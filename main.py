@@ -1,24 +1,23 @@
-from astrbot.api.event import filter, AstrMessageEvent, MessageEventResult
-from astrbot.api.star import Context, Star, register
-from astrbot.api import logger
+from astrbot.api.star import Context, Star
 
-@register("helloworld", "YourName", "一个简单的 Hello World 插件", "1.0.0")
-class MyPlugin(Star):
-    def __init__(self, context: Context):
+
+class RocketChatAdapterPlugin(Star):
+    """
+    Rocket.Chat 消息平台适配器插件入口。
+
+    本插件以"平台适配器"形式接入 AstrBot，不提供对话指令，
+    仅在初始化时导入适配器模块以触发 @register_platform_adapter
+    装饰器完成注册。注册完成后，用户可在 AstrBot WebUI 的
+    「平台」页面中添加 rocket_chat 类型的平台实例。
+    """
+
+    def __init__(self, context: Context) -> None:
         super().__init__(context)
+        # 导入适配器模块，触发 @register_platform_adapter 装饰器注册
+        from .rocketchat_adapter import RocketChatAdapter  # noqa: F401
 
-    async def initialize(self):
-        """可选择实现异步的插件初始化方法，当实例化该插件类之后会自动调用该方法。"""
+    async def initialize(self) -> None:
+        """插件异步初始化（可选）。"""
 
-    # 注册指令的装饰器。指令名为 helloworld。注册成功后，发送 `/helloworld` 就会触发这个指令，并回复 `你好, {user_name}!`
-    @filter.command("helloworld")
-    async def helloworld(self, event: AstrMessageEvent):
-        """这是一个 hello world 指令""" # 这是 handler 的描述，将会被解析方便用户了解插件内容。建议填写。
-        user_name = event.get_sender_name()
-        message_str = event.message_str # 用户发的纯文本消息字符串
-        message_chain = event.get_messages() # 用户所发的消息的消息链 # from astrbot.api.message_components import *
-        logger.info(message_chain)
-        yield event.plain_result(f"Hello, {user_name}, 你发了 {message_str}!") # 发送一条纯文本消息
-
-    async def terminate(self):
-        """可选择实现异步的插件销毁方法，当插件被卸载/停用时会调用。"""
+    async def terminate(self) -> None:
+        """插件销毁（可选）。"""
