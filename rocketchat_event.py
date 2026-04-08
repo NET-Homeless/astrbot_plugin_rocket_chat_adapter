@@ -138,8 +138,14 @@ class RocketChatMessageEvent(AstrMessageEvent):
                     text_parts.clear()
                 await self._send_video_component(comp)
 
+            elif isinstance(comp, Reply):
+                # AstrBot 会自动在部分场景附加 Reply 组件。
+                # 由于 Rocket.Chat 适配器已经使用了原生的引用回复语法 (quote_original)
+                # 或者通过 thread (tmid) 回复，因此直接无视它，避免把内部对象发出去
+                pass
+
             else:
-                # 其他组件（Reply、Forward 等）暂时转文本兜底
+                # 其他组件（Forward 等）暂时转文本兜底
                 fallback = str(comp)
                 if fallback:
                     text_parts.append(fallback)
