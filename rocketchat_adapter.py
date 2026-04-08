@@ -47,7 +47,6 @@ from .rocketchat_event import RocketChatMessageEvent
         "server_url": "http://localhost:3000",
         "username": "",
         "password": "",
-        "admin_users": [],
         "reconnect_delay": 5.0,
     },
     support_streaming_message=False,
@@ -61,7 +60,6 @@ class RocketChatAdapter(Platform):
       server_url     : Rocket.Chat 服务器地址，如 http://localhost:3000
       username       : 机器人账号用户名
       password       : 机器人账号密码
-      admin_users    : 管理员用户名或 userId 列表（这些用户在 AstrBot 中拥有 admin 角色）
       reconnect_delay: WebSocket 断线后重连等待秒数，默认 5.0
     """
 
@@ -80,7 +78,6 @@ class RocketChatAdapter(Platform):
         ).rstrip("/")
         self.username: str = platform_config.get("username", "")
         self.password: str = platform_config.get("password", "")
-        self.admin_users: List[str] = platform_config.get("admin_users", [])
         self.reconnect_delay: float = float(platform_config.get("reconnect_delay", 5.0))
 
         # 运行时状态
@@ -944,9 +941,6 @@ class RocketChatAdapter(Platform):
             # 群聊中 @mention 触发唤醒；私信始终处理
             if bot_mentioned or msg_type == MessageType.FRIEND_MESSAGE:
                 event.is_at_or_wake_command = True
-
-            if sender_username in self.admin_users or sender_id in self.admin_users:
-                event.role = "admin"
 
             logger.debug(
                 "[RocketChat][IN] → commit type=%s room=%r msg=%r wake=%s"

@@ -9,10 +9,10 @@
 ## 功能特性
 
 - ✅ **实时消息接收** — 基于 WebSocket（DDP 协议）订阅频道、私有群组、私信消息
-- ✅ **消息发送** — 通过 REST API 发送文本、图片（URL / 本地文件）
+- ✅ **消息发送** — 通过 REST API 发送文本、图片、语音、视频和普通文件
 - ✅ **自动重连** — WebSocket 断线后自动重连，无需人工干预
 - ✅ **动态订阅** — 机器人被加入新房间后自动订阅，无需重启
-- ✅ **管理员支持** — 通过配置指定 AstrBot 管理员（admin 角色）
+- ✅ **全局管理员** — 与 AstrBot 核心权限系统无缝集成
 - ✅ **图片上传** — 支持本地图片文件通过 `rooms.upload` API 上传
 - ✅ **Base64 图片** — 支持 AstrBot 文转图功能生成的 Base64 图片
 
@@ -43,13 +43,7 @@
 
 ```bash
 cd data/plugins
-git clone https://github.com/AstrBotDevs/astrbot_plugin_rocket_chat_adapter
-```
-
-安装依赖：
-
-```bash
-pip install aiohttp>=3.9
+git clone https://github.com/NET-Homeless/astrbot_plugin_rocket_chat_adapter
 ```
 
 ---
@@ -76,7 +70,6 @@ pip install aiohttp>=3.9
 | `server_url` | string | ✅ | `http://localhost:3000` | Rocket.Chat 服务器地址（含协议，不含末尾 `/`）|
 | `username` | string | ✅ | — | 机器人账号用户名 |
 | `password` | string | ✅ | — | 机器人账号密码 |
-| `admin_users` | list | 否 | `[]` | AstrBot 管理员的 Rocket.Chat 用户名或 userId 列表 |
 | `reconnect_delay` | float | 否 | `5.0` | WebSocket 断线后重连等待秒数 |
 
 ### 配置示例（JSON）
@@ -87,7 +80,6 @@ pip install aiohttp>=3.9
   "server_url": "https://chat.example.com",
   "username": "astrbot",
   "password": "your_bot_password",
-  "admin_users": ["admin_username", "another_admin"],
   "reconnect_delay": 5.0
 }
 ```
@@ -110,8 +102,8 @@ pip install aiohttp>=3.9
 
 ### 管理员权限
 
-在配置的 `admin_users` 列表中的用户，在 AstrBot 中具有 `admin` 角色，
-可使用管理员专属指令（如 `/plugin`、`/config` 等）。
+Rocket.Chat 适配器已接入 AstrBot 的全局权限管理系统。
+请在 AstrBot 的全局配置（`config.json` 或 WebUI）的 **管理员 ID** 选项中，填入对应用户的 Rocket.Chat `User ID`（可在后台接收消息日志中的 `sender_id` 处找到该值），即可拥有管理员专属指令权限（如 `/plugin`、`/config` 等）。
 
 ---
 
@@ -128,8 +120,8 @@ AstrBot 框架
             │     ├── POST /api/v1/login         → 获取 authToken / userId
             │     ├── GET  /api/v1/subscriptions.get → 获取已订阅房间列表
             │     ├── GET  /api/v1/rooms.info     → 获取房间类型（带缓存）
-            │     ├── POST /api/v1/chat.postMessage → 发送文本 / 图片URL
-            │     └── POST /api/v1/rooms.upload   → 上传本地图片
+            │     ├── POST /api/v1/chat.postMessage → 发送文本 / 引用回复
+            │     └── POST /api/v1/rooms.upload   → 上传文件（图片/语音/视频/普通文件）
             │
             └── WebSocket DDP (aiohttp)
                   ├── connect 握手
@@ -140,10 +132,9 @@ AstrBot 框架
 
 RocketChatMessageEvent (AstrMessageEvent)   ← rocketchat_event.py
     └── send(MessageChain)
-          ├── Plain → send_text()
-          ├── At    → @username 文本
-          ├── Image (http) → send_image_url()
-          └── Image (file) → send_image_file()
+          ├── Plain / At / AtAll → 发送文本（支持 Markdown 原生引用回复）
+          ├── Image / Record / Video → 统一转为本地临时文件上传，避免防盗链
+          └── File → 本地上传或退化为链接
 ```
 
 ### 消息流转图
@@ -195,8 +186,8 @@ Rocket.Chat 房间收到回复
 | 入站语音消息 | `files` / `file` 中音频附件 | `Record` 组件 | ✅ 已实现 | 基于 MIME / 文件名 / URL 严格识别 |
 | 入站视频消息 | `files` / `file` 中视频附件 | `Video` 组件 | ✅ 已实现 | 基于 MIME / 文件名 / URL 严格识别 |
 | 房间订阅变更 | `stream-notify-user`（被加入新房间） | 动态订阅房间消息流 | ✅ 已实现 | 无需重启插件 |
-| 出站文本回复 | `chat.postMessage` | `event.send` / `send_by_session` | ✅ 已实现 | 支持线程 `tmid` |
-| 出站图片回复 | `chat.postMessage.attachments` / `rooms.upload` | `Image` 组件发送 | ✅ 已实现 | 本地上传包含 MIME 推断 |
+| 出站文本回复 | `chat.postMessage` | `event.send` / `send_by_session` | ✅ 已实现 | 支持线程 `tmid` 和 Markdown 原生引用 |
+| 出站图片回复 | `rooms.upload` | `Image` 组件发送 | ✅ 已实现 | 统一转本地上传避免防盗链，包含 MIME 推断 |
 | 出站普通文件 | `rooms.upload` | `File` 组件发送 | ✅ 已实现 | 本地文件上传；远端 URL 退化为文本链接 |
 | 出站语音回复 | `rooms.upload` | `Record` 组件发送 | ✅ 已实现 | 本地文件、HTTP(S)、Base64 均可上传 |
 | 出站视频回复 | `rooms.upload` | `Video` 组件发送 | ✅ 已实现 | 本地文件、HTTP(S) 均可上传 |
@@ -273,7 +264,7 @@ git clone https://github.com/AstrBotDevs/AstrBot
 cd AstrBot
 
 # 克隆本插件到插件目录
-git clone https://github.com/AstrBotDevs/astrbot_plugin_rocket_chat_adapter \
+git clone https://github.com/NET-Homeless/astrbot_plugin_rocket_chat_adapter \
     data/plugins/astrbot_plugin_rocket_chat_adapter
 
 # 安装依赖
@@ -295,12 +286,6 @@ astrbot_plugin_rocket_chat_adapter/
 ├── requirements.txt         # Python 依赖
 └── README.md                # 本文档
 ```
-
----
-
-## 许可证
-
-[MIT License](LICENSE)
 
 ---
 
