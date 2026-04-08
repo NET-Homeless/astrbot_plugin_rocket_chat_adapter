@@ -209,3 +209,4 @@ __marimo__/
 # Project local tooling
 .omc/
 .tmp_*/
+.claude/
