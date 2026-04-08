@@ -335,43 +335,25 @@ class RocketChatMessageEvent(AstrMessageEvent):
         return local_name or fallback
 
     async def _send_image_component(self, img: Image) -> None:
-        """根据图片来源选择合适的发送方式。"""
+        """发送图片组件（统一转换为本地上传以避免防盗链问题）。"""
         file_ref: str = img.file or ""
 
         if not file_ref:
             logger.warning("[RocketChat] 收到空 file 字段的 Image 组件，已跳过")
             return
 
-        if file_ref.startswith("http://") or file_ref.startswith("https://"):
-            await self.adapter.send_image_url(
-                self.room_id, file_ref, tmid=self.thread_id
-            )
-        elif file_ref.startswith("base64://"):
-            import base64
-            import os
-            import tempfile
+        local_path, cleanup = await self._resolve_uploadable_path(
+            file_ref,
+            default_suffix=".png",
+        )
+        if not local_path:
+            logger.warning(f"[RocketChat] 无法解析图片路径: {file_ref!r}，已跳过")
+            return
 
-            b64_data = file_ref[len("base64://") :]
-            try:
-                raw = base64.b64decode(b64_data)
-                with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
-                    tmp.write(raw)
-                    tmp_path = tmp.name
-                try:
-                    await self.adapter.send_image_file(
-                        self.room_id, tmp_path, tmid=self.thread_id
-                    )
-                finally:
-                    os.unlink(tmp_path)
-            except Exception as e:
-                logger.error(f"[RocketChat] Base64 图片处理失败: {e}")
-        else:
-            local_path = file_ref.replace("file:///", "").replace("file://", "")
-            if local_path:
-                await self.adapter.send_image_file(
-                    self.room_id, local_path, tmid=self.thread_id
-                )
-            else:
-                logger.warning(
-                    f"[RocketChat] 无法识别的图片路径格式: {file_ref!r}，已跳过"
-                )
+        try:
+            await self.adapter.send_image_file(
+                self.room_id, local_path, tmid=self.thread_id
+            )
+        finally:
+            if cleanup:
+                cleanup()

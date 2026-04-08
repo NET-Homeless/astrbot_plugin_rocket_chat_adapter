@@ -213,8 +213,6 @@ class RocketChatAdapter(Platform):
         self.auth_token = d["authToken"]
         self.user_id = d["userId"]
         self.bot_username = d["me"]["username"]
-        # 覆盖 Platform 基类默认的随机 UUID
-        self.client_self_id = self.user_id
 
         logger.info(
             f"[RocketChat] 登录成功 | 用户: {self.bot_username} | userId: {self.user_id}"
