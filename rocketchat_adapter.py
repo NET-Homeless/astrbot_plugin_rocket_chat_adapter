@@ -16,10 +16,11 @@ import json
 import mimetypes
 import os
 import tempfile
-from urllib.parse import urlparse
+import time
 from asyncio import Queue
 from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Optional
+from urllib.parse import urlparse
 
 import aiohttp
 from astrbot import logger
@@ -90,10 +91,16 @@ class RocketChatAdapter(Platform):
         self._http_session: Optional[aiohttp.ClientSession] = None
         self._ws: Optional[aiohttp.ClientWebSocketResponse] = None
         self._running: bool = False
+        # 停止信号：terminate() 调用时 set，用于立即打断重连 sleep
+        self._stop_event: Optional[asyncio.Event] = None
 
         # 房间类型缓存（避免重复 API 请求）
         # key: room_id, value: "c"（频道）| "p"（私有群组）| "d"（私信）
         self._room_type_cache: Dict[str, str] = {}
+        # 房间名称缓存，用于构造 message_link
+        self._room_name_cache: Dict[str, str] = {}
+        # 已订阅房间集合，防止重复订阅导致消息被多次处理
+        self._subscribed_rooms: set = set()
 
         self._meta = PlatformMetadata(
             name="rocket_chat",
@@ -112,6 +119,7 @@ class RocketChatAdapter(Platform):
     async def run(self) -> None:
         """适配器主入口，持续运行并自动重连。"""
         self._running = True
+        self._stop_event = asyncio.Event()
         self._http_session = aiohttp.ClientSession()
 
         try:
@@ -132,14 +140,24 @@ class RocketChatAdapter(Platform):
                         f"[RocketChat] WebSocket 连接断开: {exc!r}，"
                         f"{self.reconnect_delay:.1f}s 后重连..."
                     )
-                    await asyncio.sleep(self.reconnect_delay)
+                    # 用 Event 等待，terminate() 可立即打断而不必等满 reconnect_delay
+                    try:
+                        await asyncio.wait_for(
+                            self._stop_event.wait(), timeout=self.reconnect_delay
+                        )
+                    except asyncio.TimeoutError:
+                        pass
         finally:
             await self._cleanup()
 
     async def terminate(self) -> None:
         """停止适配器，由 AstrBot 在关闭或禁用时调用。"""
         self._running = False
+        # 立即唤醒正在等待重连 sleep 的协程
+        if self._stop_event is not None:
+            self._stop_event.set()
         await self._cleanup()
+        await super().terminate()
 
     async def send_by_session(
         self,
@@ -152,7 +170,9 @@ class RocketChatAdapter(Platform):
         session.session_id 对应 Rocket.Chat 的 room_id。
         """
         room_id = session.session_id
-        await self._send_message_chain(room_id, message_chain, getattr(session, "message_id", None))
+        await self._send_message_chain(
+            room_id, message_chain, getattr(session, "message_id", None)
+        )
         # 必须调用：父类上报统计指标
         await super().send_by_session(session, message_chain)
 
@@ -225,27 +245,53 @@ class RocketChatAdapter(Platform):
           "d"  → 私信（direct message）
         """
         if room_id in self._room_type_cache:
-            logger.debug(f"[RocketChat][room] cache hit room_id={room_id!r} type={self._room_type_cache[room_id]!r}")
+            logger.debug(
+                f"[RocketChat][room] cache hit room_id={room_id!r} type={self._room_type_cache[room_id]!r}"
+            )
             return self._room_type_cache[room_id]
 
         url = f"{self.server_url}/api/v1/rooms.info?roomId={room_id}"
-        logger.debug(f"[RocketChat][room] fetching room info room_id={room_id!r} url={url}")
+        logger.debug(
+            f"[RocketChat][room] fetching room info room_id={room_id!r} url={url}"
+        )
         try:
             async with self._http_session.get(
                 url, headers=self._auth_headers()
             ) as resp:
                 data = await resp.json()
-            logger.debug(f"[RocketChat][room] room info response room_id={room_id!r} data={data}")
+            logger.debug(
+                f"[RocketChat][room] room info response room_id={room_id!r} data={data}"
+            )
             if data.get("success"):
-                room_type = data.get("room", {}).get("t", "c")
+                room = data.get("room", {})
+                room_type = room.get("t", "c")
                 self._room_type_cache[room_id] = room_type
-                logger.debug(f"[RocketChat][room] resolved room_id={room_id!r} type={room_type!r}")
+                room_name = room.get("name") or room.get("fname")
+                if room_name:
+                    self._room_name_cache[room_id] = room_name
+                logger.debug(
+                    f"[RocketChat][room] resolved room_id={room_id!r} type={room_type!r}"
+                )
                 return room_type
         except Exception as e:
             logger.warning(f"[RocketChat] 获取房间类型失败 room_id={room_id}: {e}")
 
         logger.debug(f"[RocketChat][room] fallback room_id={room_id!r} type='c'")
         return "c"
+
+    def _build_message_link(self, room_id: str, message_id: str) -> str:
+        """构造指向原始消息的 Rocket.Chat 深链接（用于引用附件）。"""
+        room_type = self._room_type_cache.get(room_id, "c")
+        room_name = self._room_name_cache.get(room_id, "")
+        if not room_name:
+            return ""
+        if room_type == "c":
+            path = f"channel/{room_name}"
+        elif room_type == "p":
+            path = f"group/{room_name}"
+        else:
+            return ""
+        return f"{self.server_url}/{path}?msg={message_id}"
 
     # ------------------------------------------------------------------ #
     #  WebSocket / DDP 协议                                                #
@@ -259,6 +305,9 @@ class RocketChatAdapter(Platform):
                 "http://", "ws://", 1
             )
         ) + "/websocket"
+
+        # 重连时重置订阅集合，让本次连接重新订阅所有房间
+        self._subscribed_rooms.clear()
 
         async with self._http_session.ws_connect(
             ws_url,
@@ -341,6 +390,13 @@ class RocketChatAdapter(Platform):
             room_id = sub.get("rid")
             if not room_id:
                 continue
+            # 从订阅数据顺带缓存房间类型和名称，减少后续 API 调用
+            room_type = sub.get("t")
+            if room_type:
+                self._room_type_cache[room_id] = room_type
+            room_name = sub.get("name") or sub.get("fname")
+            if room_name:
+                self._room_name_cache[room_id] = room_name
             await ws.send_json(
                 {
                     "msg": "sub",
@@ -349,6 +405,7 @@ class RocketChatAdapter(Platform):
                     "params": [room_id, False],
                 }
             )
+            self._subscribed_rooms.add(room_id)
 
     async def _ddp_subscribe_user_events(
         self, ws: aiohttp.ClientWebSocketResponse
@@ -402,11 +459,6 @@ class RocketChatAdapter(Platform):
         msg_type = data.get("msg")
         collection = data.get("collection", "")
 
-        if msg_type not in {"ping", "pong"}:
-            logger.debug(
-                f"[RocketChat][DDP] msg={msg_type!r} collection={collection!r} data={data}"
-            )
-
         if msg_type == "ping":
             # 应用层心跳：服务器发 ping，客户端必须回 pong
             await ws.send_json({"msg": "pong"})
@@ -415,16 +467,12 @@ class RocketChatAdapter(Platform):
             if collection == "stream-room-messages":
                 # 房间新消息推送
                 args: List[dict] = data.get("fields", {}).get("args", [])
-                logger.debug(f"[RocketChat][DDP] stream-room-messages args={args}")
                 for raw_msg in args:
                     # 异步处理，避免阻塞接收循环
                     asyncio.create_task(self._process_incoming_message(raw_msg))
 
             elif collection == "stream-notify-user":
                 # 用户级别通知（如：被加入新房间）
-                logger.debug(
-                    f"[RocketChat][DDP] stream-notify-user fields={data.get('fields', {})}"
-                )
                 await self._handle_user_notification(data, ws)
 
         elif msg_type == "added":
@@ -461,7 +509,12 @@ class RocketChatAdapter(Platform):
                     f"[RocketChat][room] cached from notify room_id={room_id!r} type={room_type!r} event={event_type!r}"
                 )
 
-        if event_type in {"inserted", "updated"} and room_id:
+        # 只在真正新加入房间时订阅，updated 仅表示房间有活动，不需要重新订阅
+        if (
+            event_type == "inserted"
+            and room_id
+            and room_id not in self._subscribed_rooms
+        ):
             await ws.send_json(
                 {
                     "msg": "sub",
@@ -470,7 +523,8 @@ class RocketChatAdapter(Platform):
                     "params": [room_id, False],
                 }
             )
-            logger.info(f"[RocketChat] 动态订阅房间: {room_id} ({event_type})")
+            self._subscribed_rooms.add(room_id)
+            logger.info(f"[RocketChat] 动态订阅新房间: {room_id}")
 
     async def _normalize_media_url(self, media_url: str) -> str:
         """将 Rocket.Chat 返回的相对媒体地址补全为绝对 URL。"""
@@ -558,14 +612,11 @@ class RocketChatAdapter(Platform):
 
         for att in attachments:
             mime_type = (
-                att.get("image_type")
-                or att.get("type")
-                or att.get("mimeType")
-                or ""
+                att.get("image_type") or att.get("type") or att.get("mimeType") or ""
             )
-            is_image_attachment = (
-                bool(att.get("image_dimensions")) or mime_type.startswith("image/")
-            )
+            is_image_attachment = bool(
+                att.get("image_dimensions")
+            ) or mime_type.startswith("image/")
 
             for key in (
                 "image_url",
@@ -621,7 +672,9 @@ class RocketChatAdapter(Platform):
                 continue
             meta = url_obj.get("meta") if isinstance(url_obj.get("meta"), dict) else {}
             headers = (
-                url_obj.get("headers") if isinstance(url_obj.get("headers"), dict) else {}
+                url_obj.get("headers")
+                if isinstance(url_obj.get("headers"), dict)
+                else {}
             )
             content_type = (
                 meta.get("contentType")
@@ -695,7 +748,9 @@ class RocketChatAdapter(Platform):
             for key in ("url", "path", "title_link", "titleLink", "link"):
                 value = file_obj.get(key)
                 if value:
-                    records.append(Record.fromURL(await self._normalize_media_url(value)))
+                    records.append(
+                        Record.fromURL(await self._normalize_media_url(value))
+                    )
                     break
 
         files_raw = raw_msg.get("files", [])
@@ -754,20 +809,14 @@ class RocketChatAdapter(Platform):
                 deduped.append(video)
         return deduped
 
-
     async def _process_incoming_message(self, raw_msg: dict) -> None:
         """
         将 Rocket.Chat 原始消息转换为 AstrBotMessage，构造事件并提交队列。
         """
         try:
-            logger.debug(f"[RocketChat][IN] raw_msg={raw_msg}")
-
             # ---- 过滤规则 ----
             # 1. 系统消息（有 t 字段，如用户加入/离开通知）
             if raw_msg.get("t"):
-                logger.debug(
-                    f"[RocketChat][IN] skip system message t={raw_msg.get('t')!r} raw={raw_msg}"
-                )
                 return
 
             # 2. 机器人自身发出的消息
@@ -782,18 +831,24 @@ class RocketChatAdapter(Platform):
             video_components = await self._extract_video_components(raw_msg)
             file_components = await self._extract_file_components(raw_msg)
             logger.debug(
-                "[RocketChat][IN] parsed msg=%r images=%d records=%d videos=%d files=%d rid=%r user=%r"
+                "[RocketChat][IN] ← %s@%s: %r  img=%d rec=%d vid=%d file=%d"
                 % (
-                    msg_text,
+                    raw_msg.get("u", {}).get("username"),
+                    raw_msg.get("rid"),
+                    (msg_text[:60] + "…") if len(msg_text) > 60 else msg_text,
                     len(image_urls),
                     len(record_components),
                     len(video_components),
                     len(file_components),
-                    raw_msg.get("rid"),
-                    raw_msg.get("u", {}).get("username"),
                 )
             )
-            if not msg_text and not image_urls and not record_components and not video_components and not file_components:
+            if (
+                not msg_text
+                and not image_urls
+                and not record_components
+                and not video_components
+                and not file_components
+            ):
                 logger.debug("[RocketChat][IN] skip empty/unsupported message")
                 return
 
@@ -802,18 +857,23 @@ class RocketChatAdapter(Platform):
             sender_id: str = raw_msg.get("u", {}).get("_id", "")
             sender_username: str = raw_msg.get("u", {}).get("username", "")
             sender_name: str = raw_msg.get("u", {}).get("name") or sender_username
-            thread_id: Optional[str] = raw_msg.get("tmid") or raw_msg.get("_id")
-            timestamp = await self._parse_timestamp(raw_msg.get("ts"))
+            # tmid 只在消息本身是线程回复时才存在；普通消息不设 thread_id，
+            # 避免把每条消息都错误地当作线程来回复
+            thread_id: Optional[str] = raw_msg.get("tmid")
+            # 解析 Rocket.Chat 的时间戳格式 {"$date": <毫秒>}
+            ts_raw = raw_msg.get("ts")
+            if isinstance(ts_raw, dict):
+                timestamp = int(ts_raw.get("$date", time.time() * 1000) / 1000)
+            else:
+                timestamp = int(time.time())
 
             # ---- 判断消息类型 ----
             room_type = await self._get_room_type(room_id)
-            logger.debug(f"[RocketChat][IN] room_type={room_type!r} room_id={room_id!r}")
             msg_type = (
                 MessageType.FRIEND_MESSAGE
                 if room_type == "d"
                 else MessageType.GROUP_MESSAGE
             )
-            logger.debug(f"[RocketChat][IN] msg_type={msg_type!r}")
 
             # ---- 构建消息链（消息组件列表）----
             components = []
@@ -829,13 +889,11 @@ class RocketChatAdapter(Platform):
 
             # ---- 构造 AstrBotMessage ----
             abm = AstrBotMessage()
-            logger.debug("[RocketChat][IN] AstrBotMessage created")
             abm.type = msg_type
             abm.self_id = self.user_id
             abm.session_id = room_id
             abm.message_id = raw_msg.get("_id", "")
             abm.sender = MessageMember(user_id=sender_id, nickname=sender_name)
-            logger.debug(f"[RocketChat][IN] sender built sender_id={sender_id!r} sender_name={sender_name!r}")
             abm.message = components
             abm.message_str = msg_text
             abm.raw_message = raw_msg
@@ -844,11 +902,34 @@ class RocketChatAdapter(Platform):
 
             if msg_type == MessageType.GROUP_MESSAGE:
                 abm.group = Group(group_id=room_id)
-                logger.debug(f"[RocketChat][IN] group built group_id={room_id!r}")
 
-            logger.debug(
-                "[RocketChat][IN] built message type=%r session=%r sender=%r"
-                % (abm.type, abm.session_id, sender_username)
+            # ---- 检测 @mention，决定是否唤醒 AstrBot ----
+            mentions = raw_msg.get("mentions", [])
+            bot_mentioned = any(
+                m.get("_id") == self.user_id or m.get("username") == self.bot_username
+                for m in mentions
+            )
+            if bot_mentioned:
+                # 从消息文本里去掉 @botusername，只保留实际内容
+                clean_text = msg_text.replace(f"@{self.bot_username}", "").strip()
+                abm.message_str = clean_text
+                # 更新 Plain 组件里的文本
+                for comp in abm.message:
+                    if isinstance(comp, Plain):
+                        comp.text = clean_text
+                        break
+                logger.debug(
+                    f"[RocketChat][IN] bot mentioned, clean_text={clean_text!r}"
+                )
+
+            # ---- 判断回复场景 ----
+            # is_thread_msg: 收到的消息本身就在线程里（有 tmid）
+            is_thread_msg = bool(raw_msg.get("tmid"))
+            # 频道 @mention 且不在线程里 → 引用原消息回复到大厅
+            should_quote = (
+                msg_type == MessageType.GROUP_MESSAGE
+                and bot_mentioned
+                and not is_thread_msg
             )
 
             # ---- 构造平台事件 ----
@@ -858,29 +939,33 @@ class RocketChatAdapter(Platform):
                 platform_meta=self.meta(),
                 session_id=abm.session_id,
                 room_id=room_id,
-                thread_id=thread_id,
+                thread_id=thread_id,  # 线程消息时为父消息 ID，否则 None
+                quote_original=should_quote,
                 adapter=self,
             )
-            logger.debug("[RocketChat][IN] RocketChatMessageEvent created")
-
-            logger.debug(
-                "[RocketChat][IN] committing event type=%r session=%r room=%r msg=%r components=%r"
-                % (
-                    abm.type,
-                    abm.session_id,
-                    room_id,
-                    abm.message_str,
-                    [type(comp).__name__ for comp in components],
-                )
-            )
+            # 群聊中 @mention 触发唤醒；私信始终处理
+            if bot_mentioned or msg_type == MessageType.FRIEND_MESSAGE:
+                event.is_at_or_wake_command = True
 
             if sender_username in self.admin_users or sender_id in self.admin_users:
                 event.role = "admin"
 
+            logger.debug(
+                "[RocketChat][IN] → commit type=%s room=%r msg=%r wake=%s"
+                % (
+                    "DM" if msg_type == MessageType.FRIEND_MESSAGE else "Group",
+                    room_id,
+                    (abm.message_str[:60] + "…")
+                    if len(abm.message_str) > 60
+                    else abm.message_str,
+                    event.is_at_or_wake_command,
+                )
+            )
             self.commit_event(event)
-            logger.debug("[RocketChat][IN] commit_event done")
         except Exception as exc:
-            logger.error(f"[RocketChat][IN] unhandled processing error: {exc!r}", exc_info=True)
+            logger.error(
+                f"[RocketChat][IN] unhandled processing error: {exc!r}", exc_info=True
+            )
             raise
 
     # ------------------------------------------------------------------ #
@@ -914,6 +999,50 @@ class RocketChatAdapter(Platform):
                     logger.error(f"[RocketChat] 发送文本失败: {data}")
         except Exception as exc:
             logger.error(f"[RocketChat] 发送文本异常: {exc!r}")
+
+    async def send_with_quote(
+        self,
+        room_id: str,
+        text: str,
+        original_msg: dict,
+        sender_name: str,
+        tmid: Optional[str] = None,
+    ) -> None:
+        """
+        发送带引用原始消息的回复（频道 @mention 场景）。
+
+        :param room_id:      目标房间 ID
+        :param text:         机器人回复正文
+        :param original_msg: 被引用的原始消息 raw_msg dict
+        :param sender_name:  被引用消息的发送者显示名
+        :param tmid:         可选线程 ID
+        """
+        msg_id = original_msg.get("_id", "")
+        link = self._build_message_link(room_id, msg_id)
+
+        # 使用 Rocket.Chat 原生引用格式：[ ](链接) 后接回复内容
+        if link:
+            quote_text = f"[ ]({link}) {text}"
+        else:
+            quote_text = text
+
+        payload: dict = {
+            "roomId": room_id,
+            "text": quote_text,
+        }
+        if tmid:
+            payload["tmid"] = tmid
+
+        url = f"{self.server_url}/api/v1/chat.postMessage"
+        try:
+            async with self._http_session.post(
+                url, json=payload, headers=self._auth_headers()
+            ) as resp:
+                data = await resp.json()
+                if not data.get("success"):
+                    logger.error(f"[RocketChat] 引用回复失败: {data}")
+        except Exception as exc:
+            logger.error(f"[RocketChat] 引用回复异常: {exc!r}")
 
     async def send_image_url(
         self,
@@ -1089,7 +1218,9 @@ class RocketChatAdapter(Platform):
     ) -> tuple[str | None, Callable[[], None] | None]:
         parsed = urlparse(url)
         filename = parsed.path.rsplit("/", 1)[-1] if parsed.path else ""
-        suffix = "." + filename.rsplit(".", 1)[-1] if "." in filename else default_suffix
+        suffix = (
+            "." + filename.rsplit(".", 1)[-1] if "." in filename else default_suffix
+        )
         try:
             async with self._http_session.get(url) as resp:
                 if resp.status >= 400:
@@ -1116,7 +1247,7 @@ class RocketChatAdapter(Platform):
         default_suffix: str,
     ) -> tuple[str | None, Callable[[], None] | None]:
         try:
-            raw = base64.b64decode(file_ref[len("base64://"):])
+            raw = base64.b64decode(file_ref[len("base64://") :])
         except Exception as exc:
             logger.error(f"[RocketChat] Base64 媒体处理失败: {exc!r}")
             return None, None
@@ -1169,7 +1300,9 @@ class RocketChatAdapter(Platform):
                 else:
                     local_path = file_ref.replace("file:///", "").replace("file://", "")
                     if local_path:
-                        await self.send_file(room_id, local_path, filename=comp.name, tmid=tmid)
+                        await self.send_file(
+                            room_id, local_path, filename=comp.name, tmid=tmid
+                        )
             elif isinstance(comp, Record):
                 if text_parts:
                     await self.send_text(room_id, "".join(text_parts), tmid)

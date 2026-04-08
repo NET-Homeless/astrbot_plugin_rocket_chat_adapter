@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import base64
+import os
+import tempfile
 from typing import TYPE_CHECKING, Callable
 from urllib.parse import urlparse
 
+from astrbot import logger
 from astrbot.api.event import AstrMessageEvent, MessageChain
-from astrbot.api.platform import AstrBotMessage, PlatformMetadata
 from astrbot.api.message_components import (
     At,
     AtAll,
@@ -22,7 +25,7 @@ from astrbot.api.message_components import (
     Share,
     Video,
 )
-from astrbot import logger
+from astrbot.api.platform import AstrBotMessage, PlatformMetadata
 
 if TYPE_CHECKING:
     from .rocketchat_adapter import RocketChatAdapter
@@ -46,6 +49,7 @@ class RocketChatMessageEvent(AstrMessageEvent):
         room_id: str,
         thread_id: str | None,
         adapter: "RocketChatAdapter",
+        quote_original: bool = False,
     ) -> None:
         """
         Parameters
@@ -61,6 +65,7 @@ class RocketChatMessageEvent(AstrMessageEvent):
         super().__init__(message_str, message_obj, platform_meta, session_id)
         self.room_id: str = room_id
         self.thread_id: str | None = thread_id
+        self.quote_original: bool = quote_original
         self.adapter: "RocketChatAdapter" = adapter
 
     # ------------------------------------------------------------------
@@ -71,17 +76,20 @@ class RocketChatMessageEvent(AstrMessageEvent):
         """
         将 AstrBot 生成的消息链发送回 Rocket.Chat。
 
-        处理逻辑：
-        - Plain  → 累积为纯文本，合并后一次发送
-        - At/AtAll → 转换为 @username / @all 文本
-        - Image  → HTTP URL 用 attachment 方式发送，本地文件用 rooms.upload 上传
-        - File   → 本地文件上传，远端文件退化为文本链接
-        - Record/Video → 本地文件或 HTTP(S) URL 下载后上传，保持媒体文件语义
-        - Reply/Forward/Share/Location/Music/Json/Poke/Face → 文本兜底
+        回复场景：
+        - 频道 @mention（非线程）→ 引用原消息发到大厅（quote_original=True）
+        - 线程 @mention          → 在同一线程里回复（thread_id 已设置）
+        - 私信                   → 直接回复（无 tmid，无引用）
 
         注意：必须在末尾调用 await super().send(message)，
               框架依赖该调用更新内部发送状态与统计指标。
         """
+        logger.debug(
+            "[RocketChat][Event] send() quote_original=%s thread_id=%r chain=%r",
+            self.quote_original,
+            self.thread_id,
+            [type(c).__name__ for c in message.chain],
+        )
         text_parts: list[str] = []
         pending_images: list[Image] = []
 
@@ -96,9 +104,7 @@ class RocketChatMessageEvent(AstrMessageEvent):
                 # Rocket.Chat 支持 @username 格式的提及
                 # AstrBot At 组件可能使用 name 或 qq 字段存储用户标识
                 mention_name = (
-                    getattr(comp, "name", None)
-                    or getattr(comp, "qq", None)
-                    or ""
+                    getattr(comp, "name", None) or getattr(comp, "qq", None) or ""
                 )
                 if mention_name:
                     text_parts.append(f"@{mention_name} ")
@@ -107,28 +113,28 @@ class RocketChatMessageEvent(AstrMessageEvent):
                 # 先把前面累积的文本发出去，再发图片，保持顺序
                 combined = "".join(text_parts).strip()
                 if combined:
-                    await self.adapter.send_text(self.room_id, combined, self.thread_id)
+                    await self._flush_text(combined)
                     text_parts.clear()
                 pending_images.append(comp)
 
             elif isinstance(comp, File):
                 combined = "".join(text_parts).strip()
                 if combined:
-                    await self.adapter.send_text(self.room_id, combined, self.thread_id)
+                    await self._flush_text(combined)
                     text_parts.clear()
                 await self._send_file_component(comp)
 
             elif isinstance(comp, Record):
                 combined = "".join(text_parts).strip()
                 if combined:
-                    await self.adapter.send_text(self.room_id, combined, self.thread_id)
+                    await self._flush_text(combined)
                     text_parts.clear()
                 await self._send_record_component(comp)
 
             elif isinstance(comp, Video):
                 combined = "".join(text_parts).strip()
                 if combined:
-                    await self.adapter.send_text(self.room_id, combined, self.thread_id)
+                    await self._flush_text(combined)
                     text_parts.clear()
                 await self._send_video_component(comp)
 
@@ -141,7 +147,7 @@ class RocketChatMessageEvent(AstrMessageEvent):
         # 发送剩余文本
         remaining_text = "".join(text_parts).strip()
         if remaining_text:
-            await self.adapter.send_text(self.room_id, remaining_text, self.thread_id)
+            await self._flush_text(remaining_text)
 
         # 发送所有图片
         for img in pending_images:
@@ -149,6 +155,25 @@ class RocketChatMessageEvent(AstrMessageEvent):
 
         # ⚠️ 必须调用父类 send，框架在此更新发送状态 & 上报 Metric
         await super().send(message)
+
+    async def _flush_text(self, text: str) -> None:
+        """发送一段文本，自动选择引用回复或普通发送。"""
+        logger.debug(
+            "[RocketChat][Event] _flush_text() quote_original=%s text=%r",
+            self.quote_original,
+            text[:80],
+        )
+        if self.quote_original:
+            await self.adapter.send_with_quote(
+                self.room_id,
+                text,
+                self.message_obj.raw_message,
+                self.message_obj.sender.nickname or self.message_obj.sender.user_id,
+            )
+            # 第一段文本已作为引用发出，后续内容走普通发送
+            self.quote_original = False
+        else:
+            await self.adapter.send_text(self.room_id, text, tmid=self.thread_id)
 
     async def _send_file_component(self, file_comp: File) -> None:
         """发送普通文件组件。"""
@@ -249,7 +274,11 @@ class RocketChatMessageEvent(AstrMessageEvent):
         default_suffix: str,
     ) -> tuple[str | None, Callable[[], None] | None]:
         parsed = urlparse(url)
-        suffix = "." + parsed.path.rsplit(".", 1)[-1] if "." in parsed.path.rsplit("/", 1)[-1] else default_suffix
+        suffix = (
+            "." + parsed.path.rsplit(".", 1)[-1]
+            if "." in parsed.path.rsplit("/", 1)[-1]
+            else default_suffix
+        )
         try:
             async with self.adapter._http_session.get(url) as resp:
                 if resp.status >= 400:
@@ -276,7 +305,7 @@ class RocketChatMessageEvent(AstrMessageEvent):
         default_suffix: str,
     ) -> tuple[str | None, Callable[[], None] | None]:
         try:
-            raw = base64.b64decode(file_ref[len("base64://"):])
+            raw = base64.b64decode(file_ref[len("base64://") :])
         except Exception as exc:
             logger.error(f"[RocketChat] Base64 媒体处理失败: {exc!r}")
             return None, None
@@ -308,20 +337,24 @@ class RocketChatMessageEvent(AstrMessageEvent):
             return
 
         if file_ref.startswith("http://") or file_ref.startswith("https://"):
-            await self.adapter.send_image_url(self.room_id, file_ref, tmid=self.thread_id)
+            await self.adapter.send_image_url(
+                self.room_id, file_ref, tmid=self.thread_id
+            )
         elif file_ref.startswith("base64://"):
             import base64
             import os
             import tempfile
 
-            b64_data = file_ref[len("base64://"):]
+            b64_data = file_ref[len("base64://") :]
             try:
                 raw = base64.b64decode(b64_data)
                 with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
                     tmp.write(raw)
                     tmp_path = tmp.name
                 try:
-                    await self.adapter.send_image_file(self.room_id, tmp_path, tmid=self.thread_id)
+                    await self.adapter.send_image_file(
+                        self.room_id, tmp_path, tmid=self.thread_id
+                    )
                 finally:
                     os.unlink(tmp_path)
             except Exception as e:
@@ -329,6 +362,10 @@ class RocketChatMessageEvent(AstrMessageEvent):
         else:
             local_path = file_ref.replace("file:///", "").replace("file://", "")
             if local_path:
-                await self.adapter.send_image_file(self.room_id, local_path, tmid=self.thread_id)
+                await self.adapter.send_image_file(
+                    self.room_id, local_path, tmid=self.thread_id
+                )
             else:
-                logger.warning(f"[RocketChat] 无法识别的图片路径格式: {file_ref!r}，已跳过")
+                logger.warning(
+                    f"[RocketChat] 无法识别的图片路径格式: {file_ref!r}，已跳过"
+                )
