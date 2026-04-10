@@ -317,6 +317,18 @@ class RocketChatAdapter(Platform):
             return ""
         return f"{self.server_url}/{path}?msg={message_id}"
 
+    async def _fetch_message_by_id(self, msg_id: str) -> Optional[dict]:
+        """通过 API 获取指定消息详情。"""
+        url = f"{self.server_url}/api/v1/chat.getMessage?msgId={msg_id}"
+        try:
+            async with self._http_session.get(url, headers=self._auth_headers()) as resp:
+                data = await resp.json()
+                if data.get("success"):
+                    return data.get("message")
+        except Exception as exc:
+            logger.warning(f"[RocketChat] 无法拉取被引用的消息明细 msgId={msg_id}: {exc!r}")
+        return None
+
     # ------------------------------------------------------------------ #
     #  WebSocket / DDP 协议                                                #
     # ------------------------------------------------------------------ #
@@ -847,30 +859,105 @@ class RocketChatAdapter(Platform):
                 return
 
             # 3. 空消息（无文本且无任何可处理媒体）
-            msg_text: str = raw_msg.get("msg", "").strip()
-            image_urls = await self._extract_image_urls(raw_msg)
-            record_components = await self._extract_record_components(raw_msg)
-            video_components = await self._extract_video_components(raw_msg)
-            file_components = await self._extract_file_components(raw_msg)
-            logger.debug(
-                "[RocketChat][IN] ← %s@%s: %r  img=%d rec=%d vid=%d file=%d"
-                % (
-                    raw_msg.get("u", {}).get("username"),
-                    raw_msg.get("rid"),
-                    (msg_text[:60] + "…") if len(msg_text) > 60 else msg_text,
-                    len(image_urls),
-                    len(record_components),
-                    len(video_components),
-                    len(file_components),
-                )
-            )
-            if (
-                not msg_text
-                and not image_urls
-                and not record_components
-                and not video_components
-                and not file_components
-            ):
+            # --- 构建消息组件流 (按时序排列文本和媒体，完美兼容多模态大模型的视觉理解) ---
+            import re
+            
+            def _get_all_attachments_tmp(payload: dict) -> List[dict]:
+                res = []
+                att_raw = payload.get("attachments", [])
+                atts = [att_raw] if isinstance(att_raw, dict) else [a for a in att_raw if isinstance(a, dict)]
+                for att in atts:
+                    res.append(att)
+                    res.extend(_get_all_attachments_tmp(att))
+                return res
+
+            seen_quote_ids = set()
+
+            async def _build_components_recursively(current_payload: dict, current_depth: int = 0, max_depth: int = 3) -> list:
+                """将原始附表及正文转化为前后交织的 Component 流"""
+                chain = []
+                if current_depth >= max_depth:
+                    return chain
+
+                msg_text = current_payload.get("msg", "").strip()
+                
+                # --- 提取自身的全部附件 ---
+                local_images = await self._extract_image_urls(current_payload)
+                local_recs = await self._extract_record_components(current_payload)
+                local_vids = await self._extract_video_components(current_payload)
+                local_files = await self._extract_file_components(current_payload)
+
+                # --- 定位所有引用 ---
+                pattern = re.compile(r"\[\s*\]\([^)]+\?msg=([a-zA-Z0-9]+)[^)]*\)")
+                
+                implicit_quote_ids = []
+                for att in _get_all_attachments_tmp(current_payload):
+                    link = att.get("message_link") or ""
+                    if "msg=" in link:
+                        msg_id = link.rsplit("msg=", 1)[-1].split("&")[0]
+                        if msg_id:
+                            implicit_quote_ids.append(msg_id)
+
+                # --- 顺着正文切割并原地展开正文引用 ---
+                last_end = 0
+                for match in pattern.finditer(msg_text):
+                    prefix = msg_text[last_end:match.start()].strip()
+                    if prefix:
+                        chain.append(Plain(text=prefix + "\n"))
+                    
+                    q_id = match.group(1)
+                    if q_id in implicit_quote_ids:
+                        implicit_quote_ids.remove(q_id)
+                        
+                    if q_id not in seen_quote_ids:
+                        seen_quote_ids.add(q_id)
+                        q_msg = await self._fetch_message_by_id(q_id)
+                        if q_msg:
+                            q_components = await _build_components_recursively(q_msg, current_depth + 1, max_depth)
+                            if q_components:
+                                chain.append(Plain(text="\n【包含引用的历史消息内容如下】\n> "))
+                                chain.extend(q_components)
+                                chain.append(Plain(text="\n【历史消息引用结束】\n"))
+                                
+                    last_end = match.end()
+
+                suffix = msg_text[last_end:].strip()
+                if suffix:
+                    chain.append(Plain(text=suffix))
+
+                # --- 处理只在 attachment 里挂载的隐式引用 ---
+                for q_id in implicit_quote_ids:
+                    if q_id in seen_quote_ids:
+                        continue
+                    seen_quote_ids.add(q_id)
+                    q_msg = await self._fetch_message_by_id(q_id)
+                    if q_msg:
+                        q_components = await _build_components_recursively(q_msg, current_depth + 1, max_depth)
+                        if q_components:
+                            # 隐式引用一般出现在头部
+                            chain.insert(0, Plain(text="\n【回复包含的引用原文】\n> "))
+                            for idx, c in enumerate(q_components):
+                                chain.insert(idx + 1, c)
+                            chain.insert(len(q_components) + 1, Plain(text="\n【引用原文内容结束】\n\n"))
+
+                # --- 最后铺设自身的媒体内容 ---
+                if local_images or local_recs or local_vids or local_files:
+                    if current_depth > 0:
+                        chain.append(Plain(text="\n[附带的上传文件及媒体]:\n"))
+                    for i in local_images:
+                        chain.append(Image.fromURL(i))
+                    chain.extend(local_recs)
+                    chain.extend(local_vids)
+                    chain.extend(local_files)
+
+                return chain
+
+            components = await _build_components_recursively(raw_msg)
+            
+            # 用于快速获取最终平摊出来的纯文本，用于指令判断和日志
+            msg_text = "".join([c.text for c in components if isinstance(c, Plain)]).strip()
+
+            if not msg_text and not [c for c in components if not isinstance(c, Plain)]:
                 logger.debug("[RocketChat][IN] skip empty/unsupported message")
                 return
 
@@ -879,35 +966,20 @@ class RocketChatAdapter(Platform):
             sender_id: str = raw_msg.get("u", {}).get("_id", "")
             sender_username: str = raw_msg.get("u", {}).get("username", "")
             sender_name: str = raw_msg.get("u", {}).get("name") or sender_username
-            # tmid 只在消息本身是线程回复时才存在；普通消息不设 thread_id，
-            # 避免把每条消息都错误地当作线程来回复
             thread_id: Optional[str] = raw_msg.get("tmid")
-            # 解析 Rocket.Chat 的时间戳格式 {"$date": <毫秒>}
+            
             ts_raw = raw_msg.get("ts")
             if isinstance(ts_raw, dict):
                 timestamp = int(ts_raw.get("$date", time.time() * 1000) / 1000)
             else:
                 timestamp = int(time.time())
 
-            # ---- 判断消息类型 ----
             room_type = await self._get_room_type(room_id)
             msg_type = (
                 MessageType.FRIEND_MESSAGE
                 if room_type == "d"
                 else MessageType.GROUP_MESSAGE
             )
-
-            # ---- 构建消息链（消息组件列表）----
-            components = []
-            if msg_text:
-                components.append(Plain(text=msg_text))
-
-            # 处理附件/文件中的媒体
-            for img_url in image_urls:
-                components.append(Image.fromURL(img_url))
-            components.extend(record_components)
-            components.extend(video_components)
-            components.extend(file_components)
 
             # ---- 构造 AstrBotMessage ----
             abm = AstrBotMessage()
