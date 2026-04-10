@@ -1136,15 +1136,31 @@ class RocketChatAdapter(Platform):
             return
         self._typing_seq += 1
         try:
+            # 兼容 Rocket.Chat 所有版本（v4/5 使用 typing, v6/7+ 使用 user-activity）
             logger.debug(
                 f"[RocketChat] send typing room_id={room_id!r} user={self.bot_username!r} flag={flag}"
             )
+            # 1. 传统 typing 管道
             await self._ws.send_json(
                 {
                     "msg": "method",
                     "method": "stream-notify-room",
-                    "id": f"typing-{self._typing_seq}",
+                    "id": f"typing-legacy-{self._typing_seq}",
                     "params": [f"{room_id}/typing", self.bot_username, flag],
+                }
+            )
+            # 2. 现代 user-activity 管道
+            await self._ws.send_json(
+                {
+                    "msg": "method",
+                    "method": "stream-notify-room",
+                    "id": f"typing-modern-{self._typing_seq}",
+                    "params": [
+                        f"{room_id}/user-activity",
+                        self.bot_username,
+                        ["user-typing"] if flag else [],
+                        {}
+                    ],
                 }
             )
         except Exception as exc:
