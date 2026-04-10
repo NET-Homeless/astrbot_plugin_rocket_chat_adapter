@@ -163,33 +163,20 @@ class RocketChatMessageEvent(AstrMessageEvent):
                     if mention_name:
                         text_parts.append(f"@{mention_name} ")
 
-                elif isinstance(comp, Image):
+                elif isinstance(comp, (Image, File, Record, Video)):
                     combined = "".join(text_parts).strip()
                     if combined:
                         await self._flush_text(combined)
                         text_parts.clear()
-                    await self._send_image_component(comp)
 
-                elif isinstance(comp, File):
-                    combined = "".join(text_parts).strip()
-                    if combined:
-                        await self._flush_text(combined)
-                        text_parts.clear()
-                    await self._send_file_component(comp)
-
-                elif isinstance(comp, Record):
-                    combined = "".join(text_parts).strip()
-                    if combined:
-                        await self._flush_text(combined)
-                        text_parts.clear()
-                    await self._send_record_component(comp)
-
-                elif isinstance(comp, Video):
-                    combined = "".join(text_parts).strip()
-                    if combined:
-                        await self._flush_text(combined)
-                        text_parts.clear()
-                    await self._send_video_component(comp)
+                    if isinstance(comp, Image):
+                        await self._send_image_component(comp)
+                    elif isinstance(comp, File):
+                        await self._send_file_component(comp)
+                    elif isinstance(comp, Record):
+                        await self._send_record_component(comp)
+                    elif isinstance(comp, Video):
+                        await self._send_video_component(comp)
 
                 elif isinstance(comp, Reply):
                     # AstrBot 会自动在部分场景附加 Reply 组件。
@@ -319,76 +306,17 @@ class RocketChatMessageEvent(AstrMessageEvent):
         if file_ref.startswith("http://") or file_ref.startswith("https://"):
             return await self.adapter._download_remote_media(file_ref, default_suffix)
         if file_ref.startswith("base64://"):
-            return self._decode_base64_to_temp(file_ref, default_suffix)
+            return self.adapter._decode_base64_media(file_ref, default_suffix)
 
         local_path = file_ref.replace("file:///", "").replace("file://", "")
         return (local_path or None, None)
 
-    async def _download_to_temp(
-        self,
-        url: str,
-        default_suffix: str,
-    ) -> tuple[str | None, Callable[[], None] | None]:
-        parsed = urlparse(url)
-        suffix = (
-            "." + parsed.path.rsplit(".", 1)[-1]
-            if "." in parsed.path.rsplit("/", 1)[-1]
-            else default_suffix
-        )
-        try:
-            # 检查连接是否可用以防泄漏或在关闭边缘调用
-            if not getattr(self.adapter, "_http_session", None) or self.adapter._http_session.closed:
-                logger.warning(f"[RocketChat] 下载媒体失败: HTTP Session 已关闭或不可用")
-                return None, None
-            
-            # 使用 timeout 参数防长挂起 (结合配置和 SSRF 防护面减小风险)
-            async with self.adapter._http_session.get(url, timeout=30) as resp:
-                if resp.status >= 400:
-                    logger.error(f"[RocketChat] 下载媒体失败 {resp.status}: {url}")
-                    return None, None
-                raw = await resp.read()
-        except Exception as exc:
-            logger.error(f"[RocketChat] 下载媒体异常: {exc!r}")
-            return None, None
-
-        tmp = tempfile.NamedTemporaryFile(suffix=suffix, delete=False)
-        try:
-            tmp.write(raw)
-            tmp.close()
-            return tmp.name, lambda: os.unlink(tmp.name)
-        except Exception:
-            tmp.close()
-            os.unlink(tmp.name)
-            raise
-
-    def _decode_base64_to_temp(
-        self,
-        file_ref: str,
-        default_suffix: str,
-    ) -> tuple[str | None, Callable[[], None] | None]:
-        try:
-            raw = base64.b64decode(file_ref[len("base64://") :])
-        except Exception as exc:
-            logger.error(f"[RocketChat] Base64 媒体处理失败: {exc!r}")
-            return None, None
-
-        tmp = tempfile.NamedTemporaryFile(suffix=default_suffix, delete=False)
-        try:
-            tmp.write(raw)
-            tmp.close()
-            return tmp.name, lambda: os.unlink(tmp.name)
-        except Exception:
-            tmp.close()
-            os.unlink(tmp.name)
-            raise
-
     def _guess_filename(self, file_ref: str, local_path: str, fallback: str) -> str:
         parsed = urlparse(file_ref)
-        candidate = parsed.path.rsplit("/", 1)[-1] if parsed.path else ""
+        candidate = os.path.basename(parsed.path)
         if candidate:
             return candidate
-        local_name = local_path.replace("\\", "/").rsplit("/", 1)[-1]
-        return local_name or fallback
+        return os.path.basename(local_path) or fallback
 
     async def _send_image_component(self, img: Image) -> None:
         """发送图片组件（统一转换为本地上传以避免防盗链问题）。"""

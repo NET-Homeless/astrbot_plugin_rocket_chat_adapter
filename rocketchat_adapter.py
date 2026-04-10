@@ -738,26 +738,19 @@ class RocketChatAdapter(Platform):
                 deduped_urls.append(image_url)
         return deduped_urls
 
-    async def _extract_file_components(self, raw_msg: dict) -> List[File]:
-        """从 Rocket.Chat 文件结构中提取严格意义上的普通文件组件。"""
-        files: List[File] = []
+    async def _extract_media_components(self, raw_msg: dict, target_kind: str) -> List[tuple[str, dict]]:
+        """提取特定的媒体组件并验证其 URL"""
+        results = []
 
-        async def add_file_candidate(file_obj: dict) -> None:
-            file_kind = self._classify_file_kind(file_obj)
-            if file_kind != "file":
+        async def add_candidate(file_obj: dict) -> None:
+            if self._classify_file_kind(file_obj) != target_kind:
                 return
-
-            file_name = file_obj.get("name") or file_obj.get("title") or "attachment"
-
-            file_url = None
             for key in ("url", "path", "title_link", "titleLink", "link"):
                 value = file_obj.get(key)
                 if value:
-                    file_url = await self._normalize_media_url(value)
+                    url = await self._normalize_media_url(value)
+                    results.append((url, file_obj))
                     break
-
-            if file_url:
-                files.append(File(name=file_name, url=file_url))
 
         files_raw = raw_msg.get("files", [])
         if isinstance(files_raw, dict):
@@ -765,92 +758,47 @@ class RocketChatAdapter(Platform):
         else:
             iterable = [f for f in files_raw if isinstance(f, dict)]
         for file_obj in iterable:
-            await add_file_candidate(file_obj)
+            await add_candidate(file_obj)
 
         for file_key in ("file", "fileUpload"):
             single_file = raw_msg.get(file_key)
             if isinstance(single_file, dict):
-                await add_file_candidate(single_file)
+                await add_candidate(single_file)
+        return results
 
+    async def _extract_file_components(self, raw_msg: dict) -> List[File]:
+        """从 Rocket.Chat 文件结构中提取严格意义上的普通文件组件。"""
+        candidates = await self._extract_media_components(raw_msg, "file")
         deduped: List[File] = []
         seen: set[tuple[str, str]] = set()
-        for file_comp in files:
-            key = (file_comp.name, file_comp.url)
+        for url, file_obj in candidates:
+            name = file_obj.get("name") or file_obj.get("title") or "attachment"
+            key = (name, url)
             if key not in seen:
                 seen.add(key)
-                deduped.append(file_comp)
+                deduped.append(File(name=name, url=url))
         return deduped
 
     async def _extract_record_components(self, raw_msg: dict) -> List[Record]:
         """从 Rocket.Chat 文件结构中提取语音组件。"""
-        records: List[Record] = []
-
-        async def add_record_candidate(file_obj: dict) -> None:
-            if self._classify_file_kind(file_obj) != "audio":
-                return
-
-            for key in ("url", "path", "title_link", "titleLink", "link"):
-                value = file_obj.get(key)
-                if value:
-                    records.append(
-                        Record.fromURL(await self._normalize_media_url(value))
-                    )
-                    break
-
-        files_raw = raw_msg.get("files", [])
-        if isinstance(files_raw, dict):
-            iterable = [files_raw]
-        else:
-            iterable = [f for f in files_raw if isinstance(f, dict)]
-        for file_obj in iterable:
-            await add_record_candidate(file_obj)
-
-        for file_key in ("file", "fileUpload"):
-            single_file = raw_msg.get(file_key)
-            if isinstance(single_file, dict):
-                await add_record_candidate(single_file)
-
+        candidates = await self._extract_media_components(raw_msg, "audio")
         deduped: List[Record] = []
         seen: set[str] = set()
-        for record in records:
-            if record.file and record.file not in seen:
-                seen.add(record.file)
-                deduped.append(record)
+        for url, _ in candidates:
+            if url not in seen:
+                seen.add(url)
+                deduped.append(Record.fromURL(url))
         return deduped
 
     async def _extract_video_components(self, raw_msg: dict) -> List[Video]:
         """从 Rocket.Chat 文件结构中提取视频组件。"""
-        videos: List[Video] = []
-
-        async def add_video_candidate(file_obj: dict) -> None:
-            if self._classify_file_kind(file_obj) != "video":
-                return
-
-            for key in ("url", "path", "title_link", "titleLink", "link"):
-                value = file_obj.get(key)
-                if value:
-                    videos.append(Video.fromURL(await self._normalize_media_url(value)))
-                    break
-
-        files_raw = raw_msg.get("files", [])
-        if isinstance(files_raw, dict):
-            iterable = [files_raw]
-        else:
-            iterable = [f for f in files_raw if isinstance(f, dict)]
-        for file_obj in iterable:
-            await add_video_candidate(file_obj)
-
-        for file_key in ("file", "fileUpload"):
-            single_file = raw_msg.get(file_key)
-            if isinstance(single_file, dict):
-                await add_video_candidate(single_file)
-
+        candidates = await self._extract_media_components(raw_msg, "video")
         deduped: List[Video] = []
         seen: set[str] = set()
-        for video in videos:
-            if video.file and video.file not in seen:
-                seen.add(video.file)
-                deduped.append(video)
+        for url, _ in candidates:
+            if url not in seen:
+                seen.add(url)
+                deduped.append(Video.fromURL(url))
         return deduped
 
     async def _process_incoming_message(self, raw_msg: dict) -> None:
@@ -1208,9 +1156,7 @@ class RocketChatAdapter(Platform):
         }
         try:
             with open(file_path, "rb") as fp:
-                filename = (
-                    file_path.replace("\\", "/").rsplit("/", 1)[-1] or "image.png"
-                )
+                filename = os.path.basename(file_path) or "image.png"
                 form = aiohttp.FormData()
                 content_type = self._infer_upload_content_type(file_path, filename)
                 form.add_field(
@@ -1251,9 +1197,7 @@ class RocketChatAdapter(Platform):
         }
         try:
             with open(file_path, "rb") as fp:
-                resolved_name = filename or (
-                    file_path.replace("\\", "/").rsplit("/", 1)[-1] or "attachment"
-                )
+                resolved_name = filename or os.path.basename(file_path) or "attachment"
                 form = aiohttp.FormData()
                 content_type = self._infer_upload_content_type(file_path, resolved_name)
                 form.add_field(
@@ -1302,10 +1246,9 @@ class RocketChatAdapter(Platform):
             logger.warning(f"[RocketChat] 拒绝下载不支持的媒体协议: {url}")
             return None, None
 
-        filename = parsed.path.rsplit("/", 1)[-1] if parsed.path else ""
-        suffix = (
-            "." + filename.rsplit(".", 1)[-1] if "." in filename else default_suffix
-        )
+        filename = os.path.basename(parsed.path)
+        _, ext = os.path.splitext(filename)
+        suffix = ext if ext else default_suffix
         try:
             async with self._http_session.get(
                 url,
@@ -1381,68 +1324,43 @@ class RocketChatAdapter(Platform):
         for comp in message_chain.chain:
             if isinstance(comp, Plain):
                 text_parts.append(comp.text)
-            elif isinstance(comp, Image):
+            elif isinstance(comp, (Image, File, Record, Video)):
                 if text_parts:
                     await self.send_text(room_id, "".join(text_parts), tmid)
                     text_parts.clear()
 
-                file_ref: str = comp.file or ""
-                if file_ref.startswith("http"):
-                    await self.send_image_url(room_id, file_ref, tmid=tmid)
-                else:
-                    local_path = file_ref.replace("file:///", "").replace("file://", "")
-                    if local_path:
-                        await self.send_image_file(room_id, local_path, tmid=tmid)
-            elif isinstance(comp, File):
-                if text_parts:
-                    await self.send_text(room_id, "".join(text_parts), tmid)
-                    text_parts.clear()
+                if isinstance(comp, Image):
+                    file_ref: str = comp.file or ""
+                    if file_ref.startswith("http"):
+                        await self.send_image_url(room_id, file_ref, tmid=tmid)
+                    else:
+                        local_path = file_ref.replace("file:///", "").replace("file://", "")
+                        if local_path:
+                            await self.send_image_file(room_id, local_path, tmid=tmid)
 
-                file_ref = comp.file or comp.url or ""
-                if file_ref.startswith("http://") or file_ref.startswith("https://"):
-                    await self.send_text(
-                        room_id,
-                        f"{comp.name}: {file_ref}" if comp.name else file_ref,
-                        tmid,
-                    )
-                else:
-                    local_path = file_ref.replace("file:///", "").replace("file://", "")
-                    if local_path:
-                        await self.send_file(
-                            room_id, local_path, filename=comp.name, tmid=tmid
+                elif isinstance(comp, File):
+                    file_ref = comp.file or getattr(comp, "url", None) or ""
+                    if file_ref.startswith("http://") or file_ref.startswith("https://"):
+                        await self.send_text(
+                            room_id,
+                            f"{comp.name}: {file_ref}" if getattr(comp, "name", None) else file_ref,
+                            tmid,
                         )
-            elif isinstance(comp, Record):
-                if text_parts:
-                    await self.send_text(room_id, "".join(text_parts), tmid)
-                    text_parts.clear()
+                    else:
+                        local_path = file_ref.replace("file:///", "").replace("file://", "")
+                        if local_path:
+                            await self.send_file(room_id, local_path, filename=getattr(comp, "name", None), tmid=tmid)
 
-                file_ref = comp.file or getattr(comp, "url", None) or ""
-                media_path, cleanup = await self._resolve_outbound_media_path(
-                    file_ref,
-                    ".ogg",
-                )
-                if media_path:
-                    try:
-                        await self.send_file(room_id, media_path, tmid=tmid)
-                    finally:
-                        if cleanup:
-                            cleanup()
-            elif isinstance(comp, Video):
-                if text_parts:
-                    await self.send_text(room_id, "".join(text_parts), tmid)
-                    text_parts.clear()
-
-                file_ref = comp.file or ""
-                media_path, cleanup = await self._resolve_outbound_media_path(
-                    file_ref,
-                    ".mp4",
-                )
-                if media_path:
-                    try:
-                        await self.send_file(room_id, media_path, tmid=tmid)
-                    finally:
-                        if cleanup:
-                            cleanup()
+                elif isinstance(comp, (Record, Video)):
+                    file_ref = comp.file or getattr(comp, "url", None) or ""
+                    suffix = ".mp4" if isinstance(comp, Video) else ".ogg"
+                    media_path, cleanup = await self._resolve_outbound_media_path(file_ref, suffix)
+                    if media_path:
+                        try:
+                            await self.send_file(room_id, media_path, tmid=tmid)
+                        finally:
+                            if cleanup:
+                                cleanup()
             else:
                 fallback = str(comp)
                 if fallback:
