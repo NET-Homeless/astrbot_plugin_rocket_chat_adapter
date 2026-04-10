@@ -571,12 +571,22 @@ class RocketChatAdapter(Platform):
             logger.info(f"[RocketChat] 动态订阅新房间: {room_id}")
 
     async def _normalize_media_url(self, media_url: str) -> str:
-        """将 Rocket.Chat 返回的相对媒体地址补全为绝对 URL。"""
-        if media_url.startswith("http://") or media_url.startswith("https://"):
-            return media_url
-        if media_url.startswith("/"):
-            return f"{self.server_url}{media_url}"
-        return f"{self.server_url}/{media_url}"
+        """将 Rocket.Chat 返回的相对媒体地址补全为绝对 URL，并加上认证参数。"""
+        url = media_url
+        if not (url.startswith("http://") or url.startswith("https://")):
+            if url.startswith("/"):
+                url = f"{self.server_url}{url}"
+            else:
+                url = f"{self.server_url}/{url}"
+
+        # 仅对指向自身服务器的链接附加认证 query 参数
+        if url.startswith(self.server_url) and self.user_id and self.auth_token:
+            # 避免重复附加
+            if "rc_uid=" not in url and "rc_token=" not in url:
+                delimiter = "&" if "?" in url else "?"
+                url = f"{url}{delimiter}rc_uid={self.user_id}&rc_token={self.auth_token}"
+
+        return url
 
     def _classify_file_kind(self, file_obj: dict) -> str:
         """基于 MIME / 文件名 / URL 推断文件类别。"""
@@ -648,13 +658,18 @@ class RocketChatAdapter(Platform):
         ):
             await add_image_candidate(raw_msg.get(key), force=True)
 
-        attachments_raw = raw_msg.get("attachments", [])
-        if isinstance(attachments_raw, dict):
-            attachments = [attachments_raw]
-        else:
-            attachments = [att for att in attachments_raw if isinstance(att, dict)]
+        def _get_all_attachments(payload: dict) -> List[dict]:
+            res = []
+            att_raw = payload.get("attachments", [])
+            atts = [att_raw] if isinstance(att_raw, dict) else [a for a in att_raw if isinstance(a, dict)]
+            for att in atts:
+                res.append(att)
+                res.extend(_get_all_attachments(att))
+            return res
 
-        for att in attachments:
+        all_attachments = _get_all_attachments(raw_msg)
+
+        for att in all_attachments:
             mime_type = (
                 att.get("image_type") or att.get("type") or att.get("mimeType") or ""
             )
@@ -752,18 +767,33 @@ class RocketChatAdapter(Platform):
                     results.append((url, file_obj))
                     break
 
-        files_raw = raw_msg.get("files", [])
-        if isinstance(files_raw, dict):
-            iterable = [files_raw]
-        else:
-            iterable = [f for f in files_raw if isinstance(f, dict)]
-        for file_obj in iterable:
-            await add_candidate(file_obj)
+        def _get_all_attachments(payload: dict) -> List[dict]:
+            res = []
+            att_raw = payload.get("attachments", [])
+            atts = [att_raw] if isinstance(att_raw, dict) else [a for a in att_raw if isinstance(a, dict)]
+            for att in atts:
+                res.append(att)
+                res.extend(_get_all_attachments(att))
+            return res
 
-        for file_key in ("file", "fileUpload"):
-            single_file = raw_msg.get(file_key)
-            if isinstance(single_file, dict):
-                await add_candidate(single_file)
+        for context in [raw_msg] + _get_all_attachments(raw_msg):
+            files_raw = context.get("files", [])
+            if isinstance(files_raw, dict):
+                iterable = [files_raw]
+            else:
+                iterable = [f for f in files_raw if isinstance(f, dict)]
+            for file_obj in iterable:
+                await add_candidate(file_obj)
+
+            for file_key in ("file", "fileUpload"):
+                single_file = context.get(file_key)
+                if isinstance(single_file, dict):
+                    await add_candidate(single_file)
+            
+            # For attachments acting as media directly (like audio_url/video_url via title_link)
+            if context != raw_msg:
+                await add_candidate(context)
+
         return results
 
     async def _extract_file_components(self, raw_msg: dict) -> List[File]:
