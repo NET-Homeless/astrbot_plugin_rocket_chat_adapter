@@ -1,7 +1,7 @@
 name: astrbot_plugin_rocket_chat_adapter
 display_name: Rocket.Chat 适配器
 desc: AstrBot 的 Rocket.Chat 消息平台适配器，支持通过 WebSocket 实时接收消息，通过 REST API 发送消息
-version: v0.1.0
+version: v0.1.2
 author: 星光の殲滅者
 repo: https://github.com/NET-Homeless/astrbot_plugin_rocket_chat_adapter
 astrbot_version: ">=4.0"

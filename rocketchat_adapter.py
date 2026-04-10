@@ -23,7 +23,7 @@ from typing import Any, Callable, Dict, List, Optional
 from urllib.parse import urlparse
 
 import aiohttp
-from astrbot import logger
+from astrbot.api import logger
 from astrbot.api.event import MessageChain
 from astrbot.api.message_components import File, Image, Plain, Record, Video
 from astrbot.api.platform import (
@@ -49,6 +49,7 @@ from .rocketchat_event import RocketChatMessageEvent
         "password": "",
         "reconnect_delay": 5.0,
         "typing_indicator_delay": 0.5,
+        "remote_media_max_size": 20971520,
     },
     support_streaming_message=False,
 )
@@ -63,6 +64,7 @@ class RocketChatAdapter(Platform):
       password               : 机器人账号密码
       reconnect_delay        : WebSocket 断线后重连等待秒数，默认 5.0
       typing_indicator_delay : 输入中提示的延迟秒数；小于该时间的快速系统回复不显示 typing
+      remote_media_max_size  : 远端媒体下载大小上限（字节），默认 20MB
     """
 
     def __init__(
@@ -83,6 +85,9 @@ class RocketChatAdapter(Platform):
         self.reconnect_delay: float = float(platform_config.get("reconnect_delay", 5.0))
         self.typing_indicator_delay: float = float(
             platform_config.get("typing_indicator_delay", 0.5)
+        )
+        self.remote_media_max_size: int = int(
+            platform_config.get("remote_media_max_size", 20 * 1024 * 1024)
         )
 
         # 运行时状态
@@ -107,6 +112,8 @@ class RocketChatAdapter(Platform):
         self._typing_seq: int = 0
         # 后台任务强引用集合，防止 Python 3.12+ GC 回收未完成的 task
         self._background_tasks: set[asyncio.Task] = set()
+        # 并发处理控制，防止瞬间过多消息导致处理积压
+        self._message_semaphore = asyncio.Semaphore(100)
 
         self._meta = PlatformMetadata(
             name="rocket_chat",
@@ -126,7 +133,9 @@ class RocketChatAdapter(Platform):
         """适配器主入口，持续运行并自动重连。"""
         self._running = True
         self._stop_event = asyncio.Event()
-        self._http_session = aiohttp.ClientSession()
+        self._http_session = aiohttp.ClientSession(
+            timeout=aiohttp.ClientTimeout(total=45.0)
+        )
 
         try:
             # 第一步：REST API 登录，获取 authToken / userId
@@ -198,6 +207,17 @@ class RocketChatAdapter(Platform):
                 await self._http_session.close()
             except Exception:
                 pass
+
+        # 统一取消并等待后台任务完成，避免生命周期外泄漏
+        if self._background_tasks:
+            for task in list(self._background_tasks):
+                if not task.done():
+                    task.cancel()
+            try:
+                await asyncio.gather(*self._background_tasks, return_exceptions=True)
+            except Exception:
+                pass
+            self._background_tasks.clear()
 
     # ------------------------------------------------------------------ #
     #  REST API                                                            #
@@ -316,7 +336,7 @@ class RocketChatAdapter(Platform):
         async with self._http_session.ws_connect(
             ws_url,
             heartbeat=30.0,  # aiohttp 层面 TCP 心跳
-            max_msg_size=0,  # 不限制单条消息大小
+            max_msg_size=8 * 1024 * 1024,  # 限制单条消息最大 8MB 防止超大帧导致内存激增 (DoS风险)
         ) as ws:
             self._ws = ws
             try:
@@ -472,8 +492,12 @@ class RocketChatAdapter(Platform):
                 # 房间新消息推送
                 args: List[dict] = data.get("fields", {}).get("args", [])
                 for raw_msg in args:
-                    # 异步处理，避免阻塞接收循环
-                    task = asyncio.create_task(self._process_incoming_message(raw_msg))
+                    # 并发并使用信号量控制上限，避免突发高流量导致 OOM 或过载
+                    async def process(msg: dict):
+                        async with self._message_semaphore:
+                            await self._process_incoming_message(msg)
+
+                    task = asyncio.create_task(process(raw_msg))
                     self._background_tasks.add(task)
                     task.add_done_callback(self._background_tasks.discard)
 
@@ -924,11 +948,16 @@ class RocketChatAdapter(Platform):
                 abm.group = Group(group_id=room_id)
 
             # ---- 检测 @mention，决定是否唤醒 AstrBot ----
+            bot_mentioned = False
             mentions = raw_msg.get("mentions", [])
-            bot_mentioned = any(
-                m.get("_id") == self.user_id or m.get("username") == self.bot_username
-                for m in mentions
-            )
+            if isinstance(mentions, list):
+                for m in mentions:
+                    if isinstance(m, dict) and (
+                        m.get("_id") == self.user_id or m.get("username") == self.bot_username
+                    ):
+                        bot_mentioned = True
+                        break
+            
             if bot_mentioned:
                 # 从消息文本里去掉 @botusername，只保留实际内容
                 clean_text = msg_text.replace(f"@{self.bot_username}", "").strip()
@@ -1059,7 +1088,6 @@ class RocketChatAdapter(Platform):
         room_id: str,
         text: str,
         original_msg: dict,
-        sender_name: str,
         tmid: Optional[str] = None,
     ) -> None:
         """
@@ -1068,7 +1096,6 @@ class RocketChatAdapter(Platform):
         :param room_id:      目标房间 ID
         :param text:         机器人回复正文
         :param original_msg: 被引用的原始消息 raw_msg dict
-        :param sender_name:  被引用消息的发送者显示名
         :param tmid:         可选线程 ID
         """
         msg_id = original_msg.get("_id", "")
@@ -1271,16 +1298,43 @@ class RocketChatAdapter(Platform):
         default_suffix: str,
     ) -> tuple[str | None, Callable[[], None] | None]:
         parsed = urlparse(url)
+        if parsed.scheme not in {"http", "https"}:
+            logger.warning(f"[RocketChat] 拒绝下载不支持的媒体协议: {url}")
+            return None, None
+
         filename = parsed.path.rsplit("/", 1)[-1] if parsed.path else ""
         suffix = (
             "." + filename.rsplit(".", 1)[-1] if "." in filename else default_suffix
         )
         try:
-            async with self._http_session.get(url) as resp:
+            async with self._http_session.get(
+                url,
+                timeout=aiohttp.ClientTimeout(total=30, connect=10),
+                allow_redirects=True,
+                max_redirects=3,
+            ) as resp:
                 if resp.status >= 400:
                     logger.error(f"[RocketChat] 下载媒体失败 {resp.status}: {url}")
                     return None, None
-                raw = await resp.read()
+
+                content_length = resp.content_length
+                if (
+                    content_length is not None
+                    and content_length > self.remote_media_max_size
+                ):
+                    logger.error(
+                        f"[RocketChat] 下载媒体失败，文件过大: {content_length} > {self.remote_media_max_size} ({url})"
+                    )
+                    return None, None
+
+                raw = bytearray()
+                async for chunk in resp.content.iter_chunked(64 * 1024):
+                    raw.extend(chunk)
+                    if len(raw) > self.remote_media_max_size:
+                        logger.error(
+                            f"[RocketChat] 下载媒体失败，文件超过限制: {len(raw)} > {self.remote_media_max_size} ({url})"
+                        )
+                        return None, None
         except Exception as exc:
             logger.error(f"[RocketChat] 下载媒体异常: {exc!r}")
             return None, None

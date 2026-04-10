@@ -7,23 +7,16 @@ import tempfile
 from typing import TYPE_CHECKING, Callable
 from urllib.parse import urlparse
 
-from astrbot import logger
+from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent, MessageChain
 from astrbot.api.message_components import (
     At,
     AtAll,
-    Face,
     File,
-    Forward,
     Image,
-    Json,
-    Location,
-    Music,
     Plain,
-    Poke,
     Record,
     Reply,
-    Share,
     Video,
 )
 from astrbot.api.platform import AstrBotMessage, PlatformMetadata
@@ -90,7 +83,7 @@ class RocketChatMessageEvent(AstrMessageEvent):
         self._typing_task = asyncio.create_task(self._typing_indicator_worker())
 
     async def stop_typing_indicator(self) -> None:
-        """停止 typing 状态，并清理延迟任务。"""
+        """结束 typing 状态并取消后台任务。"""
         task = self._typing_task
         self._typing_task = None
 
@@ -152,7 +145,6 @@ class RocketChatMessageEvent(AstrMessageEvent):
         await self.stop_typing_indicator()
 
         text_parts: list[str] = []
-        pending_images: list[Image] = []
 
         try:
             for comp in message.chain:
@@ -172,12 +164,11 @@ class RocketChatMessageEvent(AstrMessageEvent):
                         text_parts.append(f"@{mention_name} ")
 
                 elif isinstance(comp, Image):
-                    # 先把前面累积的文本发出去，再发图片，保持顺序
                     combined = "".join(text_parts).strip()
                     if combined:
                         await self._flush_text(combined)
                         text_parts.clear()
-                    pending_images.append(comp)
+                    await self._send_image_component(comp)
 
                 elif isinstance(comp, File):
                     combined = "".join(text_parts).strip()
@@ -217,10 +208,6 @@ class RocketChatMessageEvent(AstrMessageEvent):
             if remaining_text:
                 await self._flush_text(remaining_text)
 
-            # 发送所有图片
-            for img in pending_images:
-                await self._send_image_component(img)
-
             # ⚠️ 必须调用父类 send，框架在此更新发送状态 & 上报 Metric
             await super().send(message)
         finally:
@@ -238,7 +225,6 @@ class RocketChatMessageEvent(AstrMessageEvent):
                 self.room_id,
                 text,
                 self.message_obj.raw_message,
-                self.message_obj.sender.nickname or self.message_obj.sender.user_id,
             )
             # 第一段文本已作为引用发出，后续内容走普通发送
             self.quote_original = False
@@ -331,7 +317,7 @@ class RocketChatMessageEvent(AstrMessageEvent):
     ) -> tuple[str | None, Callable[[], None] | None]:
         """将组件引用解析为可上传的本地文件路径。"""
         if file_ref.startswith("http://") or file_ref.startswith("https://"):
-            return await self._download_to_temp(file_ref, default_suffix)
+            return await self.adapter._download_remote_media(file_ref, default_suffix)
         if file_ref.startswith("base64://"):
             return self._decode_base64_to_temp(file_ref, default_suffix)
 
@@ -350,7 +336,13 @@ class RocketChatMessageEvent(AstrMessageEvent):
             else default_suffix
         )
         try:
-            async with self.adapter._http_session.get(url) as resp:
+            # 检查连接是否可用以防泄漏或在关闭边缘调用
+            if not getattr(self.adapter, "_http_session", None) or self.adapter._http_session.closed:
+                logger.warning(f"[RocketChat] 下载媒体失败: HTTP Session 已关闭或不可用")
+                return None, None
+            
+            # 使用 timeout 参数防长挂起 (结合配置和 SSRF 防护面减小风险)
+            async with self.adapter._http_session.get(url, timeout=30) as resp:
                 if resp.status >= 400:
                     logger.error(f"[RocketChat] 下载媒体失败 {resp.status}: {url}")
                     return None, None
