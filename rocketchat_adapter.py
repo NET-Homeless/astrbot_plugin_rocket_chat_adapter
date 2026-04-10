@@ -1028,16 +1028,18 @@ class RocketChatAdapter(Platform):
                         break
             
             if bot_mentioned:
-                # 从消息文本里去掉 @botusername，只保留实际内容
-                clean_text = msg_text.replace(f"@{self.bot_username}", "").strip()
-                abm.message_str = clean_text
-                # 更新 Plain 组件里的文本
+                # 遍地清理 @botusername，绝对不可以把全局替换后的纯文本重新塞进单一组件，这样会破坏多模态组件流时序！
+                bot_mentions = [f"@{self.bot_username} ", f"@{self.bot_username}"]
+                new_msg_text = ""
                 for comp in abm.message:
                     if isinstance(comp, Plain):
-                        comp.text = clean_text
-                        break
+                        for bm in bot_mentions:
+                            comp.text = comp.text.replace(bm, "")
+                        new_msg_text += comp.text
+                
+                abm.message_str = new_msg_text.strip()
                 logger.debug(
-                    f"[RocketChat][IN] bot mentioned, clean_text={clean_text!r}"
+                    f"[RocketChat][IN] bot mentioned, clean_text={abm.message_str!r}"
                 )
 
             # ---- 判断回复场景 ----
