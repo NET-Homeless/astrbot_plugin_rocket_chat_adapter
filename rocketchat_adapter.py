@@ -631,9 +631,9 @@ class RocketChatAdapter(Platform):
         """从 Rocket.Chat 多种附件/文件结构中提取图片 URL。"""
         image_urls: List[str] = []
 
-        async def add_image_candidate(candidate: Any, force: bool = False) -> None:
+        async def add_image_candidate(candidate: Any, force: bool = False) -> Optional[str]:
             if not candidate:
-                return
+                return None
 
             if isinstance(candidate, dict):
                 for key in (
@@ -645,19 +645,21 @@ class RocketChatAdapter(Platform):
                     "titleLink",
                     "link",
                 ):
-                    await add_image_candidate(candidate.get(key), force=force)
-                return
+                    res = await add_image_candidate(candidate.get(key), force=force)
+                    if res:
+                        return res
+                return None
 
             if not isinstance(candidate, str):
-                return
+                return None
 
             if force:
-                image_urls.append(await self._normalize_media_url(candidate))
-                return
+                return await self._normalize_media_url(candidate)
 
             guessed, _ = mimetypes.guess_type(candidate.split("?", 1)[0])
             if guessed and guessed.startswith("image/"):
-                image_urls.append(await self._normalize_media_url(candidate))
+                return await self._normalize_media_url(candidate)
+            return None
 
         for key in (
             "image_url",
@@ -668,13 +670,18 @@ class RocketChatAdapter(Platform):
             "image_preview",
             "imagePreview",
         ):
-            await add_image_candidate(raw_msg.get(key), force=True)
+            res = await add_image_candidate(raw_msg.get(key), force=True)
+            if res and res not in image_urls:
+                image_urls.append(res)
+                break
 
         def _get_all_attachments(payload: dict) -> List[dict]:
             res = []
             att_raw = payload.get("attachments", [])
             atts = [att_raw] if isinstance(att_raw, dict) else [a for a in att_raw if isinstance(a, dict)]
             for att in atts:
+                if att.get("message_link"):
+                    continue
                 res.append(att)
                 res.extend(_get_all_attachments(att))
             return res
@@ -693,28 +700,28 @@ class RocketChatAdapter(Platform):
                 "image_url",
                 "imageUrl",
                 "image",
-                "image_preview",
-                "imagePreview",
-                "thumb_url",
-                "thumbUrl",
                 "url",
                 "path",
                 "title_link",
                 "titleLink",
+                "image_preview",
+                "imagePreview",
+                "thumb_url",
+                "thumbUrl",
             ):
-                await add_image_candidate(
-                    att.get(key),
-                    force=is_image_attachment
-                    or key
-                    in {
-                        "image_url",
-                        "imageUrl",
-                        "image_preview",
-                        "imagePreview",
-                        "thumb_url",
-                        "thumbUrl",
-                    },
-                )
+                force = is_image_attachment or key in {
+                    "image_url",
+                    "imageUrl",
+                    "image",
+                    "image_preview",
+                    "imagePreview",
+                    "thumb_url",
+                    "thumbUrl",
+                }
+                res = await add_image_candidate(att.get(key), force=force)
+                if res and res not in image_urls:
+                    image_urls.append(res)
+                    break
 
         files_raw = raw_msg.get("files", [])
         if isinstance(files_raw, dict):
@@ -726,7 +733,10 @@ class RocketChatAdapter(Platform):
             is_image_file = self._classify_file_kind(file_obj) == "image"
 
             for key in ("url", "path", "title_link", "titleLink", "link"):
-                await add_image_candidate(file_obj.get(key), force=is_image_file)
+                res = await add_image_candidate(file_obj.get(key), force=is_image_file)
+                if res and res not in image_urls:
+                    image_urls.append(res)
+                    break
 
         for file_key in ("file", "fileUpload"):
             single_file = raw_msg.get(file_key)
@@ -736,7 +746,10 @@ class RocketChatAdapter(Platform):
             is_image_file = self._classify_file_kind(single_file) == "image"
 
             for key in ("url", "path", "title_link", "titleLink", "link"):
-                await add_image_candidate(single_file.get(key), force=is_image_file)
+                res = await add_image_candidate(single_file.get(key), force=is_image_file)
+                if res and res not in image_urls:
+                    image_urls.append(res)
+                    break
 
         for url_obj in raw_msg.get("urls", []):
             if not isinstance(url_obj, dict):
@@ -784,6 +797,8 @@ class RocketChatAdapter(Platform):
             att_raw = payload.get("attachments", [])
             atts = [att_raw] if isinstance(att_raw, dict) else [a for a in att_raw if isinstance(a, dict)]
             for att in atts:
+                if att.get("message_link"):
+                    continue
                 res.append(att)
                 res.extend(_get_all_attachments(att))
             return res
@@ -888,7 +903,11 @@ class RocketChatAdapter(Platform):
                 local_files = await self._extract_file_components(current_payload)
 
                 # --- 定位所有引用 ---
-                pattern = re.compile(r"\[\s*\]\([^)]+\?msg=([a-zA-Z0-9]+)[^)]*\)")
+                # 兼容多种引用格式：
+                # 1. [ ](https://.../?msg=123)
+                # 2. [引用文本](https://.../?msg=123)
+                # 3. https://.../?msg=123
+                pattern = re.compile(r"(?:\[.*?\]\()?https?://[^\s)]+\?msg=([a-zA-Z0-9]+)[^\s)]*(?:\))?")
                 
                 implicit_quote_ids = []
                 for att in _get_all_attachments_tmp(current_payload):
