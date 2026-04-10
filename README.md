@@ -10,6 +10,7 @@
 
 - ✅ **实时消息接收** — 基于 WebSocket（DDP 协议）订阅频道、私有群组、私信消息
 - ✅ **消息发送** — 通过 REST API 发送文本、图片、语音、视频和普通文件
+- ✅ **输入中提示** — 群聊/线程中 `@bot` 后支持延迟 typing；私聊也支持延迟 typing
 - ✅ **自动重连** — WebSocket 断线后自动重连，无需人工干预
 - ✅ **动态订阅** — 机器人被加入新房间后自动订阅，无需重启
 - ✅ **全局管理员** — 与 AstrBot 核心权限系统无缝集成
@@ -71,6 +72,7 @@ git clone https://github.com/NET-Homeless/astrbot_plugin_rocket_chat_adapter
 | `username` | string | ✅ | — | 机器人账号用户名 |
 | `password` | string | ✅ | — | 机器人账号密码 |
 | `reconnect_delay` | float | 否 | `5.0` | WebSocket 断线后重连等待秒数 |
+| `typing_indicator_delay` | float | 否 | `0.5` | 输入中提示延迟秒数；若在该时间内已回复，则不会显示 typing |
 
 ### 配置示例（JSON）
 
@@ -80,7 +82,8 @@ git clone https://github.com/NET-Homeless/astrbot_plugin_rocket_chat_adapter
   "server_url": "https://chat.example.com",
   "username": "astrbot",
   "password": "your_bot_password",
-  "reconnect_delay": 5.0
+  "reconnect_delay": 5.0,
+  "typing_indicator_delay": 0.5
 }
 ```
 
@@ -99,6 +102,13 @@ git clone https://github.com/NET-Homeless/astrbot_plugin_rocket_chat_adapter
 ```
 
 私信机器人账号时，无需唤醒词，所有消息均会被处理。
+
+### 输入中提示（Typing）
+
+- **群聊 / 线程**：只有在 `@bot` 后才会启动延迟 typing
+- **私聊**：只要用户给 bot 账号发消息，就会启动延迟 typing
+- **延迟控制**：默认延迟 `0.5s`，如果 bot 在延迟时间内已经完成回复，则不会显示 typing
+- **停止时机**：真正发送消息前会自动发送 `typing=false`
 
 ### 管理员权限
 
@@ -191,21 +201,22 @@ Rocket.Chat 房间收到回复
 | 出站普通文件 | `rooms.upload` | `File` 组件发送 | ✅ 已实现 | 本地文件上传；远端 URL 退化为文本链接 |
 | 出站语音回复 | `rooms.upload` | `Record` 组件发送 | ✅ 已实现 | 本地文件、HTTP(S)、Base64 均可上传 |
 | 出站视频回复 | `rooms.upload` | `Video` 组件发送 | ✅ 已实现 | 本地文件、HTTP(S) 均可上传 |
+| 出站输入中状态 | `stream-notify-room` | typing 指示器 | ✅ 已实现 | 群聊/线程仅在 `@bot` 时启用；私聊也支持；受 `typing_indicator_delay` 控制 |
 | 系统/审计事件 | 加入/退出/改名/权限变化等 | 无统一映射 | ❌ 不支持 | 当前版本不建模为 AstrBot 事件 |
-| 交互状态事件 | 编辑、撤回、反应、输入中、已读、在线状态 | 无统一映射 | ❌ 不支持 | 不在当前适配器范围 |
+| 交互状态事件 | 编辑、撤回、反应、已读、在线状态 | 无统一映射 | ❌ 不支持 | 输入中已实现，其余状态仍不在当前适配器范围 |
 | 其他富媒体语义 | 转发等 | 文本兜底或忽略 | ⚠️ 降级处理 | 非消息闭环基线的一部分 |
 
 ### 严格边界判定
 
 - **严格支持（✅）**
   - 入站：文本消息、图片消息、普通文件消息、语音消息、视频消息
-  - 出站：文本回复、图片回复、普通文件回复、语音回复、视频回复
+  - 出站：文本回复、图片回复、普通文件回复、语音回复、视频回复、输入中状态
   - 运行：房间订阅变更（动态订阅）
 - **降级支持（⚠️）**
   - 转发等其他富媒体语义：仅文本兜底或忽略，不保证语义等价
 - **不支持（❌）**
   - 系统/审计事件
-  - 交互状态事件（编辑、撤回、反应、输入中、已读、在线状态等）
+  - 交互状态事件（编辑、撤回、反应、已读、在线状态等）
 
 以上判定以当前实现为准：只有 ✅ 条目属于“严格支持目标”，⚠️/❌ 均不纳入严格支持承诺。
 
@@ -215,8 +226,8 @@ Rocket.Chat 房间收到回复
 |------|------|------|
 | Realtime API 已废弃 | 外部约束 | Rocket.Chat 官方将 DDP WebSocket 标注为 Deprecated；当前接收链路仍依赖该能力。 |
 | 流式消息输出不可用 | 外部约束 | Rocket.Chat REST 发送形态限制，`support_streaming_message=False`。 |
-| 其他富媒体语义仍为降级支持 | 功能边界 | 当前严格支持覆盖文本、图片、普通文件、语音、视频；转发等其余富媒体语义仍为兜底或未实现。 |
-| 非消息型事件未覆盖 | 范围约束 | 编辑、撤回、反应、状态类事件不在当前版本范围。 |
+| 其他富媒体语义仍为降级支持 | 功能边界 | 当前严格支持覆盖文本、图片、普通文件、语音、视频和输入中状态；转发等其余富媒体语义仍为兜底或未实现。 |
+| 非消息型事件未覆盖 | 范围约束 | 编辑、撤回、反应、已读、在线状态等事件不在当前版本范围。 |
 
 以上“支持范围”定义的是 AstrBot 与 Rocket.Chat 的稳定交集，不等同于两端全部事件能力。
 

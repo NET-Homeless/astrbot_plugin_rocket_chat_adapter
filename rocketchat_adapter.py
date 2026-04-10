@@ -48,6 +48,7 @@ from .rocketchat_event import RocketChatMessageEvent
         "username": "",
         "password": "",
         "reconnect_delay": 5.0,
+        "typing_indicator_delay": 0.5,
     },
     support_streaming_message=False,
 )
@@ -56,11 +57,12 @@ class RocketChatAdapter(Platform):
     Rocket.Chat 平台适配器。
 
     配置项（default_config_tmpl）：
-      id             : 适配器实例唯一标识，默认 "rocket_chat"
-      server_url     : Rocket.Chat 服务器地址，如 http://localhost:3000
-      username       : 机器人账号用户名
-      password       : 机器人账号密码
-      reconnect_delay: WebSocket 断线后重连等待秒数，默认 5.0
+      id                     : 适配器实例唯一标识，默认 "rocket_chat"
+      server_url             : Rocket.Chat 服务器地址，如 http://localhost:3000
+      username               : 机器人账号用户名
+      password               : 机器人账号密码
+      reconnect_delay        : WebSocket 断线后重连等待秒数，默认 5.0
+      typing_indicator_delay : 输入中提示的延迟秒数；小于该时间的快速系统回复不显示 typing
     """
 
     def __init__(
@@ -79,6 +81,9 @@ class RocketChatAdapter(Platform):
         self.username: str = platform_config.get("username", "")
         self.password: str = platform_config.get("password", "")
         self.reconnect_delay: float = float(platform_config.get("reconnect_delay", 5.0))
+        self.typing_indicator_delay: float = float(
+            platform_config.get("typing_indicator_delay", 0.5)
+        )
 
         # 运行时状态
         self.auth_token: Optional[str] = None
@@ -98,6 +103,10 @@ class RocketChatAdapter(Platform):
         self._room_name_cache: Dict[str, str] = {}
         # 已订阅房间集合，防止重复订阅导致消息被多次处理
         self._subscribed_rooms: set = set()
+        # typing method 调用序号
+        self._typing_seq: int = 0
+        # 后台任务强引用集合，防止 Python 3.12+ GC 回收未完成的 task
+        self._background_tasks: set[asyncio.Task] = set()
 
         self._meta = PlatformMetadata(
             name="rocket_chat",
@@ -464,11 +473,27 @@ class RocketChatAdapter(Platform):
                 args: List[dict] = data.get("fields", {}).get("args", [])
                 for raw_msg in args:
                     # 异步处理，避免阻塞接收循环
-                    asyncio.create_task(self._process_incoming_message(raw_msg))
+                    task = asyncio.create_task(self._process_incoming_message(raw_msg))
+                    self._background_tasks.add(task)
+                    task.add_done_callback(self._background_tasks.discard)
 
             elif collection == "stream-notify-user":
                 # 用户级别通知（如：被加入新房间）
                 await self._handle_user_notification(data, ws)
+
+        elif msg_type == "result":
+            # DDP method 调用结果
+            result_id = data.get("id", "")
+            if result_id.startswith("typing-"):
+                error = data.get("error")
+                if error:
+                    logger.warning(
+                        f"[RocketChat] typing method 调用被服务端拒绝: id={result_id} error={error}"
+                    )
+                else:
+                    logger.debug(
+                        f"[RocketChat] typing method 调用成功: id={result_id} result={data.get('result')}"
+                    )
 
         elif msg_type == "added":
             # DDP 初始化数据，暂不处理
@@ -942,6 +967,13 @@ class RocketChatAdapter(Platform):
             if bot_mentioned or msg_type == MessageType.FRIEND_MESSAGE:
                 event.is_at_or_wake_command = True
 
+            # 群聊 / 线程中仅在 @bot 时启用延迟 typing；
+            # 私聊则收到消息后直接启用延迟 typing。
+            if (
+                msg_type == MessageType.GROUP_MESSAGE and bot_mentioned
+            ) or msg_type == MessageType.FRIEND_MESSAGE:
+                event.start_typing_indicator()
+
             logger.debug(
                 "[RocketChat][IN] → commit type=%s room=%r msg=%r wake=%s"
                 % (
@@ -991,6 +1023,36 @@ class RocketChatAdapter(Platform):
                     logger.error(f"[RocketChat] 发送文本失败: {data}")
         except Exception as exc:
             logger.error(f"[RocketChat] 发送文本异常: {exc!r}")
+
+    async def send_typing(self, room_id: str, flag: bool) -> None:
+        """
+        通过 Rocket.Chat Realtime API 发送 typing 状态。
+
+        :param room_id: 目标房间 ID
+        :param flag:    True 表示正在输入，False 表示结束输入
+        """
+        if not self._ws or self._ws.closed or not self.bot_username:
+            logger.warning(
+                f"[RocketChat] typing 跳过: ws={self._ws is not None and not getattr(self._ws, 'closed', True)} bot_username={self.bot_username!r}"
+            )
+            return
+        self._typing_seq += 1
+        try:
+            logger.debug(
+                f"[RocketChat] send typing room_id={room_id!r} user={self.bot_username!r} flag={flag}"
+            )
+            await self._ws.send_json(
+                {
+                    "msg": "method",
+                    "method": "stream-notify-room",
+                    "id": f"typing-{self._typing_seq}",
+                    "params": [f"{room_id}/typing", self.bot_username, flag],
+                }
+            )
+        except Exception as exc:
+            logger.warning(
+                f"[RocketChat] 发送 typing 状态失败 room_id={room_id!r} flag={flag}: {exc!r}"
+            )
 
     async def send_with_quote(
         self,

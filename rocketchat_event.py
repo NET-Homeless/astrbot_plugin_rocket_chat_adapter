@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import base64
 import os
 import tempfile
@@ -67,6 +68,64 @@ class RocketChatMessageEvent(AstrMessageEvent):
         self.thread_id: str | None = thread_id
         self.quote_original: bool = quote_original
         self.adapter: "RocketChatAdapter" = adapter
+        self._typing_task: asyncio.Task | None = None
+        self._typing_started: bool = False
+        self._typing_keepalive_interval: float = 3.0
+
+    # ------------------------------------------------------------------
+    # typing 指示器
+    # ------------------------------------------------------------------
+
+    def start_typing_indicator(self) -> None:
+        """
+        启动一个延迟 typing 任务。
+
+        设计目标：
+        - 群聊 / 线程里 @bot 后，如果 LLM 需要较长时间生成回复，则显示 typing
+        - 如果是系统命令等快速回复，在 delay 时间内完成，则不会显示 typing
+        """
+        if self._typing_task is not None and not self._typing_task.done():
+            return
+        logger.debug(f"[RocketChat][Event] start_typing_indicator room={self.room_id!r}")
+        self._typing_task = asyncio.create_task(self._typing_indicator_worker())
+
+    async def stop_typing_indicator(self) -> None:
+        """停止 typing 状态，并清理延迟任务。"""
+        task = self._typing_task
+        self._typing_task = None
+
+        if task and not task.done():
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+
+        if self._typing_started:
+            self._typing_started = False
+            try:
+                await self.adapter.send_typing(self.room_id, False)
+            except Exception as exc:
+                logger.warning(f"[RocketChat][Event] stop typing failed: {exc!r}")
+
+    async def _typing_indicator_worker(self) -> None:
+        """延迟后启动 typing，并在回复完成前定期续期。"""
+        try:
+            delay = float(getattr(self.adapter, "typing_indicator_delay", 0.8))
+            logger.debug(f"[RocketChat][Event] typing worker started, delay={delay}s room={self.room_id!r}")
+            if delay > 0:
+                await asyncio.sleep(delay)
+            await self.adapter.send_typing(self.room_id, True)
+            self._typing_started = True
+
+            interval = self._typing_keepalive_interval
+            while True:
+                await asyncio.sleep(interval)
+                await self.adapter.send_typing(self.room_id, True)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning(f"[RocketChat][Event] typing worker failed: {exc!r}")
 
     # ------------------------------------------------------------------
     # 核心：将 MessageChain 发送到 Rocket.Chat
@@ -90,77 +149,82 @@ class RocketChatMessageEvent(AstrMessageEvent):
             self.thread_id,
             [type(c).__name__ for c in message.chain],
         )
+        await self.stop_typing_indicator()
+
         text_parts: list[str] = []
         pending_images: list[Image] = []
 
-        for comp in message.chain:
-            if isinstance(comp, Plain):
-                text_parts.append(comp.text)
+        try:
+            for comp in message.chain:
+                if isinstance(comp, Plain):
+                    text_parts.append(comp.text)
 
-            elif isinstance(comp, AtAll):
-                text_parts.append("@all ")
+                elif isinstance(comp, AtAll):
+                    text_parts.append("@all ")
 
-            elif isinstance(comp, At):
-                # Rocket.Chat 支持 @username 格式的提及
-                # AstrBot At 组件可能使用 name 或 qq 字段存储用户标识
-                mention_name = (
-                    getattr(comp, "name", None) or getattr(comp, "qq", None) or ""
-                )
-                if mention_name:
-                    text_parts.append(f"@{mention_name} ")
+                elif isinstance(comp, At):
+                    # Rocket.Chat 支持 @username 格式的提及
+                    # AstrBot At 组件可能使用 name 或 qq 字段存储用户标识
+                    mention_name = (
+                        getattr(comp, "name", None) or getattr(comp, "qq", None) or ""
+                    )
+                    if mention_name:
+                        text_parts.append(f"@{mention_name} ")
 
-            elif isinstance(comp, Image):
-                # 先把前面累积的文本发出去，再发图片，保持顺序
-                combined = "".join(text_parts).strip()
-                if combined:
-                    await self._flush_text(combined)
-                    text_parts.clear()
-                pending_images.append(comp)
+                elif isinstance(comp, Image):
+                    # 先把前面累积的文本发出去，再发图片，保持顺序
+                    combined = "".join(text_parts).strip()
+                    if combined:
+                        await self._flush_text(combined)
+                        text_parts.clear()
+                    pending_images.append(comp)
 
-            elif isinstance(comp, File):
-                combined = "".join(text_parts).strip()
-                if combined:
-                    await self._flush_text(combined)
-                    text_parts.clear()
-                await self._send_file_component(comp)
+                elif isinstance(comp, File):
+                    combined = "".join(text_parts).strip()
+                    if combined:
+                        await self._flush_text(combined)
+                        text_parts.clear()
+                    await self._send_file_component(comp)
 
-            elif isinstance(comp, Record):
-                combined = "".join(text_parts).strip()
-                if combined:
-                    await self._flush_text(combined)
-                    text_parts.clear()
-                await self._send_record_component(comp)
+                elif isinstance(comp, Record):
+                    combined = "".join(text_parts).strip()
+                    if combined:
+                        await self._flush_text(combined)
+                        text_parts.clear()
+                    await self._send_record_component(comp)
 
-            elif isinstance(comp, Video):
-                combined = "".join(text_parts).strip()
-                if combined:
-                    await self._flush_text(combined)
-                    text_parts.clear()
-                await self._send_video_component(comp)
+                elif isinstance(comp, Video):
+                    combined = "".join(text_parts).strip()
+                    if combined:
+                        await self._flush_text(combined)
+                        text_parts.clear()
+                    await self._send_video_component(comp)
 
-            elif isinstance(comp, Reply):
-                # AstrBot 会自动在部分场景附加 Reply 组件。
-                # 由于 Rocket.Chat 适配器已经使用了原生的引用回复语法 (quote_original)
-                # 或者通过 thread (tmid) 回复，因此直接无视它，避免把内部对象发出去
-                pass
+                elif isinstance(comp, Reply):
+                    # AstrBot 会自动在部分场景附加 Reply 组件。
+                    # 由于 Rocket.Chat 适配器已经使用了原生的引用回复语法 (quote_original)
+                    # 或者通过 thread (tmid) 回复，因此直接无视它，避免把内部对象发出去
+                    pass
 
-            else:
-                # 其他组件（Forward 等）暂时转文本兜底
-                fallback = str(comp)
-                if fallback:
-                    text_parts.append(fallback)
+                else:
+                    # 其他组件（Forward 等）暂时转文本兜底
+                    fallback = str(comp)
+                    if fallback:
+                        text_parts.append(fallback)
 
-        # 发送剩余文本
-        remaining_text = "".join(text_parts).strip()
-        if remaining_text:
-            await self._flush_text(remaining_text)
+            # 发送剩余文本
+            remaining_text = "".join(text_parts).strip()
+            if remaining_text:
+                await self._flush_text(remaining_text)
 
-        # 发送所有图片
-        for img in pending_images:
-            await self._send_image_component(img)
+            # 发送所有图片
+            for img in pending_images:
+                await self._send_image_component(img)
 
-        # ⚠️ 必须调用父类 send，框架在此更新发送状态 & 上报 Metric
-        await super().send(message)
+            # ⚠️ 必须调用父类 send，框架在此更新发送状态 & 上报 Metric
+            await super().send(message)
+        finally:
+            await self.stop_typing_indicator()
 
     async def _flush_text(self, text: str) -> None:
         """发送一段文本，自动选择引用回复或普通发送。"""
