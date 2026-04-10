@@ -1,0 +1,49 @@
+name: Auto Release
+
+on:
+  push:
+    branches:
+      - main
+      - master
+    paths:
+      - 'metadata.yaml'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # 需要获取完整历史记录才能生成准确的 Changelog
+
+      - name: Extract version from metadata.yaml
+        id: get_version
+        run: |
+          # 从 metadata.yaml 中提取 version 字段（去掉两端可能的引号和空格）
+          VERSION=$(grep '^version:' metadata.yaml | sed 's/^version:[[:space:]]*//' | tr -d '"'\''')
+          echo "Parsed version: $VERSION"
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+
+      - name: Check if tag already exists
+        id: check_tag
+        run: |
+          # 检查对应版本的 tag 是否已经存在，避免重复发布报错
+          if git rev-parse "refs/tags/${{ steps.get_version.outputs.version }}" >/dev/null 2>&1; then
+            echo "exists=true" >> $GITHUB_OUTPUT
+            echo "Tag ${{ steps.get_version.outputs.version }} 已经存在，跳过发布。"
+          else
+            echo "exists=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Create Release and Changelog
+        if: steps.check_tag.outputs.exists == 'false'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.get_version.outputs.version }}
+          name: Release ${{ steps.get_version.outputs.version }}
+          # 启用 GitHub 原生的自动生成 Release Notes 功能（基于上一个 tag 计算 commit 差异生成 changelog）
+          generate_release_notes: true
