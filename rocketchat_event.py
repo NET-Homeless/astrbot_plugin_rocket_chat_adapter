@@ -213,14 +213,23 @@ class RocketChatMessageEvent(AstrMessageEvent):
             text[:80],
         )
         if self.quote_original:
+            logger.info(
+                f"[RocketChat][Event] 触发引用回复 quote_original=True thread_id={self.thread_id!r}"
+            )
+            # 频道 @mention 场景：仅用 attachments 显示引用框，不创建线程
+            # 如果是线程消息，thread_id 已在初始化时设置，后续普通发送会用到它
             await self.adapter.send_with_quote(
                 self.room_id,
                 text,
                 self.message_obj.raw_message,
+                tmid=self.thread_id,  # 仅当原消息本身是线程消息时才传 thread_id
             )
             # 第一段文本已作为引用发出，后续内容走普通发送
             self.quote_original = False
         else:
+            logger.info(
+                f"[RocketChat][Event] 普通发送 quote_original=False thread_id={self.thread_id!r}"
+            )
             await self.adapter.send_text(self.room_id, text, tmid=self.thread_id)
 
     async def _send_file_component(self, file_comp: File) -> None:

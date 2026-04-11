@@ -1120,6 +1120,10 @@ class RocketChatAdapter(Platform):
                 and not is_thread_msg
             )
 
+            logger.info(
+                f"[RocketChat][IN] 回复场景判定: msg_type={msg_type} bot_mentioned={bot_mentioned} is_thread={is_thread_msg} -> should_quote={should_quote}"
+            )
+
             # ---- 构造平台事件 ----
             event = RocketChatMessageEvent(
                 message_str=abm.message_str,
@@ -1235,7 +1239,7 @@ class RocketChatAdapter(Platform):
         tmid: Optional[str] = None,
     ) -> None:
         """
-        发送带引用原始消息的回复。优先使用 attachments 呈现美观的引用框。
+        发送带引用原始消息的回复。通过文本格式实现引用显示。
 
         :param room_id:      目标房间 ID
         :param text:         机器人回复正文
@@ -1243,42 +1247,21 @@ class RocketChatAdapter(Platform):
         :param tmid:         可选线程 ID
         """
         msg_id = original_msg.get("_id", "")
-        sender_name = original_msg.get("u", {}).get("name") or original_msg.get("u", {}).get("username", "")
-        ts_raw = original_msg.get("ts")
-        if isinstance(ts_raw, dict):
-            ts = ts_raw.get("$date")
-        else:
-            ts = None
-
-        # 构造引用附件
-        quote_text = original_msg.get("msg", "").strip()
-        if not quote_text:
-            if original_msg.get("attachments"):
-                quote_text = "[附件内容]"
-            elif original_msg.get("file") or original_msg.get("files"):
-                quote_text = "[文件/图片]"
-            else:
-                quote_text = "[引用消息]"
-
         link = self._build_message_link(room_id, msg_id)
-        attachment = {
-            "author_name": sender_name,
-            "text": quote_text,
-            "message_link": link,
-        }
-        if ts:
-            attachment["ts"] = datetime.fromtimestamp(ts / 1000, tz=timezone.utc).isoformat()
 
-        # 构造最终正文：遵循 Rocket.Chat 习惯，在正文首行添加引用链接
+        # 构造最终正文：使用 Rocket.Chat 的引用格式 [ ](link) 实现引用显示
         final_text = f"[ ]({link})\n{text}" if link else text
 
         payload: dict = {
             "roomId": room_id,
             "text": final_text,
-            "attachments": [attachment]
         }
         if tmid:
             payload["tmid"] = tmid
+
+        logger.info(
+            f"[RocketChat] send_with_quote() 发送: quote_msg_id={msg_id!r} tmid={tmid!r}"
+        )
 
         url = f"{self.server_url}/api/v1/chat.postMessage"
         try:
