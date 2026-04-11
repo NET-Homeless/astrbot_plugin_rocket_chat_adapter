@@ -1177,7 +1177,7 @@ class RocketChatAdapter(Platform):
                 f"[RocketChat] send typing room_id={room_id!r} user={self.bot_username!r} flag={flag}"
             )
 
-            # 使用现代 user-activity API (Rocket.Chat 6.0+)
+            # 使用现代 user-activity API，确保兼容性
             # 每次 method 调用使用唯一的 DDP ID
             self._ddp_call_id += 1
 
@@ -1186,12 +1186,7 @@ class RocketChatAdapter(Platform):
                     "msg": "method",
                     "method": "stream-notify-room",
                     "id": f"typing-{self._ddp_call_id}",
-                    "params": [
-                        f"{room_id}/user-activity",
-                        self.bot_username,
-                        ["user-typing"] if flag else [],
-                        {}
-                    ],
+                    "params": [f"{room_id}/user-activity", self.bot_username, ["user-typing"] if flag else []],
                 }
             )
         except Exception as exc:

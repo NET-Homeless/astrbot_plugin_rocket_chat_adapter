@@ -102,20 +102,25 @@ class RocketChatMessageEvent(AstrMessageEvent):
                 logger.warning(f"[RocketChat][Event] stop typing failed: {exc!r}")
 
     async def _typing_indicator_worker(self) -> None:
-        """延迟后启动 typing，并在回复完成前定期续期。"""
+        """延迟后启动 typing，保持状态直到任务被取消。"""
         try:
             delay = float(getattr(self.adapter, "typing_indicator_delay", 0.8))
             logger.debug(f"[RocketChat][Event] typing worker started, delay={delay}s room={self.room_id!r}")
             if delay > 0:
                 await asyncio.sleep(delay)
+
+            # 发送 start typing
             await self.adapter.send_typing(self.room_id, True)
             self._typing_started = True
+            logger.debug(f"[RocketChat][Event] typing started room={self.room_id!r}")
 
-            interval = self._typing_keepalive_interval
+            # 等待任务被取消（即回复完成时）
+            # Rocket.Chat 的 typing indicator 会自动过期，通常不需要 keepalive
             while True:
-                await asyncio.sleep(interval)
-                await self.adapter.send_typing(self.room_id, True)
+                await asyncio.sleep(1)  # 每秒检查一次是否被取消
+
         except asyncio.CancelledError:
+            logger.debug(f"[RocketChat][Event] typing worker cancelled room={self.room_id!r}")
             raise
         except Exception as exc:
             logger.warning(f"[RocketChat][Event] typing worker failed: {exc!r}")
