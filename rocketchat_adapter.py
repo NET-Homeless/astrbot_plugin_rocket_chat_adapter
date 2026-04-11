@@ -25,7 +25,7 @@ from urllib.parse import urlparse
 import aiohttp
 from astrbot.api import logger
 from astrbot.api.event import MessageChain
-from astrbot.api.message_components import File, Image, Plain, Record, Video
+from astrbot.api.message_components import File, Image, Plain, Record, Reply, Video
 from astrbot.api.platform import (
     AstrBotMessage,
     Group,
@@ -889,7 +889,7 @@ class RocketChatAdapter(Platform):
             seen_quote_ids = set()
 
             async def _build_components_recursively(current_payload: dict, current_depth: int = 0, max_depth: int = 3) -> list:
-                """将原始附表及正文转化为前后交织的 Component 流"""
+                """将原始附表及正文转化为 Component 流，使用 Reply 组件标准化引用"""
                 chain = []
                 if current_depth >= max_depth:
                     return chain
@@ -902,67 +902,102 @@ class RocketChatAdapter(Platform):
                 local_vids = await self._extract_video_components(current_payload)
                 local_files = await self._extract_file_components(current_payload)
 
-                # --- 定位所有引用 ---
-                # 兼容多种引用格式：
-                # 1. [ ](https://.../?msg=123)
-                # 2. [引用文本](https://.../?msg=123)
-                # 3. https://.../?msg=123
-                pattern = re.compile(r"(?:\[.*?\]\()?https?://[^\s)]+\?msg=([a-zA-Z0-9]+)[^\s)]*(?:\))?")
-                
-                implicit_quote_ids = []
-                for att in _get_all_attachments_tmp(current_payload):
-                    link = att.get("message_link") or ""
-                    if "msg=" in link:
-                        msg_id = link.rsplit("msg=", 1)[-1].split("&")[0]
-                        if msg_id:
-                            implicit_quote_ids.append(msg_id)
-
-                # --- 顺着正文切割并原地展开正文引用 ---
-                last_end = 0
-                for match in pattern.finditer(msg_text):
-                    prefix = msg_text[last_end:match.start()].strip()
-                    if prefix:
-                        chain.append(Plain(text=prefix + "\n"))
+                # ---- 只在 depth=0 时处理引用，转为 Reply 组件 ----
+                if current_depth == 0:
+                    # 兼容多种引用格式：
+                    # 1. [ ](https://.../?msg=123)
+                    # 2. [引用文本](https://.../?msg=123)
+                    # 3. https://.../?msg=123
+                    pattern = re.compile(r"(?:\[.*?\]\()?https?://[^\s)]+\?msg=([a-zA-Z0-9]+)[^\s)]*(?:\))?")
                     
-                    q_id = match.group(1)
-                    if q_id in implicit_quote_ids:
-                        implicit_quote_ids.remove(q_id)
-                        
-                    if q_id not in seen_quote_ids:
-                        seen_quote_ids.add(q_id)
-                        q_msg = await self._fetch_message_by_id(q_id)
-                        if q_msg:
-                            q_components = await _build_components_recursively(q_msg, current_depth + 1, max_depth)
-                            if q_components:
-                                chain.append(Plain(text="\n【包含引用的历史消息内容如下】\n> "))
-                                chain.extend(q_components)
-                                chain.append(Plain(text="\n【历史消息引用结束】\n"))
-                                
-                    last_end = match.end()
+                    explicit_quote_ids = []
+                    implicit_quote_ids = []
+                    
+                    # 从正文链接提取显式引用
+                    for match in pattern.finditer(msg_text):
+                        q_id = match.group(1)
+                        if q_id not in explicit_quote_ids:
+                            explicit_quote_ids.append(q_id)
+                    
+                    # 从 attachment message_link 提取隐式引用
+                    for att in _get_all_attachments_tmp(current_payload):
+                        link = att.get("message_link") or ""
+                        if "msg=" in link:
+                            msg_id = link.rsplit("msg=", 1)[-1].split("&")[0]
+                            if msg_id and msg_id not in implicit_quote_ids:
+                                implicit_quote_ids.append(msg_id)
 
-                suffix = msg_text[last_end:].strip()
-                if suffix:
-                    chain.append(Plain(text=suffix))
-
-                # --- 处理只在 attachment 里挂载的隐式引用 ---
-                for q_id in implicit_quote_ids:
-                    if q_id in seen_quote_ids:
-                        continue
-                    seen_quote_ids.add(q_id)
-                    q_msg = await self._fetch_message_by_id(q_id)
-                    if q_msg:
-                        q_components = await _build_components_recursively(q_msg, current_depth + 1, max_depth)
-                        if q_components:
-                            # 隐式引用一般出现在头部
-                            chain.insert(0, Plain(text="\n【回复包含的引用原文】\n> "))
-                            for idx, c in enumerate(q_components):
-                                chain.insert(idx + 1, c)
-                            chain.insert(len(q_components) + 1, Plain(text="\n【引用原文内容结束】\n\n"))
+                    # --- 先处理显式引用（正文中出现的）---
+                    for q_id in explicit_quote_ids:
+                        if q_id not in seen_quote_ids:
+                            seen_quote_ids.add(q_id)
+                            q_msg = await self._fetch_message_by_id(q_id)
+                            if q_msg:
+                                # 递归构建被引用消息的组件（仅 depth>0，不包含引用本身）
+                                q_components = await _build_components_recursively(q_msg, current_depth + 1, max_depth)
+                                if q_components:
+                                    # 获取引用消息的元数据
+                                    q_sender_id = q_msg.get("u", {}).get("_id", "")
+                                    q_sender_name = q_msg.get("u", {}).get("name") or q_msg.get("u", {}).get("username", "")
+                                    q_ts_raw = q_msg.get("ts")
+                                    if isinstance(q_ts_raw, dict):
+                                        q_timestamp = int(q_ts_raw.get("$date", time.time() * 1000) / 1000)
+                                    else:
+                                        q_timestamp = int(time.time())
+                                    
+                                    # 提取引用消息的纯文本
+                                    q_msg_text = "".join([c.text for c in q_components if isinstance(c, Plain)]).strip()
+                                    
+                                    # 创建 Reply 组件
+                                    reply_comp = Reply(
+                                        id=q_id,
+                                        chain=q_components,
+                                        sender_id=q_sender_id,
+                                        sender_nickname=q_sender_name,
+                                        time=q_timestamp,
+                                        message_str=q_msg_text,
+                                    )
+                                    chain.append(reply_comp)
+                    
+                    # --- 再处理隐式引用（仅在 attachment 中的）---
+                    for q_id in implicit_quote_ids:
+                        if q_id not in seen_quote_ids:
+                            seen_quote_ids.add(q_id)
+                            q_msg = await self._fetch_message_by_id(q_id)
+                            if q_msg:
+                                q_components = await _build_components_recursively(q_msg, current_depth + 1, max_depth)
+                                if q_components:
+                                    q_sender_id = q_msg.get("u", {}).get("_id", "")
+                                    q_sender_name = q_msg.get("u", {}).get("name") or q_msg.get("u", {}).get("username", "")
+                                    q_ts_raw = q_msg.get("ts")
+                                    if isinstance(q_ts_raw, dict):
+                                        q_timestamp = int(q_ts_raw.get("$date", time.time() * 1000) / 1000)
+                                    else:
+                                        q_timestamp = int(time.time())
+                                    
+                                    q_msg_text = "".join([c.text for c in q_components if isinstance(c, Plain)]).strip()
+                                    
+                                    reply_comp = Reply(
+                                        id=q_id,
+                                        chain=q_components,
+                                        sender_id=q_sender_id,
+                                        sender_nickname=q_sender_name,
+                                        time=q_timestamp,
+                                        message_str=q_msg_text,
+                                    )
+                                    chain.insert(0, reply_comp)  # 隐式引用一般出现在头部
+                    
+                    # --- 清理正文中的引用链接，保留纯文本 ---
+                    cleaned_msg_text = pattern.sub("", msg_text).strip()
+                    if cleaned_msg_text:
+                        chain.append(Plain(text=cleaned_msg_text))
+                else:
+                    # ---- depth > 0：仅返回消息自身内容，不处理引用 ----
+                    if msg_text:
+                        chain.append(Plain(text=msg_text))
 
                 # --- 最后铺设自身的媒体内容 ---
                 if local_images or local_recs or local_vids or local_files:
-                    if current_depth > 0:
-                        chain.append(Plain(text="\n[附带的上传文件及媒体]:\n"))
                     for i in local_images:
                         chain.append(Image.fromURL(i))
                     chain.extend(local_recs)
