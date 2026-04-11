@@ -108,8 +108,8 @@ class RocketChatAdapter(Platform):
         self._room_name_cache: Dict[str, str] = {}
         # 已订阅房间集合，防止重复订阅导致消息被多次处理
         self._subscribed_rooms: set = set()
-        # typing method 调用序号
-        self._typing_seq: int = 0
+        # DDP method 调用 ID 计数器，确保每次调用 ID 唯一
+        self._ddp_call_id: int = 0
         # 后台任务强引用集合，防止 Python 3.12+ GC 回收未完成的 task
         self._background_tasks: set[asyncio.Task] = set()
         # 并发处理控制，防止瞬间过多消息导致处理积压
@@ -1171,27 +1171,21 @@ class RocketChatAdapter(Platform):
                 f"[RocketChat] typing 跳过: ws={self._ws is not None and not getattr(self._ws, 'closed', True)} bot_username={self.bot_username!r}"
             )
             return
-        self._typing_seq += 1
+
         try:
-            # 兼容 Rocket.Chat 所有版本（v4/5 使用 typing, v6/7+ 使用 user-activity）
             logger.debug(
                 f"[RocketChat] send typing room_id={room_id!r} user={self.bot_username!r} flag={flag}"
             )
-            # 1. 传统 typing 管道
+
+            # 使用现代 user-activity API (Rocket.Chat 6.0+)
+            # 每次 method 调用使用唯一的 DDP ID
+            self._ddp_call_id += 1
+
             await self._ws.send_json(
                 {
                     "msg": "method",
                     "method": "stream-notify-room",
-                    "id": f"typing-legacy-{self._typing_seq}",
-                    "params": [f"{room_id}/typing", self.bot_username, flag],
-                }
-            )
-            # 2. 现代 user-activity 管道
-            await self._ws.send_json(
-                {
-                    "msg": "method",
-                    "method": "stream-notify-room",
-                    "id": f"typing-modern-{self._typing_seq}",
+                    "id": f"typing-{self._ddp_call_id}",
                     "params": [
                         f"{room_id}/user-activity",
                         self.bot_username,
