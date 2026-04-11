@@ -307,14 +307,17 @@ class RocketChatAdapter(Platform):
         """构造指向原始消息的 Rocket.Chat 深链接（用于引用附件）。"""
         room_type = self._room_type_cache.get(room_id, "c")
         room_name = self._room_name_cache.get(room_id, "")
-        if not room_name:
-            return ""
+        
+        # 补全链接路径
         if room_type == "c":
-            path = f"channel/{room_name}"
+            path = f"channel/{room_name}" if room_name else f"channel/{room_id}"
         elif room_type == "p":
-            path = f"group/{room_name}"
+            path = f"group/{room_name}" if room_name else f"group/{room_id}"
+        elif room_type == "d":
+            path = f"direct/{room_id}"
         else:
-            return ""
+            path = f"channel/{room_id}"
+            
         return f"{self.server_url}/{path}?msg={message_id}"
 
     async def _fetch_message_by_id(self, msg_id: str) -> Optional[dict]:
@@ -325,6 +328,10 @@ class RocketChatAdapter(Platform):
                 data = await resp.json()
                 if data.get("success"):
                     return data.get("message")
+                else:
+                    logger.debug(f"[RocketChat] 获取消息详情失败: msgId={msg_id} response={data}")
+        except asyncio.TimeoutError:
+            logger.warning(f"[RocketChat] 获取消息详情超时: msgId={msg_id}")
         except Exception as exc:
             logger.warning(f"[RocketChat] 无法拉取被引用的消息明细 msgId={msg_id}: {exc!r}")
         return None
@@ -627,6 +634,22 @@ class RocketChatAdapter(Platform):
 
         return "file"
 
+    def _get_all_attachments_recursive(self, payload: dict) -> List[dict]:
+        """
+        递归地从 payload 中提取所有附件（包括嵌套附件）。
+        
+        这是一个通用的辅助方法，用于避免在多个地方重复编写相同的递归逻辑。
+        用于 _extract_image_urls, _extract_media_components 等方法。
+        """
+        res = []
+        att_raw = payload.get("attachments", [])
+        atts = [att_raw] if isinstance(att_raw, dict) else [a for a in att_raw if isinstance(a, dict)]
+        for att in atts:
+            res.append(att)
+            # 递归处理嵌套的attachments
+            res.extend(self._get_all_attachments_recursive(att))
+        return res
+
     async def _extract_image_urls(self, raw_msg: dict) -> List[str]:
         """从 Rocket.Chat 多种附件/文件结构中提取图片 URL。"""
         image_urls: List[str] = []
@@ -675,18 +698,8 @@ class RocketChatAdapter(Platform):
                 image_urls.append(res)
                 break
 
-        def _get_all_attachments(payload: dict) -> List[dict]:
-            res = []
-            att_raw = payload.get("attachments", [])
-            atts = [att_raw] if isinstance(att_raw, dict) else [a for a in att_raw if isinstance(a, dict)]
-            for att in atts:
-                if att.get("message_link"):
-                    continue
-                res.append(att)
-                res.extend(_get_all_attachments(att))
-            return res
-
-        all_attachments = _get_all_attachments(raw_msg)
+        # 使用统一的递归方法提取所有附件（包括嵌套）
+        all_attachments = self._get_all_attachments_recursive(raw_msg)
 
         for att in all_attachments:
             mime_type = (
@@ -792,18 +805,10 @@ class RocketChatAdapter(Platform):
                     results.append((url, file_obj))
                     break
 
-        def _get_all_attachments(payload: dict) -> List[dict]:
-            res = []
-            att_raw = payload.get("attachments", [])
-            atts = [att_raw] if isinstance(att_raw, dict) else [a for a in att_raw if isinstance(a, dict)]
-            for att in atts:
-                if att.get("message_link"):
-                    continue
-                res.append(att)
-                res.extend(_get_all_attachments(att))
-            return res
+        # 使用统一的递归方法
+        all_attachments = self._get_all_attachments_recursive(raw_msg)
 
-        for context in [raw_msg] + _get_all_attachments(raw_msg):
+        for context in [raw_msg] + all_attachments:
             files_raw = context.get("files", [])
             if isinstance(files_raw, dict):
                 iterable = [files_raw]
@@ -863,6 +868,21 @@ class RocketChatAdapter(Platform):
         将 Rocket.Chat 原始消息转换为 AstrBotMessage，构造事件并提交队列。
         """
         try:
+            # ---- 调试日志：打印原始消息结构 ----
+            logger.info(
+                f"[RocketChat][IN-RAW] msg_id={raw_msg.get('_id')} "
+                f"sender={raw_msg.get('u', {}).get('username')} "
+                f"room={raw_msg.get('rid')} "
+                f"text_len={len(raw_msg.get('msg', ''))} "
+                f"attachments={len(raw_msg.get('attachments', []))} "
+                f"mentions={len(raw_msg.get('mentions', []))} "
+                f"has_files={bool(raw_msg.get('files') or raw_msg.get('file'))} "
+                f"has_urls={bool(raw_msg.get('urls'))} "
+                f"is_thread={bool(raw_msg.get('tmid'))} "
+                f"is_system={bool(raw_msg.get('t'))}"
+            )
+            logger.debug(f"[RocketChat][IN-FULL] {json.dumps(raw_msg, ensure_ascii=False, default=str)}")
+            
             # ---- 过滤规则 ----
             # 1. 系统消息（有 t 字段，如用户加入/离开通知）
             if raw_msg.get("t"):
@@ -877,15 +897,6 @@ class RocketChatAdapter(Platform):
             # --- 构建消息组件流 (按时序排列文本和媒体，完美兼容多模态大模型的视觉理解) ---
             import re
             
-            def _get_all_attachments_tmp(payload: dict) -> List[dict]:
-                res = []
-                att_raw = payload.get("attachments", [])
-                atts = [att_raw] if isinstance(att_raw, dict) else [a for a in att_raw if isinstance(a, dict)]
-                for att in atts:
-                    res.append(att)
-                    res.extend(_get_all_attachments_tmp(att))
-                return res
-
             seen_quote_ids = set()
 
             async def _build_components_recursively(current_payload: dict, current_depth: int = 0, max_depth: int = 3) -> list:
@@ -896,47 +907,89 @@ class RocketChatAdapter(Platform):
 
                 msg_text = current_payload.get("msg", "").strip()
                 
-                # --- 提取自身的全部附件 ---
+                # --- 提取自身的图片和媒体内容 ---
                 local_images = await self._extract_image_urls(current_payload)
                 local_recs = await self._extract_record_components(current_payload)
                 local_vids = await self._extract_video_components(current_payload)
                 local_files = await self._extract_file_components(current_payload)
 
-                # ---- 只在 depth=0 时处理引用，转为 Reply 组件 ----
-                if current_depth == 0:
-                    # 兼容多种引用格式：
-                    # 1. [ ](https://.../?msg=123)
-                    # 2. [引用文本](https://.../?msg=123)
-                    # 3. https://.../?msg=123
-                    pattern = re.compile(r"(?:\[.*?\]\()?https?://[^\s)]+\?msg=([a-zA-Z0-9]+)[^\s)]*(?:\))?")
-                    
-                    explicit_quote_ids = []
-                    implicit_quote_ids = []
-                    
-                    # 从正文链接提取显式引用
-                    for match in pattern.finditer(msg_text):
-                        q_id = match.group(1)
-                        if q_id not in explicit_quote_ids:
-                            explicit_quote_ids.append(q_id)
-                    
-                    # 从 attachment message_link 提取隐式引用
-                    for att in _get_all_attachments_tmp(current_payload):
-                        link = att.get("message_link") or ""
-                        if "msg=" in link:
-                            msg_id = link.rsplit("msg=", 1)[-1].split("&")[0]
-                            if msg_id and msg_id not in implicit_quote_ids:
-                                implicit_quote_ids.append(msg_id)
+                # --- 识别引用 ID (优先使用系统提供的结构化数据) ---
+                quote_ids = []
+                
+                # 1. 扫描系统解析出的 urls 数组 (推荐做法)
+                from urllib.parse import urlparse, parse_qs
+                for url_obj in current_payload.get("urls", []):
+                    u_str = url_obj.get("url") or ""
+                    # 尝试从预解析的 parsedUrl 获取，否则手动解析
+                    p_url = url_obj.get("parsedUrl", {})
+                    if p_url and "query" in p_url and "msg" in p_url["query"]:
+                        q_id = p_url["query"]["msg"]
+                        if q_id and q_id not in quote_ids:
+                            quote_ids.append(q_id)
+                            logger.debug(f"[RocketChat][IN] 从urls.parsedUrl识别引用: msg_id={q_id}")
+                    elif "msg=" in u_str:
+                        parsed = urlparse(u_str)
+                        qs = parse_qs(parsed.query)
+                        if "msg" in qs:
+                            q_id = qs["msg"][0]
+                            if q_id and q_id not in quote_ids:
+                                quote_ids.append(q_id)
+                                logger.debug(f"[RocketChat][IN] 从urls手动parse识别引用: msg_id={q_id} url={u_str[:80]}")
 
-                    # --- 先处理显式引用（正文中出现的）---
-                    for q_id in explicit_quote_ids:
-                        if q_id not in seen_quote_ids:
-                            seen_quote_ids.add(q_id)
+                # 2. 扫描直接子级附件中的消息链接（仅一层，不递归）
+                # 这样保证引用的嵌套结构是正确的
+                att_raw = current_payload.get("attachments", [])
+                direct_atts = [att_raw] if isinstance(att_raw, dict) else [a for a in att_raw if isinstance(a, dict)]
+                for att in direct_atts:
+                    link = att.get("message_link") or ""
+                    if "msg=" in link:
+                        parsed = urlparse(link)
+                        qs = parse_qs(parsed.query)
+                        if "msg" in qs:
+                            q_id = qs["msg"][0]
+                            if q_id and q_id not in quote_ids:
+                                quote_ids.append(q_id)
+                                logger.debug(f"[RocketChat][IN] 从直接attachment.message_link识别引用: msg_id={q_id}")
+
+                # 3. 兜底扫描正文 (仅用于定位链接以清理文本) ---
+                # 改进的正则，可以更准确地识别包含 msg= 参数的链接
+                # 支持两种格式：
+                # 1. Markdown: [任意文本](URL?msg=id)
+                # 2. 直接URL: https://...?msg=id
+                link_pattern = re.compile(
+                    r'\[([^\]]*)\]\(([^)]*msg=[^)]*)\)|'           # Markdown格式: [text](url?msg=...)
+                    r'((?:https?|http)://[^\s)]+msg=[^\s)]*)',     # 直接URL (以msg参数结尾)
+                    re.IGNORECASE
+                )
+                
+                # 如果 urls 数组为空，尝试正则提取作为补充
+                if not quote_ids:
+                    for match in link_pattern.finditer(msg_text):
+                        # match.groups() 返回 (markdown_text, markdown_url, direct_url)
+                        markdown_url = match.group(2)
+                        direct_url = match.group(3)
+                        u_str = markdown_url or direct_url or ""
+                        if u_str and "msg=" in u_str:
+                            # 移除 markdown 包裹字符
+                            u_clean = u_str.strip("[]() ")
+                            parsed = urlparse(u_clean)
+                            qs = parse_qs(parsed.query)
+                            if "msg" in qs:
+                                q_id = qs["msg"][0]
+                                if q_id and q_id not in quote_ids:
+                                    quote_ids.append(q_id)
+
+                # --- 只有在未达最大深度时才进一步拉取引用详情 ---
+                found_reply_comps = []
+                for q_id in quote_ids:
+                    if q_id not in seen_quote_ids:
+                        seen_quote_ids.add(q_id)
+                        try:
                             q_msg = await self._fetch_message_by_id(q_id)
                             if q_msg:
-                                # 递归构建被引用消息的组件（仅 depth>0，不包含引用本身）
+                                # 递归处理被引用消息 (Depth + 1)
                                 q_components = await _build_components_recursively(q_msg, current_depth + 1, max_depth)
                                 if q_components:
-                                    # 获取引用消息的元数据
                                     q_sender_id = q_msg.get("u", {}).get("_id", "")
                                     q_sender_name = q_msg.get("u", {}).get("name") or q_msg.get("u", {}).get("username", "")
                                     q_ts_raw = q_msg.get("ts")
@@ -945,36 +998,6 @@ class RocketChatAdapter(Platform):
                                     else:
                                         q_timestamp = int(time.time())
                                     
-                                    # 提取引用消息的纯文本
-                                    q_msg_text = "".join([c.text for c in q_components if isinstance(c, Plain)]).strip()
-                                    
-                                    # 创建 Reply 组件
-                                    reply_comp = Reply(
-                                        id=q_id,
-                                        chain=q_components,
-                                        sender_id=q_sender_id,
-                                        sender_nickname=q_sender_name,
-                                        time=q_timestamp,
-                                        message_str=q_msg_text,
-                                    )
-                                    chain.append(reply_comp)
-                    
-                    # --- 再处理隐式引用（仅在 attachment 中的）---
-                    for q_id in implicit_quote_ids:
-                        if q_id not in seen_quote_ids:
-                            seen_quote_ids.add(q_id)
-                            q_msg = await self._fetch_message_by_id(q_id)
-                            if q_msg:
-                                q_components = await _build_components_recursively(q_msg, current_depth + 1, max_depth)
-                                if q_components:
-                                    q_sender_id = q_msg.get("u", {}).get("_id", "")
-                                    q_sender_name = q_msg.get("u", {}).get("name") or q_msg.get("u", {}).get("username", "")
-                                    q_ts_raw = q_msg.get("ts")
-                                    if isinstance(q_ts_raw, dict):
-                                        q_timestamp = int(q_ts_raw.get("$date", time.time() * 1000) / 1000)
-                                    else:
-                                        q_timestamp = int(time.time())
-                                    
                                     q_msg_text = "".join([c.text for c in q_components if isinstance(c, Plain)]).strip()
                                     
                                     reply_comp = Reply(
@@ -985,19 +1008,29 @@ class RocketChatAdapter(Platform):
                                         time=q_timestamp,
                                         message_str=q_msg_text,
                                     )
-                                    chain.insert(0, reply_comp)  # 隐式引用一般出现在头部
-                    
-                    # --- 清理正文中的引用链接，保留纯文本 ---
-                    cleaned_msg_text = pattern.sub("", msg_text).strip()
-                    if cleaned_msg_text:
-                        chain.append(Plain(text=cleaned_msg_text))
-                else:
-                    # ---- depth > 0：仅返回消息自身内容，不处理引用 ----
-                    if msg_text:
-                        chain.append(Plain(text=msg_text))
+                                    found_reply_comps.append(reply_comp)
+                            else:
+                                logger.debug(f"[RocketChat][IN] 被引用消息不存在或无权限访问: msgId={q_id}")
+                        except Exception as e:
+                            logger.warning(f"[RocketChat][IN] 递归处理被引用消息出错: msgId={q_id} error={e!r}")
+                
+                # 按识别顺序放入链条头部
+                chain.extend(found_reply_comps)
 
-                # --- 最后铺设自身的媒体内容 ---
+                # --- 清理当前文本中的引用标记，保留自身实质文案 ---
+                cleaned_msg_text = link_pattern.sub("", msg_text).strip()
+                if cleaned_msg_text:
+                    chain.append(Plain(text=cleaned_msg_text))
+                    if current_depth == 0:  # 仅顶层消息日志
+                        logger.debug(f"[RocketChat][IN] 清理后文本: clean_text={cleaned_msg_text!r}")
+
+                # --- 铺设本层级的媒体内容 ---
                 if local_images or local_recs or local_vids or local_files:
+                    logger.debug(
+                        f"[RocketChat][IN] 深度{current_depth}提取媒体: "
+                        f"images={len(local_images)} records={len(local_recs)} "
+                        f"videos={len(local_vids)} files={len(local_files)}"
+                    )
                     for i in local_images:
                         chain.append(Image.fromURL(i))
                     chain.extend(local_recs)
@@ -1202,7 +1235,7 @@ class RocketChatAdapter(Platform):
         tmid: Optional[str] = None,
     ) -> None:
         """
-        发送带引用原始消息的回复（频道 @mention 场景）。
+        发送带引用原始消息的回复。优先使用 attachments 呈现美观的引用框。
 
         :param room_id:      目标房间 ID
         :param text:         机器人回复正文
@@ -1210,17 +1243,39 @@ class RocketChatAdapter(Platform):
         :param tmid:         可选线程 ID
         """
         msg_id = original_msg.get("_id", "")
-        link = self._build_message_link(room_id, msg_id)
-
-        # 使用 Rocket.Chat 原生引用格式：[ ](链接) 后接回复内容
-        if link:
-            quote_text = f"[ ]({link}) {text}"
+        sender_name = original_msg.get("u", {}).get("name") or original_msg.get("u", {}).get("username", "")
+        ts_raw = original_msg.get("ts")
+        if isinstance(ts_raw, dict):
+            ts = ts_raw.get("$date")
         else:
-            quote_text = text
+            ts = None
+
+        # 构造引用附件
+        quote_text = original_msg.get("msg", "").strip()
+        if not quote_text:
+            if original_msg.get("attachments"):
+                quote_text = "[附件内容]"
+            elif original_msg.get("file") or original_msg.get("files"):
+                quote_text = "[文件/图片]"
+            else:
+                quote_text = "[引用消息]"
+
+        link = self._build_message_link(room_id, msg_id)
+        attachment = {
+            "author_name": sender_name,
+            "text": quote_text,
+            "message_link": link,
+        }
+        if ts:
+            attachment["ts"] = datetime.fromtimestamp(ts / 1000, tz=timezone.utc).isoformat()
+
+        # 构造最终正文：遵循 Rocket.Chat 习惯，在正文首行添加引用链接
+        final_text = f"[ ]({link})\n{text}" if link else text
 
         payload: dict = {
             "roomId": room_id,
-            "text": quote_text,
+            "text": final_text,
+            "attachments": [attachment]
         }
         if tmid:
             payload["tmid"] = tmid
@@ -1482,15 +1537,36 @@ class RocketChatAdapter(Platform):
         """
         将 MessageChain 发送到指定房间（内部复用方法）。
         """
-        text_parts: List[str] = []
+        # 预先提取 Reply 组件和全量文本
+        reply_comp = next((c for c in message_chain.chain if isinstance(c, Reply)), None)
+        full_text = "".join([c.text for c in message_chain.chain if isinstance(c, Plain)]).strip()
+        
+        # 如果有引用组件，优先尝试将其与文本合并发送
+        reply_sent = False
+        if reply_comp:
+            q_msg = await self._fetch_message_by_id(reply_comp.id)
+            if q_msg:
+                await self.send_with_quote(room_id, full_text, q_msg, tmid)
+                reply_sent = True
+            else:
+                # 降级：如果拉不到消息，构造一个链接引用
+                link = self._build_message_link(room_id, reply_comp.id)
+                if link:
+                    await self.send_text(room_id, f"[ ]({link}) {full_text}", tmid)
+                    reply_sent = True
 
-        for comp in message_chain.chain:
-            if isinstance(comp, Plain):
-                text_parts.append(comp.text)
-            elif isinstance(comp, (Image, File, Record, Video)):
-                if text_parts:
-                    await self.send_text(room_id, "".join(text_parts), tmid)
-                    text_parts.clear()
+        # 如果没有引用组件，或者引用组件发送失败，则走常规的时序发送流程
+        if not reply_sent:
+            text_parts: List[str] = []
+            for comp in message_chain.chain:
+                if isinstance(comp, Plain):
+                    text_parts.append(comp.text)
+                elif isinstance(comp, (Image, File, Record, Video)):
+                    if text_parts:
+                        await self.send_text(room_id, "".join(text_parts), tmid)
+                        text_parts.clear()
+                    
+                    # 媒体分发逻辑保持不变...
 
                 if isinstance(comp, Image):
                     file_ref: str = comp.file or ""
