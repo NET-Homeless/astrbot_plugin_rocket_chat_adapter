@@ -11,11 +11,8 @@ Rocket.Chat 平台适配器（Platform Adapter）
 from __future__ import annotations
 
 import asyncio
-import base64
 import json
-import mimetypes
 import os
-import tempfile
 import time
 from asyncio import Queue
 from datetime import datetime, timezone
@@ -38,6 +35,7 @@ from astrbot.api.platform import (
 
 from .rocketchat_e2ee import RocketChatE2EEManager
 from .rocketchat_event import RocketChatMessageEvent
+from .rocketchat_media import RocketChatMediaBridge
 
 
 def _coerce_bool(value: Any) -> bool:
@@ -196,6 +194,7 @@ class RocketChatAdapter(Platform):
             enabled=self.enable_e2ee,
             password=self.e2ee_password,
         )
+        self._media = RocketChatMediaBridge(self)
 
     # ------------------------------------------------------------------ #
     #  Platform 抽象方法实现                                                #
@@ -783,260 +782,22 @@ class RocketChatAdapter(Platform):
         return url
 
     def _classify_file_kind(self, file_obj: dict) -> str:
-        """基于 MIME / 文件名 / URL 推断文件类别。"""
-        candidates: List[str] = []
-
-        for key in ("type", "mimeType", "contentType"):
-            value = file_obj.get(key)
-            if isinstance(value, str) and value:
-                candidates.append(value)
-
-        for key in ("name", "title", "url", "path", "title_link", "titleLink", "link"):
-            value = file_obj.get(key)
-            if not isinstance(value, str) or not value:
-                continue
-            guessed, _ = mimetypes.guess_type(value.split("?", 1)[0])
-            if guessed:
-                candidates.append(guessed)
-
-        for candidate in candidates:
-            if candidate.startswith("image/"):
-                return "image"
-            if candidate.startswith("audio/"):
-                return "audio"
-            if candidate.startswith("video/"):
-                return "video"
-
-        return "file"
+        return self._media.classify_file_kind(file_obj)
 
     def _get_all_attachments_recursive(self, payload: dict) -> List[dict]:
-        """
-        递归地从 payload 中提取所有附件（包括嵌套附件）。
-        
-        这是一个通用的辅助方法，用于避免在多个地方重复编写相同的递归逻辑。
-        用于 _extract_image_urls, _extract_media_components 等方法。
-        """
-        res = []
-        att_raw = payload.get("attachments", [])
-        atts = [att_raw] if isinstance(att_raw, dict) else [a for a in att_raw if isinstance(a, dict)]
-        for att in atts:
-            res.append(att)
-            # 递归处理嵌套的attachments
-            res.extend(self._get_all_attachments_recursive(att))
-        return res
+        return self._media.get_all_attachments_recursive(payload)
 
-    async def _extract_image_urls(self, raw_msg: dict) -> List[str]:
-        """从 Rocket.Chat 多种附件/文件结构中提取图片 URL。"""
-        image_urls: List[str] = []
-
-        async def add_image_candidate(candidate: Any, force: bool = False) -> Optional[str]:
-            if not candidate:
-                return None
-
-            if isinstance(candidate, dict):
-                for key in (
-                    "url",
-                    "path",
-                    "image_url",
-                    "imageUrl",
-                    "title_link",
-                    "titleLink",
-                    "link",
-                ):
-                    res = await add_image_candidate(candidate.get(key), force=force)
-                    if res:
-                        return res
-                return None
-
-            if not isinstance(candidate, str):
-                return None
-
-            if force:
-                return await self._normalize_media_url(candidate)
-
-            guessed, _ = mimetypes.guess_type(candidate.split("?", 1)[0])
-            if guessed and guessed.startswith("image/"):
-                return await self._normalize_media_url(candidate)
-            return None
-
-        for key in (
-            "image_url",
-            "imageUrl",
-            "image",
-            "thumb_url",
-            "thumbUrl",
-            "image_preview",
-            "imagePreview",
-        ):
-            res = await add_image_candidate(raw_msg.get(key), force=True)
-            if res and res not in image_urls:
-                image_urls.append(res)
-                break
-
-        # 使用统一的递归方法提取所有附件（包括嵌套）
-        all_attachments = self._get_all_attachments_recursive(raw_msg)
-
-        for att in all_attachments:
-            mime_type = (
-                att.get("image_type") or att.get("type") or att.get("mimeType") or ""
-            )
-            is_image_attachment = bool(
-                att.get("image_dimensions")
-            ) or mime_type.startswith("image/")
-
-            for key in (
-                "image_url",
-                "imageUrl",
-                "image",
-                "url",
-                "path",
-                "title_link",
-                "titleLink",
-                "image_preview",
-                "imagePreview",
-                "thumb_url",
-                "thumbUrl",
-            ):
-                force = is_image_attachment or key in {
-                    "image_url",
-                    "imageUrl",
-                    "image",
-                    "image_preview",
-                    "imagePreview",
-                    "thumb_url",
-                    "thumbUrl",
-                }
-                res = await add_image_candidate(att.get(key), force=force)
-                if res and res not in image_urls:
-                    image_urls.append(res)
-                    break
-
-        files_raw = raw_msg.get("files", [])
-        if isinstance(files_raw, dict):
-            files = [files_raw]
-        else:
-            files = [f for f in files_raw if isinstance(f, dict)]
-
-        for file_obj in files:
-            is_image_file = self._classify_file_kind(file_obj) == "image"
-
-            for key in ("url", "path", "title_link", "titleLink", "link"):
-                res = await add_image_candidate(file_obj.get(key), force=is_image_file)
-                if res and res not in image_urls:
-                    image_urls.append(res)
-                    break
-
-        for file_key in ("file", "fileUpload"):
-            single_file = raw_msg.get(file_key)
-            if not isinstance(single_file, dict):
-                continue
-
-            is_image_file = self._classify_file_kind(single_file) == "image"
-
-            for key in ("url", "path", "title_link", "titleLink", "link"):
-                res = await add_image_candidate(single_file.get(key), force=is_image_file)
-                if res and res not in image_urls:
-                    image_urls.append(res)
-                    break
-
-        for url_obj in raw_msg.get("urls", []):
-            if not isinstance(url_obj, dict):
-                continue
-            meta = url_obj.get("meta") if isinstance(url_obj.get("meta"), dict) else {}
-            headers = (
-                url_obj.get("headers")
-                if isinstance(url_obj.get("headers"), dict)
-                else {}
-            )
-            content_type = (
-                meta.get("contentType")
-                or headers.get("contentType")
-                or headers.get("content-type")
-                or ""
-            )
-            if not str(content_type).startswith("image/"):
-                continue
-            candidate = url_obj.get("url") or url_obj.get("parsedUrl")
-            if candidate:
-                image_urls.append(await self._normalize_media_url(candidate))
-
-        deduped_urls: List[str] = []
-        for image_url in image_urls:
-            if image_url not in deduped_urls:
-                deduped_urls.append(image_url)
-        return deduped_urls
-
-    async def _extract_media_components(self, raw_msg: dict, target_kind: str) -> List[tuple[str, dict]]:
-        """提取特定的媒体组件并验证其 URL"""
-        results = []
-
-        async def add_candidate(file_obj: dict) -> None:
-            if self._classify_file_kind(file_obj) != target_kind:
-                return
-            for key in ("url", "path", "title_link", "titleLink", "link"):
-                value = file_obj.get(key)
-                if value:
-                    url = await self._normalize_media_url(value)
-                    results.append((url, file_obj))
-                    break
-
-        # 使用统一的递归方法
-        all_attachments = self._get_all_attachments_recursive(raw_msg)
-
-        for context in [raw_msg] + all_attachments:
-            files_raw = context.get("files", [])
-            if isinstance(files_raw, dict):
-                iterable = [files_raw]
-            else:
-                iterable = [f for f in files_raw if isinstance(f, dict)]
-            for file_obj in iterable:
-                await add_candidate(file_obj)
-
-            for file_key in ("file", "fileUpload"):
-                single_file = context.get(file_key)
-                if isinstance(single_file, dict):
-                    await add_candidate(single_file)
-            
-            # For attachments acting as media directly (like audio_url/video_url via title_link)
-            if context != raw_msg:
-                await add_candidate(context)
-
-        return results
+    async def _extract_image_components(self, raw_msg: dict) -> List[Image]:
+        return await self._media.extract_image_components(raw_msg)
 
     async def _extract_file_components(self, raw_msg: dict) -> List[File]:
-        """从 Rocket.Chat 文件结构中提取严格意义上的普通文件组件。"""
-        candidates = await self._extract_media_components(raw_msg, "file")
-        deduped: List[File] = []
-        seen: set[tuple[str, str]] = set()
-        for url, file_obj in candidates:
-            name = file_obj.get("name") or file_obj.get("title") or "attachment"
-            key = (name, url)
-            if key not in seen:
-                seen.add(key)
-                deduped.append(File(name=name, url=url))
-        return deduped
+        return await self._media.extract_file_components(raw_msg)
 
     async def _extract_record_components(self, raw_msg: dict) -> List[Record]:
-        """从 Rocket.Chat 文件结构中提取语音组件。"""
-        candidates = await self._extract_media_components(raw_msg, "audio")
-        deduped: List[Record] = []
-        seen: set[str] = set()
-        for url, _ in candidates:
-            if url not in seen:
-                seen.add(url)
-                deduped.append(Record.fromURL(url))
-        return deduped
+        return await self._media.extract_record_components(raw_msg)
 
     async def _extract_video_components(self, raw_msg: dict) -> List[Video]:
-        """从 Rocket.Chat 文件结构中提取视频组件。"""
-        candidates = await self._extract_media_components(raw_msg, "video")
-        deduped: List[Video] = []
-        seen: set[str] = set()
-        for url, _ in candidates:
-            if url not in seen:
-                seen.add(url)
-                deduped.append(Video.fromURL(url))
-        return deduped
+        return await self._media.extract_video_components(raw_msg)
 
     def _extract_mentions_for_wake(self, raw_msg: dict) -> list[Any]:
         mentions = raw_msg.get("mentions")
@@ -1105,7 +866,7 @@ class RocketChatAdapter(Platform):
                 msg_text = current_payload.get("msg", "").strip()
                 
                 # --- 提取自身的图片和媒体内容 ---
-                local_images = await self._extract_image_urls(current_payload)
+                local_images = await self._extract_image_components(current_payload)
                 local_recs = await self._extract_record_components(current_payload)
                 local_vids = await self._extract_video_components(current_payload)
                 local_files = await self._extract_file_components(current_payload)
@@ -1228,8 +989,7 @@ class RocketChatAdapter(Platform):
                         f"images={len(local_images)} records={len(local_recs)} "
                         f"videos={len(local_vids)} files={len(local_files)}"
                     )
-                    for i in local_images:
-                        chain.append(Image.fromURL(i))
+                    chain.extend(local_images)
                     chain.extend(local_recs)
                     chain.extend(local_vids)
                     chain.extend(local_files)
@@ -1508,48 +1268,12 @@ class RocketChatAdapter(Platform):
         text: str = "",
         tmid: Optional[str] = None,
     ) -> None:
-        """
-        通过 URL 发送图片消息（使用 attachments 形式）。
-
-        :param room_id:   目标房间 ID
-        :param image_url: 图片公开 URL
-        :param text:      可选的消息正文
-        """
-        await self._send_structured_message(
+        await self._media.send_image_url(
             room_id,
-            text,
-            attachments=[{"image_url": image_url}],
+            image_url,
+            text=text,
             tmid=tmid,
         )
-
-    def _infer_upload_content_type(self, file_path: str, filename: str) -> str:
-        """推断上传文件 MIME 类型。"""
-        guessed_type, _ = mimetypes.guess_type(filename)
-        if guessed_type:
-            return guessed_type
-
-        guessed_type, _ = mimetypes.guess_type(file_path)
-        if guessed_type:
-            return guessed_type
-
-        try:
-            with open(file_path, "rb") as fp:
-                header = fp.read(16)
-        except Exception:
-            return "application/octet-stream"
-
-        if header.startswith(b"\x89PNG\r\n\x1a\n"):
-            return "image/png"
-        if header.startswith(b"\xff\xd8\xff"):
-            return "image/jpeg"
-        if header.startswith((b"GIF87a", b"GIF89a")):
-            return "image/gif"
-        if header.startswith(b"BM"):
-            return "image/bmp"
-        if header.startswith(b"RIFF") and header[8:12] == b"WEBP":
-            return "image/webp"
-
-        return "application/octet-stream"
 
     async def send_image_file(
         self,
@@ -1558,54 +1282,12 @@ class RocketChatAdapter(Platform):
         description: str = "",
         tmid: Optional[str] = None,
     ) -> None:
-        """
-        上传本地图片文件到指定房间。
-
-        :param room_id:     目标房间 ID
-        :param file_path:   本地文件路径
-        :param description: 可选描述文字
-        """
-        room_info = await self._get_room_info(room_id)
-        if not self._e2ee.encrypted_upload_supported(room_info):
-            logger.warning(
-                f"[RocketChat][E2EE] 加密房间暂不支持文件二进制上传，已跳过图片 room_id={room_id!r}"
-            )
-            if description:
-                await self.send_text(room_id, description, tmid=tmid)
-            return
-
-        url = f"{self.server_url}/api/v1/rooms.upload/{room_id}"
-        # 上传不能带 Content-Type: application/json，只需认证头
-        headers = {
-            "X-Auth-Token": self.auth_token,
-            "X-User-Id": self.user_id,
-        }
-        try:
-            with open(file_path, "rb") as fp:
-                filename = os.path.basename(file_path) or "image.png"
-                form = aiohttp.FormData()
-                content_type = self._infer_upload_content_type(file_path, filename)
-                form.add_field(
-                    "file",
-                    fp,
-                    filename=filename,
-                    content_type=content_type,
-                )
-                if description:
-                    form.add_field("description", description)
-                if tmid:
-                    form.add_field("tmid", tmid)
-
-                async with self._http_session.post(
-                    url, data=form, headers=headers
-                ) as resp:
-                    data = await resp.json()
-                    if not data.get("success"):
-                        logger.error(f"[RocketChat] 上传图片失败: {data}")
-        except FileNotFoundError:
-            logger.error(f"[RocketChat] 图片文件不存在: {file_path}")
-        except Exception as exc:
-            logger.error(f"[RocketChat] 上传图片异常: {exc!r}")
+        await self._media.send_image_file(
+            room_id,
+            file_path,
+            description=description,
+            tmid=tmid,
+        )
 
     async def send_file(
         self,
@@ -1615,47 +1297,13 @@ class RocketChatAdapter(Platform):
         description: str = "",
         tmid: Optional[str] = None,
     ) -> None:
-        """上传任意本地文件到指定房间。"""
-        room_info = await self._get_room_info(room_id)
-        if not self._e2ee.encrypted_upload_supported(room_info):
-            logger.warning(
-                f"[RocketChat][E2EE] 加密房间暂不支持文件二进制上传，已跳过文件 room_id={room_id!r}"
-            )
-            if description:
-                await self.send_text(room_id, description, tmid=tmid)
-            return
-
-        url = f"{self.server_url}/api/v1/rooms.upload/{room_id}"
-        headers = {
-            "X-Auth-Token": self.auth_token,
-            "X-User-Id": self.user_id,
-        }
-        try:
-            with open(file_path, "rb") as fp:
-                resolved_name = filename or os.path.basename(file_path) or "attachment"
-                form = aiohttp.FormData()
-                content_type = self._infer_upload_content_type(file_path, resolved_name)
-                form.add_field(
-                    "file",
-                    fp,
-                    filename=resolved_name,
-                    content_type=content_type,
-                )
-                if description:
-                    form.add_field("description", description)
-                if tmid:
-                    form.add_field("tmid", tmid)
-
-                async with self._http_session.post(
-                    url, data=form, headers=headers
-                ) as resp:
-                    data = await resp.json()
-                    if not data.get("success"):
-                        logger.error(f"[RocketChat] 上传文件失败: {data}")
-        except FileNotFoundError:
-            logger.error(f"[RocketChat] 文件不存在: {file_path}")
-        except Exception as exc:
-            logger.error(f"[RocketChat] 上传文件异常: {exc!r}")
+        await self._media.send_file(
+            room_id,
+            file_path,
+            filename=filename,
+            description=description,
+            tmid=tmid,
+        )
 
     async def _resolve_outbound_media_path(
         self,
@@ -1676,77 +1324,14 @@ class RocketChatAdapter(Platform):
         url: str,
         default_suffix: str,
     ) -> tuple[str | None, Callable[[], None] | None]:
-        parsed = urlparse(url)
-        if parsed.scheme not in {"http", "https"}:
-            logger.warning(f"[RocketChat] 拒绝下载不支持的媒体协议: {url}")
-            return None, None
-
-        filename = os.path.basename(parsed.path)
-        _, ext = os.path.splitext(filename)
-        suffix = ext if ext else default_suffix
-        try:
-            async with self._http_session.get(
-                url,
-                timeout=aiohttp.ClientTimeout(total=30, connect=10),
-                allow_redirects=True,
-                max_redirects=3,
-            ) as resp:
-                if resp.status >= 400:
-                    logger.error(f"[RocketChat] 下载媒体失败 {resp.status}: {url}")
-                    return None, None
-
-                content_length = resp.content_length
-                if (
-                    content_length is not None
-                    and content_length > self.remote_media_max_size
-                ):
-                    logger.error(
-                        f"[RocketChat] 下载媒体失败，文件过大: {content_length} > {self.remote_media_max_size} ({url})"
-                    )
-                    return None, None
-
-                raw = bytearray()
-                async for chunk in resp.content.iter_chunked(64 * 1024):
-                    raw.extend(chunk)
-                    if len(raw) > self.remote_media_max_size:
-                        logger.error(
-                            f"[RocketChat] 下载媒体失败，文件超过限制: {len(raw)} > {self.remote_media_max_size} ({url})"
-                        )
-                        return None, None
-        except Exception as exc:
-            logger.error(f"[RocketChat] 下载媒体异常: {exc!r}")
-            return None, None
-
-        tmp = tempfile.NamedTemporaryFile(suffix=suffix, delete=False)
-        try:
-            tmp.write(raw)
-            tmp.close()
-            return tmp.name, lambda: os.unlink(tmp.name)
-        except Exception:
-            tmp.close()
-            os.unlink(tmp.name)
-            raise
+        return await self._media.download_remote_media(url, default_suffix)
 
     def _decode_base64_media(
         self,
         file_ref: str,
         default_suffix: str,
     ) -> tuple[str | None, Callable[[], None] | None]:
-        try:
-            raw = base64.b64decode(file_ref[len("base64://") :])
-        except Exception as exc:
-            logger.error(f"[RocketChat] Base64 媒体处理失败: {exc!r}")
-            return None, None
-
-        tmp = tempfile.NamedTemporaryFile(suffix=default_suffix, delete=False)
-        try:
-            tmp.write(raw)
-            tmp.close()
-            return tmp.name, lambda: os.unlink(tmp.name)
-        except Exception:
-            tmp.close()
-            os.unlink(tmp.name)
-            raise
+        return self._media.decode_base64_media(file_ref, default_suffix)
 
     async def _send_message_chain(
         self, room_id: str, message_chain: MessageChain, tmid: Optional[str] = None

@@ -15,8 +15,9 @@
 - ✅ **自动重连** — WebSocket 断线后自动重连，无需人工干预
 - ✅ **动态订阅** — 机器人被加入新房间后自动订阅，无需重启
 - ✅ **全局管理员** — 与 AstrBot 核心权限系统无缝集成
-- ✅ **图片上传** — 支持本地图片文件通过 `rooms.upload` API 上传
-- ✅ **Base64 图片** — 支持 AstrBot 文转图功能生成的 Base64 图片
+- ✅ **增强型图片上传** — 本地图片原生上传；外链图片自动代理下载转存，无视防盗链阻断
+- ✅ **Base64 多媒体识别** — 原生支持处理文转图 Base64 流，并内置智能重命名拦截，彻底告别无意义长串乱码文件名
+- ✅ **全模态 E2EE 加密** — 在纯文本加密通信外，通过极简、无冗余的安全协议体结构破除版本壁垒，实现加密媒体音视频的极致稳定收发
 
 ---
 
@@ -96,11 +97,11 @@ git clone https://github.com/NET-Homeless/astrbot_plugin_rocket_chat_adapter
 
 ### E2EE 支持边界
 
-- AstrBot 当前平台适配器配置页对自定义字段通常按文本框渲染，`enable_e2ee` 在 WebUI 中可能显示为输入框而不是开关；填写 `true` / `false` 即可
 - 当前实现按 Rocket.Chat 官方源码兼容 **私信 (`d`)** 和 **私有群组 (`p`)** 的 E2EE 文本消息
 - 普通未加密频道/私聊继续沿用原有明文链路，不受 E2EE 初始化失败影响
-- 加密房间中的 **文本 / 引用回复 / 远程图片 URL 附件** 可走 E2EE
-- 加密房间中的 **本地文件 / 图片 / 音视频二进制上传** 目前仍未实现 E2EE 文件加密上传，因此会跳过，不会回退为明文上传
+- 加密房间中的 **文本 / 引用回复 / 图片 / 音频 / 视频 / 文件上传** 走 E2EE（`/api/v1/rooms.media` + `/api/v1/rooms.mediaConfirm`）
+- 加密房间中的媒体接收会自动按附件内 `encryption` 信息解密，再以 AstrBot 的普通 `Image/Record/Video/File` 组件形式进入事件流
+- 如果 E2EE 初始化失败或房间密钥不可用，加密房间消息会被安全跳过，不会影响未加密房间的正常收发
 
 ---
 
@@ -148,7 +149,8 @@ AstrBot 框架
             │     ├── POST /api/v1/chat.postMessage → 普通房间发送文本 / 引用回复
             │     ├── POST /api/v1/chat.sendMessage → E2EE 房间发送密文消息
             │     ├── GET/POST /api/v1/e2e.*       → E2EE 密钥获取 / 协商 / 分发
-            │     └── POST /api/v1/rooms.upload   → 上传文件（图片/语音/视频/普通文件）
+            │     ├── POST /api/v1/rooms.upload   → 普通房间上传文件（图片/语音/视频/普通文件）
+            │     └── POST /api/v1/rooms.media + /api/v1/rooms.mediaConfirm → E2EE 房间文件上传与消息确认
             │
             └── WebSocket DDP (aiohttp)
                   ├── connect 握手
@@ -213,11 +215,11 @@ Rocket.Chat 房间收到回复
 | 入站语音消息 | `files` / `file` 中音频附件 | `Record` 组件 | ✅ 已实现 | 基于 MIME / 文件名 / URL 严格识别 |
 | 入站视频消息 | `files` / `file` 中视频附件 | `Video` 组件 | ✅ 已实现 | 基于 MIME / 文件名 / URL 严格识别 |
 | 房间订阅变更 | `stream-notify-user`（被加入新房间） | 动态订阅房间消息流 | ✅ 已实现 | 无需重启插件 |
-| 出站文本回复 | `chat.postMessage` | `event.send` / `send_by_session` | ✅ 已实现 | 支持线程 `tmid` 和 Markdown 原生引用 |
-| 出站图片回复 | `rooms.upload` | `Image` 组件发送 | ✅ 已实现 | 统一转本地上传避免防盗链，包含 MIME 推断 |
-| 出站普通文件 | `rooms.upload` | `File` 组件发送 | ✅ 已实现 | 本地文件上传；远端 URL 退化为文本链接 |
-| 出站语音回复 | `rooms.upload` | `Record` 组件发送 | ✅ 已实现 | 本地文件、HTTP(S)、Base64 均可上传 |
-| 出站视频回复 | `rooms.upload` | `Video` 组件发送 | ✅ 已实现 | 本地文件、HTTP(S) 均可上传 |
+| 出站文本回复 | 普通:`chat.postMessage` / E2EE:`chat.sendMessage` | `event.send` / `send_by_session` | ✅ 已实现 | 支持线程 `tmid` 和 Markdown 原生引用 |
+| 出站图片回复 | 普通:`rooms.upload` / E2EE:`rooms.media + mediaConfirm` | `Image` 组件发送 | ✅ 已实现 | 统一转本地上传避免防盗链，包含 MIME 推断 |
+| 出站普通文件 | 普通:`rooms.upload` / E2EE:`rooms.media + mediaConfirm` | `File` 组件发送 | ✅ 已实现 | 本地文件上传；远端 URL 退化为文本链接 |
+| 出站语音回复 | 普通:`rooms.upload` / E2EE:`rooms.media + mediaConfirm` | `Record` 组件发送 | ✅ 已实现 | 本地文件、HTTP(S)、Base64 均可上传 |
+| 出站视频回复 | 普通:`rooms.upload` / E2EE:`rooms.media + mediaConfirm` | `Video` 组件发送 | ✅ 已实现 | 本地文件、HTTP(S) 均可上传 |
 | 出站输入中状态 | `stream-notify-room` | typing 指示器 | ✅ 已实现 | 群聊/线程仅在 `@bot` 时启用；私聊也支持；受 `typing_indicator_delay` 控制 |
 | 系统/审计事件 | 加入/退出/改名/权限变化等 | 无统一映射 | ❌ 不支持 | 当前版本不建模为 AstrBot 事件 |
 | 交互状态事件 | 编辑、撤回、反应、已读、在线状态 | 无统一映射 | ❌ 不支持 | 输入中已实现，其余状态仍不在当前适配器范围 |
