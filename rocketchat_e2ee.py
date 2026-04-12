@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import hashlib
 import json
 import os
 import uuid
@@ -263,6 +264,18 @@ class RoomKeyStore:
         return self.old_keys.get(key_id) or self.current
 
 
+@dataclass
+class EncryptedMediaUpload:
+    encrypted_name: str
+    encrypted_bytes: bytes
+    key_jwk: dict[str, Any]
+    iv_b64: str
+    sha256: str
+    original_name: str
+    mime_type: str
+    size: int
+
+
 class RocketChatE2EEManager:
     """
     Python implementation aligned with Rocket.Chat official E2EE client/server source.
@@ -381,6 +394,31 @@ class RocketChatE2EEManager:
         attachments: Optional[list[dict[str, Any]]] = None,
         tmid: Optional[str] = None,
     ) -> Optional[dict[str, Any]]:
+        content_to_encrypt: dict[str, Any] = {}
+        if text:
+            content_to_encrypt["msg"] = text
+        if attachments:
+            content_to_encrypt["attachments"] = attachments
+
+        encrypted = await self.encrypt_message_content(room_id, content_to_encrypt)
+        if not encrypted:
+            return None
+
+        message: dict[str, Any] = {
+            "rid": room_id,
+            "t": "e2e",
+            "e2e": "pending",
+            "content": encrypted,
+        }
+        if tmid:
+            message["tmid"] = tmid
+        return {"message": message}
+
+    async def encrypt_message_content(
+        self,
+        room_id: str,
+        content_to_encrypt: dict[str, Any],
+    ) -> Optional[dict[str, str]]:
         room_info = await self.adapter._get_room_info(room_id)
         if not await self.should_encrypt_room(room_info):
             return None
@@ -389,35 +427,163 @@ class RocketChatE2EEManager:
         if not session_key:
             return None
 
-        content_to_encrypt: dict[str, Any] = {}
-        if text:
-            content_to_encrypt["msg"] = text
-        if attachments:
-            content_to_encrypt["attachments"] = attachments
-
         encrypted = session_key.encrypt_payload(
             _json_dumps(content_to_encrypt).encode("utf-8")
         )
+        return {
+            "algorithm": "rc.v2.aes-sha2",
+            **encrypted,
+        }
 
-        message: dict[str, Any] = {
-            "rid": room_id,
-            "t": "e2e",
-            "e2e": "pending",
-            "content": {
-                "algorithm": "rc.v2.aes-sha2",
-                **encrypted,
+    async def prepare_encrypted_upload(
+        self,
+        room_id: str,
+        *,
+        file_name: str,
+        mime_type: str,
+        file_bytes: bytes,
+    ) -> Optional[EncryptedMediaUpload]:
+        room_info = await self.adapter._get_room_info(room_id)
+        if not await self.should_encrypt_room(room_info):
+            return None
+
+        session_key = await self._ensure_room_key(room_id, room_info=room_info)
+        if not session_key:
+            return None
+
+        iv = os.urandom(16)
+        file_key = os.urandom(32)
+        encryptor = Cipher(algorithms.AES(file_key), modes.CTR(iv)).encryptor()
+        encrypted_bytes = encryptor.update(file_bytes) + encryptor.finalize()
+
+        return EncryptedMediaUpload(
+            encrypted_name=hashlib.sha256(file_name.encode("utf-8")).hexdigest(),
+            encrypted_bytes=encrypted_bytes,
+            key_jwk={
+                "kty": "oct",
+                "k": _b64url_encode(file_key),
+                "key_ops": ["encrypt", "decrypt"],
+                "ext": True,
+                "alg": "A256CTR",
+            },
+            iv_b64=_b64_encode(iv),
+            sha256=hashlib.sha256(file_bytes).hexdigest(),
+            original_name=file_name,
+            mime_type=mime_type,
+            size=len(file_bytes),
+        )
+
+    async def build_upload_file_content(
+        self,
+        room_id: str,
+        upload: EncryptedMediaUpload,
+    ) -> Optional[dict[str, Any]]:
+        raw = {
+            "type": upload.mime_type,
+            "typeGroup": (upload.mime_type.split("/", 1)[0] if "/" in upload.mime_type else "file"),
+            "name": upload.original_name,
+            "encryption": {
+                "key": upload.key_jwk,
+                "iv": upload.iv_b64,
+            },
+            "hashes": {
+                "sha256": upload.sha256,
             },
         }
-        if tmid:
-            message["tmid"] = tmid
-        return {"message": message}
+        encrypted = await self.encrypt_message_content(room_id, raw)
+        if not encrypted:
+            return None
+        return {"raw": raw, "encrypted": encrypted}
 
-    def encrypted_upload_supported(self, room_info: dict) -> bool:
-        return not (
-            self.enabled
-            and room_info.get("encrypted")
-            and room_info.get("t") in {"d", "p"}
+    async def build_media_confirm_payload(
+        self,
+        room_id: str,
+        *,
+        upload_id: str,
+        upload_url: str,
+        upload: EncryptedMediaUpload,
+        text: str = "",
+        tmid: Optional[str] = None,
+    ) -> Optional[dict[str, Any]]:
+        file_content = await self.build_upload_file_content(room_id, upload)
+        if not file_content:
+            return None
+
+        mime_group = upload.mime_type.split("/", 1)[0] if "/" in upload.mime_type else "file"
+        attachment: dict[str, Any] = {
+            "title": upload.original_name,
+            "type": "file",
+            "title_link": upload_url,
+            "title_link_download": True,
+            "encryption": {
+                "key": upload.key_jwk,
+                "iv": upload.iv_b64,
+            },
+            "hashes": {
+                "sha256": upload.sha256,
+            },
+            "fileId": upload_id,
+        }
+        if mime_group == "image":
+            attachment["image_url"] = upload_url
+            attachment["image_type"] = upload.mime_type
+            attachment["image_size"] = upload.size
+        elif mime_group == "audio":
+            attachment["audio_url"] = upload_url
+            attachment["audio_type"] = upload.mime_type
+            attachment["audio_size"] = upload.size
+        elif mime_group == "video":
+            attachment["video_url"] = upload_url
+            attachment["video_type"] = upload.mime_type
+            attachment["video_size"] = upload.size
+        else:
+            attachment["size"] = upload.size
+            extension = upload.original_name.rsplit(".", 1)[-1].upper() if "." in upload.original_name else "file"
+            attachment["format"] = extension or "file"
+
+        file_meta = {
+            "_id": upload_id,
+            "name": upload.original_name,
+            "type": upload.mime_type,
+            "size": upload.size,
+            "format": (
+                upload.original_name.rsplit(".", 1)[-1].upper()
+                if "." in upload.original_name
+                else "file"
+            ),
+        }
+
+        encrypted_content = await self.encrypt_message_content(
+            room_id,
+            {
+                "attachments": [attachment],
+                "files": [file_meta],
+                "file": file_meta,
+                **({"msg": text} if text else {}),
+            },
         )
+        if not encrypted_content:
+            return None
+
+        payload: dict[str, Any] = {
+            "t": "e2e",
+            "content": encrypted_content,
+        }
+        if tmid:
+            payload["tmid"] = tmid
+        return payload
+
+    def decrypt_uploaded_media(
+        self,
+        encrypted_bytes: bytes,
+        *,
+        key_data: dict[str, Any],
+        iv_b64: str,
+    ) -> bytes:
+        key_bytes = _b64url_decode(key_data["k"])
+        iv = _b64_decode(iv_b64)
+        decryptor = Cipher(algorithms.AES(key_bytes), modes.CTR(iv)).decryptor()
+        return decryptor.update(encrypted_bytes) + decryptor.finalize()
 
     async def _ensure_room_key(
         self,

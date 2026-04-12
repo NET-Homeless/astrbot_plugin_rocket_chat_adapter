@@ -326,6 +326,9 @@ class RocketChatMessageEvent(AstrMessageEvent):
         return (local_path or None, None)
 
     def _guess_filename(self, file_ref: str, local_path: str, fallback: str) -> str:
+        # Base64 引用不含有意义的文件名，直接使用 fallback
+        if file_ref.startswith("base64://"):
+            return fallback
         parsed = urlparse(file_ref)
         candidate = os.path.basename(parsed.path)
         if candidate:
