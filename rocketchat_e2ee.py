@@ -779,9 +779,27 @@ class RocketChatE2EEManager:
         try:
             payload = raw_msg.get("content")
             if payload:
-                key_id = payload["kid"]
-                iv = _b64_decode(payload["iv"])
-                ciphertext = _b64_decode(payload["ciphertext"])
+                key_id = payload.get("kid")
+                iv_str = payload.get("iv")
+                if key_id and iv_str:
+                    iv = _b64_decode(iv_str)
+                    ciphertext = _b64_decode(payload["ciphertext"])
+                else:
+                    logger.warning(f"[RocketChat][E2EE] 收到缺少 kid/iv 的 content: {payload}")
+                    cipher_str = payload.get("ciphertext", "")
+                    if cipher_str.startswith("{"):
+                        logger.warning(f"[RocketChat][E2EE] ciphertext 似乎是 JSON? {cipher_str}")
+                    elif len(cipher_str) > 28: # At least 12 char kid + b64(16 byte iv)
+                        logger.warning(f"[RocketChat][E2EE] 尝试用 v1 提取法处理 content.ciphertext...")
+                        key_id = cipher_str[:12]
+                        try:
+                            decoded = _b64_decode(cipher_str[12:])
+                            iv, ciphertext = decoded[:16], decoded[16:]
+                        except Exception as e:
+                            logger.error(f"[RocketChat][E2EE] 提取备用结构失败: {e}")
+                            return None
+                    else:
+                        return None
             else:
                 key_id = raw_msg["msg"][:12]
                 decoded = _b64_decode(raw_msg["msg"][12:])
