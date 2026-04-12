@@ -340,6 +340,14 @@ class RocketChatMessageEvent(AstrMessageEvent):
             logger.warning("[RocketChat] 收到空 file 字段的 Image 组件，已跳过")
             return
 
+        if file_ref.startswith("http://") or file_ref.startswith("https://"):
+            await self.adapter.send_image_url(
+                self.room_id,
+                file_ref,
+                tmid=self.thread_id,
+            )
+            return
+
         local_path, cleanup = await self._resolve_uploadable_path(
             file_ref,
             default_suffix=".png",

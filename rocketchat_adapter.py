@@ -36,7 +36,66 @@ from astrbot.api.platform import (
     register_platform_adapter,
 )
 
+from .rocketchat_e2ee import RocketChatE2EEManager
 from .rocketchat_event import RocketChatMessageEvent
+
+
+def _coerce_bool(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"1", "true", "yes", "on"}:
+            return True
+        if normalized in {"0", "false", "no", "off", ""}:
+            return False
+    return bool(value)
+
+
+ROCKETCHAT_CONFIG_METADATA = {
+    "server_url": {
+        "description": "Rocket.Chat 服务器地址",
+        "type": "string",
+        "hint": "Rocket.Chat 服务地址，包含 http:// 或 https://，不要带末尾斜杠。",
+    },
+    "username": {
+        "description": "机器人用户名",
+        "type": "string",
+        "hint": "用于登录 Rocket.Chat 的机器人用户名。",
+    },
+    "password": {
+        "description": "机器人密码",
+        "type": "string",
+        "hint": "用于登录 Rocket.Chat 的机器人密码。",
+    },
+    "reconnect_delay": {
+        "description": "重连延迟",
+        "type": "float",
+        "hint": "WebSocket 断开后自动重连的等待秒数。",
+    },
+    "typing_indicator_delay": {
+        "description": "输入中延迟",
+        "type": "float",
+        "hint": "回复较慢时显示 typing 的延迟秒数。",
+    },
+    "remote_media_max_size": {
+        "description": "远程媒体大小上限",
+        "type": "int",
+        "hint": "下载远程媒体时允许的最大字节数。",
+    },
+    "enable_e2ee": {
+        "description": "启用 E2EE",
+        "type": "bool",
+        "hint": "启用 Rocket.Chat 端到端加密支持。私信和私有群组会按官方 E2EE 协议处理。",
+    },
+    "e2ee_password": {
+        "description": "E2EE 密钥密码",
+        "type": "string",
+        "hint": "Rocket.Chat E2EE 私钥密码。仅在启用 E2EE 时使用。",
+    },
+}
 
 
 @register_platform_adapter(
@@ -50,8 +109,11 @@ from .rocketchat_event import RocketChatMessageEvent
         "reconnect_delay": 5.0,
         "typing_indicator_delay": 0.5,
         "remote_media_max_size": 20971520,
+        "enable_e2ee": False,
+        "e2ee_password": "",
     },
     support_streaming_message=False,
+    config_metadata=ROCKETCHAT_CONFIG_METADATA,
 )
 class RocketChatAdapter(Platform):
     """
@@ -65,6 +127,8 @@ class RocketChatAdapter(Platform):
       reconnect_delay        : WebSocket 断线后重连等待秒数，默认 5.0
       typing_indicator_delay : 输入中提示的延迟秒数；小于该时间的快速系统回复不显示 typing
       remote_media_max_size  : 远端媒体下载大小上限（字节），默认 20MB
+      enable_e2ee           : 是否启用 Rocket.Chat E2EE 支持，默认 False
+      e2ee_password         : Rocket.Chat E2EE 私钥密码；仅在 enable_e2ee=True 时使用
     """
 
     def __init__(
@@ -89,6 +153,8 @@ class RocketChatAdapter(Platform):
         self.remote_media_max_size: int = int(
             platform_config.get("remote_media_max_size", 20 * 1024 * 1024)
         )
+        self.enable_e2ee: bool = _coerce_bool(platform_config.get("enable_e2ee", False))
+        self.e2ee_password: str = str(platform_config.get("e2ee_password", ""))
 
         # 运行时状态
         self.auth_token: Optional[str] = None
@@ -106,10 +172,14 @@ class RocketChatAdapter(Platform):
         self._room_type_cache: Dict[str, str] = {}
         # 房间名称缓存，用于构造 message_link
         self._room_name_cache: Dict[str, str] = {}
+        # 房间完整信息缓存（类型/名称/加密状态/e2eKeyId）
+        self._room_info_cache: Dict[str, dict] = {}
         # 已订阅房间集合，防止重复订阅导致消息被多次处理
         self._subscribed_rooms: set = set()
         # DDP method 调用 ID 计数器，确保每次调用 ID 唯一
         self._ddp_call_id: int = 0
+        # 等待 DDP result 的 Future 映射
+        self._pending_ddp_results: Dict[str, asyncio.Future] = {}
         # 后台任务强引用集合，防止 Python 3.12+ GC 回收未完成的 task
         self._background_tasks: set[asyncio.Task] = set()
         # 并发处理控制，防止瞬间过多消息导致处理积压
@@ -120,6 +190,11 @@ class RocketChatAdapter(Platform):
             description="Rocket.Chat 消息平台适配器",
             id=platform_config.get("id", "rocket_chat"),
             support_streaming_message=False,
+        )
+        self._e2ee = RocketChatE2EEManager(
+            adapter=self,
+            enabled=self.enable_e2ee,
+            password=self.e2ee_password,
         )
 
     # ------------------------------------------------------------------ #
@@ -140,6 +215,7 @@ class RocketChatAdapter(Platform):
         try:
             # 第一步：REST API 登录，获取 authToken / userId
             await self._rest_login()
+            await self._e2ee.initialize()
 
             # 第二步：外层重连循环
             while self._running:
@@ -208,6 +284,11 @@ class RocketChatAdapter(Platform):
             except Exception:
                 pass
 
+        for future in list(self._pending_ddp_results.values()):
+            if not future.done():
+                future.cancel()
+        self._pending_ddp_results.clear()
+
         # 统一取消并等待后台任务完成，避免生命周期外泄漏
         if self._background_tasks:
             for task in list(self._background_tasks):
@@ -257,22 +338,43 @@ class RocketChatAdapter(Platform):
         url = f"{self.server_url}/api/v1/subscriptions.get"
         async with self._http_session.get(url, headers=self._auth_headers()) as resp:
             data = await resp.json()
-        return data.get("update", []) if data.get("success") else []
-
-    async def _get_room_type(self, room_id: str) -> str:
-        """
-        获取房间类型，带本地缓存。
-
-        返回值：
-          "c"  → 公开频道（channel）
-          "p"  → 私有群组（private group）
-          "d"  → 私信（direct message）
-        """
-        if room_id in self._room_type_cache:
-            logger.debug(
-                f"[RocketChat][room] cache hit room_id={room_id!r} type={self._room_type_cache[room_id]!r}"
+        subscriptions = data.get("update", []) if data.get("success") else []
+        for sub in subscriptions:
+            if not isinstance(sub, dict):
+                continue
+            room_id = sub.get("rid")
+            if not room_id:
+                continue
+            self._cache_room_info(
+                {
+                    "_id": room_id,
+                    "t": sub.get("t", self._room_type_cache.get(room_id, "c")),
+                    "name": sub.get("name"),
+                    "fname": sub.get("fname"),
+                    "encrypted": bool(sub.get("encrypted", False)),
+                    "e2eKeyId": sub.get("e2eKeyId"),
+                }
             )
-            return self._room_type_cache[room_id]
+        return subscriptions
+
+    def _cache_room_info(self, room: dict) -> None:
+        room_id = room.get("_id")
+        if not room_id:
+            return
+        cached = dict(self._room_info_cache.get(room_id, {}))
+        cached.update(room)
+        self._room_info_cache[room_id] = cached
+
+        room_type = cached.get("t")
+        if room_type:
+            self._room_type_cache[room_id] = room_type
+        room_name = cached.get("name") or cached.get("fname")
+        if room_name:
+            self._room_name_cache[room_id] = room_name
+
+    async def _get_room_info(self, room_id: str, refresh: bool = False) -> dict:
+        if not refresh and room_id in self._room_info_cache:
+            return self._room_info_cache[room_id]
 
         url = f"{self.server_url}/api/v1/rooms.info?roomId={room_id}"
         logger.debug(
@@ -287,21 +389,31 @@ class RocketChatAdapter(Platform):
                 f"[RocketChat][room] room info response room_id={room_id!r} data={data}"
             )
             if data.get("success"):
-                room = data.get("room", {})
-                room_type = room.get("t", "c")
-                self._room_type_cache[room_id] = room_type
-                room_name = room.get("name") or room.get("fname")
-                if room_name:
-                    self._room_name_cache[room_id] = room_name
-                logger.debug(
-                    f"[RocketChat][room] resolved room_id={room_id!r} type={room_type!r}"
-                )
-                return room_type
-        except Exception as e:
-            logger.warning(f"[RocketChat] 获取房间类型失败 room_id={room_id}: {e}")
+                room = data.get("room", {}) or {}
+                self._cache_room_info(room)
+                return self._room_info_cache.get(room_id, room)
+        except Exception as exc:
+            logger.warning(f"[RocketChat] 获取房间信息失败 room_id={room_id}: {exc}")
 
-        logger.debug(f"[RocketChat][room] fallback room_id={room_id!r} type='c'")
-        return "c"
+        fallback = self._room_info_cache.get(room_id, {"_id": room_id, "t": "c", "encrypted": False})
+        self._cache_room_info(fallback)
+        return fallback
+
+    async def _get_room_type(self, room_id: str) -> str:
+        """
+        获取房间类型，带本地缓存。
+
+        返回值：
+          "c"  → 公开频道（channel）
+          "p"  → 私有群组（private group）
+          "d"  → 私信（direct message）
+        """
+        room = await self._get_room_info(room_id)
+        room_type = room.get("t", "c")
+        logger.debug(
+            f"[RocketChat][room] resolved room_id={room_id!r} type={room_type!r}"
+        )
+        return room_type
 
     def _build_message_link(self, room_id: str, message_id: str) -> str:
         """构造指向原始消息的 Rocket.Chat 深链接（用于引用附件）。"""
@@ -327,7 +439,8 @@ class RocketChatAdapter(Platform):
             async with self._http_session.get(url, headers=self._auth_headers()) as resp:
                 data = await resp.json()
                 if data.get("success"):
-                    return data.get("message")
+                    message = data.get("message")
+                    return await self._maybe_decrypt_incoming_message(message)
                 else:
                     logger.debug(f"[RocketChat] 获取消息详情失败: msgId={msg_id} response={data}")
         except asyncio.TimeoutError:
@@ -335,6 +448,13 @@ class RocketChatAdapter(Platform):
         except Exception as exc:
             logger.warning(f"[RocketChat] 无法拉取被引用的消息明细 msgId={msg_id}: {exc!r}")
         return None
+
+    async def _maybe_decrypt_incoming_message(self, raw_msg: Optional[dict]) -> Optional[dict]:
+        if not isinstance(raw_msg, dict):
+            return raw_msg
+        if raw_msg.get("t") != "e2e":
+            return raw_msg
+        return await self._e2ee.maybe_decrypt_message(raw_msg)
 
     # ------------------------------------------------------------------ #
     #  WebSocket / DDP 协议                                                #
@@ -370,6 +490,10 @@ class RocketChatAdapter(Platform):
                 logger.info(
                     f"[RocketChat] WebSocket 就绪，共订阅 {len(subscriptions)} 个房间"
                 )
+
+                e2ee_task = asyncio.create_task(self._e2ee.on_ws_ready())
+                self._background_tasks.add(e2ee_task)
+                e2ee_task.add_done_callback(self._background_tasks.discard)
 
                 # 进入主监听循环
                 await self._ws_listen_loop(ws)
@@ -440,6 +564,16 @@ class RocketChatAdapter(Platform):
             room_name = sub.get("name") or sub.get("fname")
             if room_name:
                 self._room_name_cache[room_id] = room_name
+            self._cache_room_info(
+                {
+                    "_id": room_id,
+                    "t": room_type or "c",
+                    "name": sub.get("name"),
+                    "fname": sub.get("fname"),
+                    "encrypted": bool(sub.get("encrypted", False)),
+                    "e2eKeyId": sub.get("e2eKeyId"),
+                }
+            )
             await ws.send_json(
                 {
                     "msg": "sub",
@@ -527,6 +661,9 @@ class RocketChatAdapter(Platform):
         elif msg_type == "result":
             # DDP method 调用结果
             result_id = data.get("id", "")
+            future = self._pending_ddp_results.pop(result_id, None)
+            if future and not future.done():
+                future.set_result(data)
             if result_id.startswith("typing-"):
                 error = data.get("error")
                 if error:
@@ -567,7 +704,16 @@ class RocketChatAdapter(Platform):
         if room_id and event_name.endswith("/rooms-changed"):
             room_type = room_payload.get("t")
             if isinstance(room_type, str) and room_type:
-                self._room_type_cache[room_id] = room_type
+                self._cache_room_info(
+                    {
+                        "_id": room_id,
+                        "t": room_type,
+                        "name": room_payload.get("name"),
+                        "fname": room_payload.get("fname"),
+                        "encrypted": bool(room_payload.get("encrypted", False)),
+                        "e2eKeyId": room_payload.get("e2eKeyId"),
+                    }
+                )
                 logger.debug(
                     f"[RocketChat][room] cached from notify room_id={room_id!r} type={room_type!r} event={event_type!r}"
                 )
@@ -588,6 +734,35 @@ class RocketChatAdapter(Platform):
             )
             self._subscribed_rooms.add(room_id)
             logger.info(f"[RocketChat] 动态订阅新房间: {room_id}")
+
+    async def _ddp_call(
+        self,
+        method: str,
+        params: Optional[list[Any]] = None,
+        timeout: float = 10.0,
+    ) -> Any:
+        if not self._ws or self._ws.closed:
+            raise RuntimeError("ddp websocket not ready")
+
+        self._ddp_call_id += 1
+        call_id = f"ddp-{self._ddp_call_id}"
+        future = asyncio.get_running_loop().create_future()
+        self._pending_ddp_results[call_id] = future
+        try:
+            await self._ws.send_json(
+                {
+                    "msg": "method",
+                    "method": method,
+                    "id": call_id,
+                    "params": params or [],
+                }
+            )
+            data = await asyncio.wait_for(future, timeout=timeout)
+            if data.get("error"):
+                raise RuntimeError(data["error"])
+            return data.get("result")
+        finally:
+            self._pending_ddp_results.pop(call_id, None)
 
     async def _normalize_media_url(self, media_url: str) -> str:
         """将 Rocket.Chat 返回的相对媒体地址补全为绝对 URL，并加上认证参数。"""
@@ -863,6 +1038,23 @@ class RocketChatAdapter(Platform):
                 deduped.append(Video.fromURL(url))
         return deduped
 
+    def _extract_mentions_for_wake(self, raw_msg: dict) -> list[Any]:
+        mentions = raw_msg.get("mentions")
+        if isinstance(mentions, list) and mentions:
+            return mentions
+
+        e2e_mentions = raw_msg.get("e2eMentions")
+        if isinstance(e2e_mentions, dict):
+            merged: list[Any] = []
+            merged.extend(e2e_mentions.get("e2eUserMentions", []) or [])
+            merged.extend(e2e_mentions.get("e2eChannelMentions", []) or [])
+            return merged
+
+        if isinstance(e2e_mentions, list):
+            return e2e_mentions
+
+        return []
+
     async def _process_incoming_message(self, raw_msg: dict) -> None:
         """
         将 Rocket.Chat 原始消息转换为 AstrBotMessage，构造事件并提交队列。
@@ -879,13 +1071,18 @@ class RocketChatAdapter(Platform):
                 f"has_files={bool(raw_msg.get('files') or raw_msg.get('file'))} "
                 f"has_urls={bool(raw_msg.get('urls'))} "
                 f"is_thread={bool(raw_msg.get('tmid'))} "
-                f"is_system={bool(raw_msg.get('t'))}"
+                f"is_system={bool(raw_msg.get('t') and raw_msg.get('t') != 'e2e')}"
             )
             logger.debug(f"[RocketChat][IN-FULL] {json.dumps(raw_msg, ensure_ascii=False, default=str)}")
-            
+
+            raw_msg = await self._maybe_decrypt_incoming_message(raw_msg)
+            if not raw_msg:
+                logger.debug("[RocketChat][IN] skip undecipherable e2e message")
+                return
+
             # ---- 过滤规则 ----
-            # 1. 系统消息（有 t 字段，如用户加入/离开通知）
-            if raw_msg.get("t"):
+            # 1. 系统消息（有 t 字段，如用户加入/离开通知；e2e 消息除外）
+            if raw_msg.get("t") and raw_msg.get("t") != "e2e":
                 return
 
             # 2. 机器人自身发出的消息
@@ -1086,14 +1283,20 @@ class RocketChatAdapter(Platform):
 
             # ---- 检测 @mention，决定是否唤醒 AstrBot ----
             bot_mentioned = False
-            mentions = raw_msg.get("mentions", [])
-            if isinstance(mentions, list):
-                for m in mentions:
-                    if isinstance(m, dict) and (
-                        m.get("_id") == self.user_id or m.get("username") == self.bot_username
-                    ):
+            mentions = self._extract_mentions_for_wake(raw_msg)
+            for m in mentions:
+                if isinstance(m, str):
+                    normalized = m.lstrip("@")
+                    if normalized in {self.user_id, self.bot_username}:
                         bot_mentioned = True
                         break
+                if isinstance(m, dict) and (
+                    m.get("_id") == self.user_id or m.get("username") == self.bot_username
+                ):
+                    bot_mentioned = True
+                    break
+            if not bot_mentioned and self.bot_username:
+                bot_mentioned = f"@{self.bot_username}" in (abm.message_str or "")
             
             if bot_mentioned:
                 # 遍地清理 @botusername，绝对不可以把全局替换后的纯文本重新塞进单一组件，这样会破坏多模态组件流时序！
@@ -1168,6 +1371,60 @@ class RocketChatAdapter(Platform):
     #  消息发送方法（供 RocketChatMessageEvent 调用）                       #
     # ------------------------------------------------------------------ #
 
+    async def _post_json_message(self, url: str, payload: dict) -> bool:
+        try:
+            async with self._http_session.post(
+                url,
+                json=payload,
+                headers=self._auth_headers(),
+            ) as resp:
+                data = await resp.json()
+                if not data.get("success"):
+                    logger.error(f"[RocketChat] 发送消息失败: {data}")
+                    return False
+                return True
+        except Exception as exc:
+            logger.error(f"[RocketChat] 发送消息异常: {exc!r}")
+            return False
+
+    async def _send_structured_message(
+        self,
+        room_id: str,
+        text: str = "",
+        *,
+        attachments: Optional[list[dict[str, Any]]] = None,
+        tmid: Optional[str] = None,
+    ) -> bool:
+        room_info = await self._get_room_info(room_id)
+        is_e2ee_room = room_info.get("encrypted") and room_info.get("t") in {"d", "p"}
+
+        if is_e2ee_room:
+            encrypted_payload = await self._e2ee.build_send_message(
+                room_id,
+                text=text,
+                attachments=attachments,
+                tmid=tmid,
+            )
+            if not encrypted_payload:
+                logger.warning(
+                    f"[RocketChat][E2EE] 房间为加密房间，当前无法安全发送，已跳过 room_id={room_id!r}"
+                )
+                return False
+            return await self._post_json_message(
+                f"{self.server_url}/api/v1/chat.sendMessage",
+                encrypted_payload,
+            )
+
+        payload: dict[str, Any] = {"roomId": room_id, "text": text}
+        if attachments:
+            payload["attachments"] = attachments
+        if tmid:
+            payload["tmid"] = tmid
+        return await self._post_json_message(
+            f"{self.server_url}/api/v1/chat.postMessage",
+            payload,
+        )
+
     async def send_text(
         self,
         room_id: str,
@@ -1181,20 +1438,7 @@ class RocketChatAdapter(Platform):
         :param text:    消息正文
         :param tmid:    可选，回复的线程消息 ID（创建/追加线程）
         """
-        payload: dict = {"roomId": room_id, "text": text}
-        if tmid:
-            payload["tmid"] = tmid
-
-        url = f"{self.server_url}/api/v1/chat.postMessage"
-        try:
-            async with self._http_session.post(
-                url, json=payload, headers=self._auth_headers()
-            ) as resp:
-                data = await resp.json()
-                if not data.get("success"):
-                    logger.error(f"[RocketChat] 发送文本失败: {data}")
-        except Exception as exc:
-            logger.error(f"[RocketChat] 发送文本异常: {exc!r}")
+        await self._send_structured_message(room_id, text, tmid=tmid)
 
     async def send_typing(self, room_id: str, flag: bool) -> None:
         """
@@ -1252,27 +1496,10 @@ class RocketChatAdapter(Platform):
         # 构造最终正文：使用 Rocket.Chat 的引用格式 [ ](link) 实现引用显示
         final_text = f"[ ]({link})\n{text}" if link else text
 
-        payload: dict = {
-            "roomId": room_id,
-            "text": final_text,
-        }
-        if tmid:
-            payload["tmid"] = tmid
-
         logger.info(
             f"[RocketChat] send_with_quote() 发送: quote_msg_id={msg_id!r} tmid={tmid!r}"
         )
-
-        url = f"{self.server_url}/api/v1/chat.postMessage"
-        try:
-            async with self._http_session.post(
-                url, json=payload, headers=self._auth_headers()
-            ) as resp:
-                data = await resp.json()
-                if not data.get("success"):
-                    logger.error(f"[RocketChat] 引用回复失败: {data}")
-        except Exception as exc:
-            logger.error(f"[RocketChat] 引用回复异常: {exc!r}")
+        await self._send_structured_message(room_id, final_text, tmid=tmid)
 
     async def send_image_url(
         self,
@@ -1288,23 +1515,12 @@ class RocketChatAdapter(Platform):
         :param image_url: 图片公开 URL
         :param text:      可选的消息正文
         """
-        payload = {
-            "roomId": room_id,
-            "text": text,
-            "attachments": [{"image_url": image_url}],
-        }
-        if tmid:
-            payload["tmid"] = tmid
-        url = f"{self.server_url}/api/v1/chat.postMessage"
-        try:
-            async with self._http_session.post(
-                url, json=payload, headers=self._auth_headers()
-            ) as resp:
-                data = await resp.json()
-                if not data.get("success"):
-                    logger.error(f"[RocketChat] 发送图片 URL 失败: {data}")
-        except Exception as exc:
-            logger.error(f"[RocketChat] 发送图片 URL 异常: {exc!r}")
+        await self._send_structured_message(
+            room_id,
+            text,
+            attachments=[{"image_url": image_url}],
+            tmid=tmid,
+        )
 
     def _infer_upload_content_type(self, file_path: str, filename: str) -> str:
         """推断上传文件 MIME 类型。"""
@@ -1349,6 +1565,15 @@ class RocketChatAdapter(Platform):
         :param file_path:   本地文件路径
         :param description: 可选描述文字
         """
+        room_info = await self._get_room_info(room_id)
+        if not self._e2ee.encrypted_upload_supported(room_info):
+            logger.warning(
+                f"[RocketChat][E2EE] 加密房间暂不支持文件二进制上传，已跳过图片 room_id={room_id!r}"
+            )
+            if description:
+                await self.send_text(room_id, description, tmid=tmid)
+            return
+
         url = f"{self.server_url}/api/v1/rooms.upload/{room_id}"
         # 上传不能带 Content-Type: application/json，只需认证头
         headers = {
@@ -1391,6 +1616,15 @@ class RocketChatAdapter(Platform):
         tmid: Optional[str] = None,
     ) -> None:
         """上传任意本地文件到指定房间。"""
+        room_info = await self._get_room_info(room_id)
+        if not self._e2ee.encrypted_upload_supported(room_info):
+            logger.warning(
+                f"[RocketChat][E2EE] 加密房间暂不支持文件二进制上传，已跳过文件 room_id={room_id!r}"
+            )
+            if description:
+                await self.send_text(room_id, description, tmid=tmid)
+            return
+
         url = f"{self.server_url}/api/v1/rooms.upload/{room_id}"
         headers = {
             "X-Auth-Token": self.auth_token,

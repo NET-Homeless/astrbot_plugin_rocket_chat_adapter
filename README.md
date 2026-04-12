@@ -10,6 +10,7 @@
 
 - ✅ **实时消息接收** — 基于 WebSocket（DDP 协议）订阅频道、私有群组、私信消息
 - ✅ **消息发送** — 通过 REST API 发送文本、图片、语音、视频和普通文件
+- ✅ **E2EE 文本消息** — 按 Rocket.Chat 官方 E2EE 协议收发加密私聊/私有群组文本消息
 - ✅ **输入中提示** — 群聊/线程中 `@bot` 后支持延迟 typing；私聊也支持延迟 typing
 - ✅ **自动重连** — WebSocket 断线后自动重连，无需人工干预
 - ✅ **动态订阅** — 机器人被加入新房间后自动订阅，无需重启
@@ -73,6 +74,9 @@ git clone https://github.com/NET-Homeless/astrbot_plugin_rocket_chat_adapter
 | `password` | string | ✅ | — | 机器人账号密码 |
 | `reconnect_delay` | float | 否 | `5.0` | WebSocket 断线后重连等待秒数 |
 | `typing_indicator_delay` | float | 否 | `0.5` | 输入中提示延迟秒数；若在该时间内已回复，则不会显示 typing |
+| `remote_media_max_size` | int | 否 | `20971520` | 远端媒体下载大小上限（字节） |
+| `enable_e2ee` | bool | 否 | `false` | 是否启用 Rocket.Chat 官方 E2EE 支持 |
+| `e2ee_password` | string | 否 | — | Rocket.Chat E2EE 私钥密码；仅在 `enable_e2ee=true` 时使用 |
 
 ### 配置示例（JSON）
 
@@ -83,9 +87,20 @@ git clone https://github.com/NET-Homeless/astrbot_plugin_rocket_chat_adapter
   "username": "astrbot",
   "password": "your_bot_password",
   "reconnect_delay": 5.0,
-  "typing_indicator_delay": 0.5
+  "typing_indicator_delay": 0.5,
+  "remote_media_max_size": 20971520,
+  "enable_e2ee": true,
+  "e2ee_password": "your_e2ee_password"
 }
 ```
+
+### E2EE 支持边界
+
+- AstrBot 当前平台适配器配置页对自定义字段通常按文本框渲染，`enable_e2ee` 在 WebUI 中可能显示为输入框而不是开关；填写 `true` / `false` 即可
+- 当前实现按 Rocket.Chat 官方源码兼容 **私信 (`d`)** 和 **私有群组 (`p`)** 的 E2EE 文本消息
+- 普通未加密频道/私聊继续沿用原有明文链路，不受 E2EE 初始化失败影响
+- 加密房间中的 **文本 / 引用回复 / 远程图片 URL 附件** 可走 E2EE
+- 加密房间中的 **本地文件 / 图片 / 音视频二进制上传** 目前仍未实现 E2EE 文件加密上传，因此会跳过，不会回退为明文上传
 
 ---
 
@@ -130,7 +145,9 @@ AstrBot 框架
             │     ├── POST /api/v1/login         → 获取 authToken / userId
             │     ├── GET  /api/v1/subscriptions.get → 获取已订阅房间列表
             │     ├── GET  /api/v1/rooms.info     → 获取房间类型（带缓存）
-            │     ├── POST /api/v1/chat.postMessage → 发送文本 / 引用回复
+            │     ├── POST /api/v1/chat.postMessage → 普通房间发送文本 / 引用回复
+            │     ├── POST /api/v1/chat.sendMessage → E2EE 房间发送密文消息
+            │     ├── GET/POST /api/v1/e2e.*       → E2EE 密钥获取 / 协商 / 分发
             │     └── POST /api/v1/rooms.upload   → 上传文件（图片/语音/视频/普通文件）
             │
             └── WebSocket DDP (aiohttp)
