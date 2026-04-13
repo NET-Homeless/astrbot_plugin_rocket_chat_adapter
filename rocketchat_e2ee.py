@@ -788,12 +788,12 @@ class RocketChatE2EEManager:
                     iv = _b64_decode(iv_str)
                     ciphertext = _b64_decode(payload["ciphertext"])
                 else:
-                    logger.warning(f"[RocketChat][E2EE] 收到缺少 kid/iv 的 content: {payload}")
+                    logger.debug(f"[RocketChat][E2EE] 收到缺少 kid/iv 的 content: {payload}")
                     cipher_str = payload.get("ciphertext", "")
                     if cipher_str.startswith("{"):
-                        logger.warning(f"[RocketChat][E2EE] ciphertext 似乎是 JSON? {cipher_str}")
+                        logger.debug(f"[RocketChat][E2EE] ciphertext 似乎是 JSON? {cipher_str}")
                     elif len(cipher_str) > 28: # At least 12 char kid + b64(16 byte iv)
-                        logger.warning(f"[RocketChat][E2EE] 尝试用 v1 提取法处理 content.ciphertext...")
+                        logger.debug(f"[RocketChat][E2EE] 尝试用 v1 提取法处理 content.ciphertext...")
                         key_id = cipher_str[:12]
                         try:
                             decoded = _b64_decode(cipher_str[12:])
