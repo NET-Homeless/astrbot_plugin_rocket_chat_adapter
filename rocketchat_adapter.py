@@ -1154,6 +1154,7 @@ class RocketChatAdapter(Platform):
         *,
         attachments: Optional[list[dict[str, Any]]] = None,
         tmid: Optional[str] = None,
+        e2e_mentions: Optional[dict[str, Any]] = None,
     ) -> bool:
         room_info = await self._get_room_info(room_id)
         is_e2ee_room = room_info.get("encrypted") and room_info.get("t") in {"d", "p"}
@@ -1164,6 +1165,7 @@ class RocketChatAdapter(Platform):
                 text=text,
                 attachments=attachments,
                 tmid=tmid,
+                e2e_mentions=e2e_mentions,
             )
             if not encrypted_payload:
                 logger.warning(
@@ -1185,11 +1187,41 @@ class RocketChatAdapter(Platform):
             payload,
         )
 
+    async def _build_explicit_reply_mention(
+        self,
+        room_id: str,
+        mention_username: Optional[str],
+    ) -> tuple[str | None, dict[str, Any] | None]:
+        room_info = await self._get_room_info(room_id)
+        if not (
+            mention_username
+            and room_info.get("encrypted")
+            and room_info.get("t") == "p"
+        ):
+            return None, None
+
+        normalized = mention_username.lstrip("@").strip()
+        if not normalized:
+            return None, None
+
+        return (
+            f"@{normalized}",
+            {
+                "e2eUserMentions": [f"@{normalized}"],
+                "e2eChannelMentions": [],
+            },
+        )
+
+    async def _should_explicit_reply_mention(self, room_id: str) -> bool:
+        room_info = await self._get_room_info(room_id)
+        return bool(room_info.get("encrypted") and room_info.get("t") == "p")
+
     async def send_text(
         self,
         room_id: str,
         text: str,
         tmid: Optional[str] = None,
+        mention_username: Optional[str] = None,
     ) -> None:
         """
         发送纯文本消息。
@@ -1198,7 +1230,19 @@ class RocketChatAdapter(Platform):
         :param text:    消息正文
         :param tmid:    可选，回复的线程消息 ID（创建/追加线程）
         """
-        await self._send_structured_message(room_id, text, tmid=tmid)
+        mention_text, e2e_mentions = await self._build_explicit_reply_mention(
+            room_id,
+            mention_username,
+        )
+        final_text = text
+        if mention_text:
+            final_text = f"{mention_text} {text}".strip()
+        await self._send_structured_message(
+            room_id,
+            final_text,
+            tmid=tmid,
+            e2e_mentions=e2e_mentions,
+        )
 
     async def send_typing(self, room_id: str, flag: bool) -> None:
         """
@@ -1241,6 +1285,7 @@ class RocketChatAdapter(Platform):
         text: str,
         original_msg: dict,
         tmid: Optional[str] = None,
+        mention_username: Optional[str] = None,
     ) -> None:
         """
         发送带引用原始消息的回复。通过文本格式实现引用显示。
@@ -1252,14 +1297,26 @@ class RocketChatAdapter(Platform):
         """
         msg_id = original_msg.get("_id", "")
         link = self._build_message_link(room_id, msg_id)
+        mention_text, e2e_mentions = await self._build_explicit_reply_mention(
+            room_id,
+            mention_username,
+        )
 
         # 构造最终正文：使用 Rocket.Chat 的引用格式 [ ](link) 实现引用显示
-        final_text = f"[ ]({link})\n{text}" if link else text
+        reply_line = text
+        if mention_text:
+            reply_line = f"{mention_text} {text}".strip()
+        final_text = f"[ ]({link})\n{reply_line}" if link else reply_line
 
         logger.info(
             f"[RocketChat] send_with_quote() 发送: quote_msg_id={msg_id!r} tmid={tmid!r}"
         )
-        await self._send_structured_message(room_id, final_text, tmid=tmid)
+        await self._send_structured_message(
+            room_id,
+            final_text,
+            tmid=tmid,
+            e2e_mentions=e2e_mentions,
+        )
 
     async def send_image_url(
         self,

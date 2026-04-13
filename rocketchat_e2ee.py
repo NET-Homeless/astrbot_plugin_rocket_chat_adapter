@@ -393,6 +393,7 @@ class RocketChatE2EEManager:
         text: str = "",
         attachments: Optional[list[dict[str, Any]]] = None,
         tmid: Optional[str] = None,
+        e2e_mentions: Optional[dict[str, Any]] = None,
     ) -> Optional[dict[str, Any]]:
         content_to_encrypt: dict[str, Any] = {}
         if text:
@@ -412,6 +413,8 @@ class RocketChatE2EEManager:
         }
         if tmid:
             message["tmid"] = tmid
+        if e2e_mentions:
+            message["e2eMentions"] = e2e_mentions
         return {"message": message}
 
     async def encrypt_message_content(

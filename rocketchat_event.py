@@ -64,6 +64,7 @@ class RocketChatMessageEvent(AstrMessageEvent):
         self._typing_task: asyncio.Task | None = None
         self._typing_started: bool = False
         self._typing_keepalive_interval: float = 3.0
+        self._reply_mention_sent: bool = False
 
     # ------------------------------------------------------------------
     # typing 指示器
@@ -212,6 +213,7 @@ class RocketChatMessageEvent(AstrMessageEvent):
             self.quote_original,
             text[:80],
         )
+        mention_username = await self._consume_reply_mention_username()
         if self.quote_original:
             logger.info(
                 f"[RocketChat][Event] 触发引用回复 quote_original=True thread_id={self.thread_id!r}"
@@ -223,6 +225,7 @@ class RocketChatMessageEvent(AstrMessageEvent):
                 text,
                 self.message_obj.raw_message,
                 tmid=self.thread_id,  # 仅当原消息本身是线程消息时才传 thread_id
+                mention_username=mention_username,
             )
             # 第一段文本已作为引用发出，后续内容走普通发送
             self.quote_original = False
@@ -230,7 +233,30 @@ class RocketChatMessageEvent(AstrMessageEvent):
             logger.info(
                 f"[RocketChat][Event] 普通发送 quote_original=False thread_id={self.thread_id!r}"
             )
-            await self.adapter.send_text(self.room_id, text, tmid=self.thread_id)
+            await self.adapter.send_text(
+                self.room_id,
+                text,
+                tmid=self.thread_id,
+                mention_username=mention_username,
+            )
+
+    async def _consume_reply_mention_username(self) -> str | None:
+        if self._reply_mention_sent:
+            return None
+
+        if not await self.adapter._should_explicit_reply_mention(self.room_id):
+            self._reply_mention_sent = True
+            return None
+
+        raw_message = getattr(self.message_obj, "raw_message", None) or {}
+        sender = raw_message.get("u", {}) if isinstance(raw_message, dict) else {}
+        username = str(sender.get("username") or "").strip()
+        if not username or username == getattr(self.adapter, "bot_username", None):
+            self._reply_mention_sent = True
+            return None
+
+        self._reply_mention_sent = True
+        return username
 
     async def _send_file_component(self, file_comp: File) -> None:
         """发送普通文件组件。"""
