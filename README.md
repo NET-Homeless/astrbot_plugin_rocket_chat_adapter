@@ -4,6 +4,8 @@
 
 将 [Rocket.Chat](https://rocket.chat) 接入 [AstrBot](https://github.com/AstrBotDevs/AstrBot) 的消息平台适配器插件。
 
+开发与排障知识沉淀见：[docs/DEVELOPMENT_KNOWLEDGE_BASE.md](/D:/Workspace/astrbot_plugin_rocket_chat_adapter/docs/DEVELOPMENT_KNOWLEDGE_BASE.md)
+
 ---
 
 ## 功能特性
