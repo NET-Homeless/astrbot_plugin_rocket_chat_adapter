@@ -1,10 +1,8 @@
 from __future__ import annotations
 
 import asyncio
-import base64
 import os
-import tempfile
-from typing import TYPE_CHECKING, Callable
+from typing import Callable, TYPE_CHECKING
 from urllib.parse import urlparse
 
 from astrbot.api import logger
