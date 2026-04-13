@@ -1269,7 +1269,12 @@ class RocketChatAdapter(Platform):
                     "msg": "method",
                     "method": "stream-notify-room",
                     "id": f"typing-{self._ddp_call_id}",
-                    "params": [f"{room_id}/user-activity", self.bot_username, ["user-typing"] if flag else []],
+                    "params": [
+                        f"{room_id}/user-activity",
+                        self.bot_username,
+                        ["user-typing"] if flag else [],
+                        {},
+                    ],
                 }
             )
         except Exception as exc:
