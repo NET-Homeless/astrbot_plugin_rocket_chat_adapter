@@ -548,7 +548,7 @@ class RocketChatMediaBridge:
         tmid: Optional[str] = None,
     ) -> bool:
         room_info = await self.adapter._get_room_info(room_id)
-        if room_info.get("encrypted") and room_info.get("t") in {"d", "p"}:
+        if self._is_e2ee_room_info(room_info):
             return await self.upload_encrypted_file(
                 room_id,
                 file_path,
@@ -564,6 +564,34 @@ class RocketChatMediaBridge:
             tmid=tmid,
         )
 
+    def _is_e2ee_room_info(self, room_info: dict[str, Any]) -> bool:
+        return bool(room_info.get("encrypted") and room_info.get("t") in {"d", "p"})
+
+    async def is_encrypted_room(self, room_id: str) -> bool:
+        room_info = await self.adapter._get_room_info(room_id)
+        return self._is_e2ee_room_info(room_info)
+
+    async def send_remote_media_fallback(
+        self,
+        room_id: str,
+        media_url: str,
+        *,
+        media_kind: str,
+        text: str = "",
+        tmid: Optional[str] = None,
+    ) -> bool:
+        if not await self.is_encrypted_room(room_id):
+            return False
+
+        logger.warning(
+            f"[RocketChat][E2EE] 加密房间{media_kind}下载失败，降级为加密文本链接发送 room_id={room_id!r}"
+        )
+        fallback_text = f"远程媒体下载失败，原文件链接：{media_url}"
+        if text:
+            fallback_text = f"{text}\n{fallback_text}".strip()
+        await self.adapter.send_text(room_id, fallback_text, tmid=tmid)
+        return True
+
     async def send_image_url(
         self,
         room_id: str,
@@ -575,14 +603,14 @@ class RocketChatMediaBridge:
         # 避免外部 URL 防盗链（Referer 检查）导致图片在 Rocket.Chat 中无法显示
         local_path, cleanup = await self.download_remote_media(image_url, ".png")
         if not local_path:
-            # 下载失败：加密房间无法降级，只能跳过；非加密房间降级为 URL 引用
-            room_info = await self.adapter._get_room_info(room_id)
-            is_e2ee_room = room_info.get("encrypted") and room_info.get("t") in {"d", "p"}
-            if is_e2ee_room:
-                logger.warning(
-                    f"[RocketChat][E2EE] 加密房间图片下载失败，已跳过远程图片发送 room_id={room_id!r}"
-                )
-            else:
+            handled = await self.send_remote_media_fallback(
+                room_id,
+                image_url,
+                media_kind="图片",
+                text=text,
+                tmid=tmid,
+            )
+            if not handled:
                 logger.warning(
                     f"[RocketChat] 远程图片下载失败，降级为 URL 引用发送 url={image_url[:80]!r}"
                 )

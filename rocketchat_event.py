@@ -295,6 +295,8 @@ class RocketChatMessageEvent(AstrMessageEvent):
             default_suffix=".ogg",
         )
         if not local_path:
+            if await self._handle_remote_media_fallback(file_ref, "语音"):
+                return
             logger.warning(f"[RocketChat] 无法识别的语音路径格式: {file_ref!r}，已跳过")
             return
 
@@ -321,6 +323,8 @@ class RocketChatMessageEvent(AstrMessageEvent):
             default_suffix=".mp4",
         )
         if not local_path:
+            if await self._handle_remote_media_fallback(file_ref, "视频"):
+                return
             logger.warning(f"[RocketChat] 无法识别的视频路径格式: {file_ref!r}，已跳过")
             return
 
@@ -334,6 +338,20 @@ class RocketChatMessageEvent(AstrMessageEvent):
         finally:
             if cleanup:
                 cleanup()
+
+    async def _handle_remote_media_fallback(
+        self,
+        file_ref: str,
+        media_kind: str,
+    ) -> bool:
+        if not (file_ref.startswith("http://") or file_ref.startswith("https://")):
+            return False
+        return await self.adapter.send_remote_media_fallback(
+            self.room_id,
+            file_ref,
+            media_kind=media_kind,
+            tmid=self.thread_id,
+        )
 
     async def _resolve_uploadable_path(
         self,

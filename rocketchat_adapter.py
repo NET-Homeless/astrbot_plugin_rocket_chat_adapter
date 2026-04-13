@@ -1360,6 +1360,23 @@ class RocketChatAdapter(Platform):
             tmid=tmid,
         )
 
+    async def send_remote_media_fallback(
+        self,
+        room_id: str,
+        media_url: str,
+        *,
+        media_kind: str,
+        text: str = "",
+        tmid: Optional[str] = None,
+    ) -> bool:
+        return await self._media.send_remote_media_fallback(
+            room_id,
+            media_url,
+            media_kind=media_kind,
+            text=text,
+            tmid=tmid,
+        )
+
     async def _resolve_outbound_media_path(
         self,
         file_ref: str,

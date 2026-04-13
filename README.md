@@ -10,7 +10,7 @@
 
 - ✅ **实时消息接收** — 基于 WebSocket（DDP 协议）订阅频道、私有群组、私信消息
 - ✅ **消息发送** — 通过 REST API 发送文本、图片、语音、视频和普通文件
-- ✅ **E2EE 文本消息** — 按 Rocket.Chat 官方 E2EE 协议收发加密私聊/私有群组文本消息
+- ✅ **E2EE 消息闭环** — 按 Rocket.Chat 官方 E2EE 协议收发加密私聊/私有群组的文本与媒体消息
 - ✅ **输入中提示** — 群聊/线程中 `@bot` 后支持延迟 typing；私聊也支持延迟 typing
 - ✅ **自动重连** — WebSocket 断线后自动重连，无需人工干预
 - ✅ **动态订阅** — 机器人被加入新房间后自动订阅，无需重启
@@ -97,10 +97,12 @@ git clone https://github.com/NET-Homeless/astrbot_plugin_rocket_chat_adapter
 
 ### E2EE 支持边界
 
-- 当前实现按 Rocket.Chat 官方源码兼容 **私信 (`d`)** 和 **私有群组 (`p`)** 的 E2EE 文本消息
+- 当前实现按 Rocket.Chat 官方源码兼容 **私信 (`d`)** 和 **私有群组 (`p`)** 的 E2EE 文本、图片、音频、视频和普通文件收发
 - 普通未加密频道/私聊继续沿用原有明文链路，不受 E2EE 初始化失败影响
 - 加密房间中的 **文本 / 引用回复 / 图片 / 音频 / 视频 / 文件上传** 走 E2EE（`/api/v1/rooms.media` + `/api/v1/rooms.mediaConfirm`）
 - 加密房间中的媒体接收会自动按附件内 `encryption` 信息解密，再以 AstrBot 的普通 `Image/Record/Video/File` 组件形式进入事件流
+- 如果 `requestSubscriptionKeys` 首次超时或房间密钥暂未同步到订阅，适配器会自动重试；只有重试耗尽后才会跳过该条加密消息
+- 加密房间中的远程图片 / 语音 / 视频如果下载失败，会降级为一条加密文本消息，并附可点击的原文件链接
 - 如果 E2EE 初始化失败或房间密钥不可用，加密房间消息会被安全跳过，不会影响未加密房间的正常收发
 
 ---
@@ -216,10 +218,10 @@ Rocket.Chat 房间收到回复
 | 入站视频消息 | `files` / `file` 中视频附件 | `Video` 组件 | ✅ 已实现 | 基于 MIME / 文件名 / URL 严格识别 |
 | 房间订阅变更 | `stream-notify-user`（被加入新房间） | 动态订阅房间消息流 | ✅ 已实现 | 无需重启插件 |
 | 出站文本回复 | 普通:`chat.postMessage` / E2EE:`chat.sendMessage` | `event.send` / `send_by_session` | ✅ 已实现 | 支持线程 `tmid` 和 Markdown 原生引用 |
-| 出站图片回复 | 普通:`rooms.upload` / E2EE:`rooms.media + mediaConfirm` | `Image` 组件发送 | ✅ 已实现 | 统一转本地上传避免防盗链，包含 MIME 推断 |
+| 出站图片回复 | 普通:`rooms.upload` / E2EE:`rooms.media + mediaConfirm` | `Image` 组件发送 | ✅ 已实现 | 统一转本地上传避免防盗链；加密房间远程下载失败时降级为加密文本链接 |
 | 出站普通文件 | 普通:`rooms.upload` / E2EE:`rooms.media + mediaConfirm` | `File` 组件发送 | ✅ 已实现 | 本地文件上传；远端 URL 退化为文本链接 |
-| 出站语音回复 | 普通:`rooms.upload` / E2EE:`rooms.media + mediaConfirm` | `Record` 组件发送 | ✅ 已实现 | 本地文件、HTTP(S)、Base64 均可上传 |
-| 出站视频回复 | 普通:`rooms.upload` / E2EE:`rooms.media + mediaConfirm` | `Video` 组件发送 | ✅ 已实现 | 本地文件、HTTP(S) 均可上传 |
+| 出站语音回复 | 普通:`rooms.upload` / E2EE:`rooms.media + mediaConfirm` | `Record` 组件发送 | ✅ 已实现 | 本地文件、HTTP(S)、Base64 均可上传；加密房间远程下载失败时降级为加密文本链接 |
+| 出站视频回复 | 普通:`rooms.upload` / E2EE:`rooms.media + mediaConfirm` | `Video` 组件发送 | ✅ 已实现 | 本地文件、HTTP(S) 均可上传；加密房间远程下载失败时降级为加密文本链接 |
 | 出站输入中状态 | `stream-notify-room` | typing 指示器 | ✅ 已实现 | 群聊/线程仅在 `@bot` 时启用；私聊也支持；受 `typing_indicator_delay` 控制 |
 | 系统/审计事件 | 加入/退出/改名/权限变化等 | 无统一映射 | ❌ 不支持 | 当前版本不建模为 AstrBot 事件 |
 | 交互状态事件 | 编辑、撤回、反应、已读、在线状态 | 无统一映射 | ❌ 不支持 | 输入中已实现，其余状态仍不在当前适配器范围 |
@@ -246,6 +248,7 @@ Rocket.Chat 房间收到回复
 | Realtime API 已废弃 | 外部约束 | Rocket.Chat 官方将 DDP WebSocket 标注为 Deprecated；当前接收链路仍依赖该能力。 |
 | 流式消息输出不可用 | 外部约束 | Rocket.Chat REST 发送形态限制，`support_streaming_message=False`。 |
 | 其他富媒体语义仍为降级支持 | 功能边界 | 当前严格支持覆盖文本、图片、普通文件、语音、视频和输入中状态；转发等其余富媒体语义仍为兜底或未实现。 |
+| 加密远程媒体依赖源地址可下载 | 行为约束 | 加密房间中的远程图片/语音/视频会先下载再上传；如果源地址不可下载，会降级为加密文本链接。 |
 | 非消息型事件未覆盖 | 范围约束 | 编辑、撤回、反应、已读、在线状态等事件不在当前版本范围。 |
 
 以上“支持范围”定义的是 AstrBot 与 Rocket.Chat 的稳定交集，不等同于两端全部事件能力。

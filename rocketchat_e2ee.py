@@ -297,6 +297,7 @@ class RocketChatE2EEManager:
         self._room_locks: dict[str, asyncio.Lock] = {}
         self._subscriptions_by_room: dict[str, dict[str, Any]] = {}
         self._subscriptions_cache_ts: float = 0.0
+        self._request_subscription_keys_task: Optional[asyncio.Task[Any]] = None
 
     async def initialize(self) -> None:
         if not self.enabled:
@@ -349,10 +350,13 @@ class RocketChatE2EEManager:
     async def on_ws_ready(self) -> None:
         if not self.ready:
             return
-        try:
-            await self.adapter._ddp_call("e2e.requestSubscriptionKeys", [])
-        except Exception as exc:
-            logger.debug(f"[RocketChat][E2EE] requestSubscriptionKeys 失败: {exc!r}")
+        self._cancel_request_subscription_keys_task()
+        expected_ws = getattr(self.adapter, "_ws", None)
+        if not await self._request_subscription_keys_once(
+            reason="ws-ready",
+            expected_ws=expected_ws,
+        ):
+            self._ensure_request_subscription_keys_task(expected_ws)
 
     async def should_encrypt_room(self, room_info: dict) -> bool:
         return bool(
@@ -606,66 +610,159 @@ class RocketChatE2EEManager:
                 return key_store.current
 
             subscription = await self._get_subscription(room_id, refresh=True)
-
-            if subscription:
-                key_store.old_keys = await self._load_old_keys(subscription)
-
-                suggested_key = subscription.get("E2ESuggestedKey")
-                if suggested_key:
-                    imported = self._import_group_key(suggested_key)
-                    if imported:
-                        key_store.current = imported
-                        try:
-                            await self._rest_post(
-                                "/api/v1/e2e.acceptSuggestedGroupKey",
-                                {"rid": room_id},
-                            )
-                        except Exception as exc:
-                            logger.debug(f"[RocketChat][E2EE] acceptSuggestedGroupKey 失败: {exc!r}")
-                        await self._maybe_share_room_key(room_id, imported)
-                        return imported
-
-                existing_key = subscription.get("E2EKey")
-                if existing_key:
-                    imported = self._import_group_key(existing_key)
-                    if imported:
-                        key_store.current = imported
-                        await self._maybe_share_room_key(room_id, imported)
-                        return imported
+            imported = await self._load_room_key_from_subscription(
+                room_id,
+                key_store,
+                subscription,
+            )
+            if imported:
+                return imported
 
             if not room_info.get("e2eKeyId"):
                 created = await self._create_room_key(room_id)
                 key_store.current = created
                 return created
 
-            await self.on_ws_ready()
-            for _ in range(3):
-                await asyncio.sleep(1)
-                subscription = await self._get_subscription(room_id, refresh=True)
-                if not subscription:
-                    continue
-                key_store.old_keys = await self._load_old_keys(subscription)
-                for field in ("E2ESuggestedKey", "E2EKey"):
-                    encrypted_key = subscription.get(field)
-                    if not encrypted_key:
-                        continue
-                    imported = self._import_group_key(encrypted_key)
-                    if not imported:
-                        continue
-                    key_store.current = imported
-                    if field == "E2ESuggestedKey":
-                        try:
-                            await self._rest_post(
-                                "/api/v1/e2e.acceptSuggestedGroupKey",
-                                {"rid": room_id},
-                            )
-                        except Exception as exc:
-                            logger.debug(f"[RocketChat][E2EE] acceptSuggestedGroupKey 失败: {exc!r}")
-                    await self._maybe_share_room_key(room_id, imported)
-                    return imported
+            await self._request_subscription_keys_once(
+                reason="room-key",
+                room_id=room_id,
+                room_info=room_info,
+            )
+            imported = await self._retry_room_key_from_subscription(
+                room_id,
+                key_store,
+            )
+            if imported:
+                return imported
 
-            logger.warning(f"[RocketChat][E2EE] 未能及时拿到房间密钥 room_id={room_id!r}")
+            logger.warning(
+                f"[RocketChat][E2EE] room key retry exhausted{self._room_key_log_suffix(room_id, room_info)}"
+            )
             return None
+
+    def _room_key_log_suffix(
+        self,
+        room_id: Optional[str],
+        room_info: Optional[dict[str, Any]] = None,
+    ) -> str:
+        if room_info is None:
+            has_e2e_key_id: str | bool = "n/a"
+        else:
+            has_e2e_key_id = bool(room_info.get("e2eKeyId"))
+        return f" room_id={room_id!r} has_e2e_key_id={has_e2e_key_id}"
+
+    def _cancel_request_subscription_keys_task(self) -> None:
+        task = self._request_subscription_keys_task
+        if task and not task.done():
+            task.cancel()
+        self._request_subscription_keys_task = None
+
+    def _ensure_request_subscription_keys_task(self, expected_ws: Any) -> None:
+        task = self._request_subscription_keys_task
+        if task and not task.done():
+            return
+
+        task = asyncio.create_task(
+            self._retry_request_subscription_keys(expected_ws),
+            name="rocketchat-e2ee-request-subscription-keys",
+        )
+        self._request_subscription_keys_task = task
+        self.adapter._background_tasks.add(task)
+
+        def _on_done(done_task: asyncio.Task[Any]) -> None:
+            self.adapter._background_tasks.discard(done_task)
+            if self._request_subscription_keys_task is done_task:
+                self._request_subscription_keys_task = None
+
+        task.add_done_callback(_on_done)
+
+    def _is_expected_ws_active(self, expected_ws: Any) -> bool:
+        current_ws = getattr(self.adapter, "_ws", None)
+        return bool(current_ws is expected_ws and current_ws and not current_ws.closed)
+
+    async def _retry_request_subscription_keys(self, expected_ws: Any) -> None:
+        for delay in (1.0, 2.0, 4.0):
+            await asyncio.sleep(delay)
+            if not self._is_expected_ws_active(expected_ws):
+                return
+            if await self._request_subscription_keys_once(
+                reason="ws-retry",
+                expected_ws=expected_ws,
+            ):
+                return
+
+    async def _request_subscription_keys_once(
+        self,
+        *,
+        reason: str,
+        room_id: Optional[str] = None,
+        room_info: Optional[dict[str, Any]] = None,
+        expected_ws: Any = None,
+    ) -> bool:
+        if not self.ready:
+            return False
+        if expected_ws is not None and not self._is_expected_ws_active(expected_ws):
+            return False
+        try:
+            await self.adapter._ddp_call("e2e.requestSubscriptionKeys", [])
+            return True
+        except Exception as exc:
+            logger.warning(
+                f"[RocketChat][E2EE] ws request failed reason={reason}{self._room_key_log_suffix(room_id, room_info)}: {exc!r}"
+            )
+            return False
+
+    async def _load_room_key_from_subscription(
+        self,
+        room_id: str,
+        key_store: RoomKeyStore,
+        subscription: Optional[dict[str, Any]],
+    ) -> Optional[SessionKey]:
+        if not subscription:
+            return None
+
+        key_store.old_keys = await self._load_old_keys(subscription)
+        for field in ("E2ESuggestedKey", "E2EKey"):
+            encrypted_key = subscription.get(field)
+            if not encrypted_key:
+                continue
+            imported = self._import_group_key(encrypted_key)
+            if not imported:
+                continue
+            key_store.current = imported
+            if field == "E2ESuggestedKey":
+                try:
+                    await self._rest_post(
+                        "/api/v1/e2e.acceptSuggestedGroupKey",
+                        {"rid": room_id},
+                    )
+                except Exception as exc:
+                    logger.debug(f"[RocketChat][E2EE] acceptSuggestedGroupKey 失败: {exc!r}")
+            await self._maybe_share_room_key(room_id, imported)
+            return imported
+        return None
+
+    async def _retry_room_key_from_subscription(
+        self,
+        room_id: str,
+        key_store: RoomKeyStore,
+    ) -> Optional[SessionKey]:
+        for attempt, delay in enumerate((0.5, 1.0, 1.0, 2.0, 2.0), start=1):
+            await asyncio.sleep(delay)
+            room_info = await self.adapter._get_room_info(room_id, refresh=True)
+            self.adapter._cache_room_info(room_info)
+            subscription = await self._get_subscription(room_id, refresh=True)
+            imported = await self._load_room_key_from_subscription(
+                room_id,
+                key_store,
+                subscription,
+            )
+            if imported:
+                return imported
+            logger.debug(
+                f"[RocketChat][E2EE] subscription refresh miss attempt={attempt}{self._room_key_log_suffix(room_id, room_info)}"
+            )
+        return None
 
     async def _create_room_key(self, room_id: str) -> SessionKey:
         if not self.public_key_json:
