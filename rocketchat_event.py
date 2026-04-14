@@ -62,6 +62,7 @@ class RocketChatMessageEvent(AstrMessageEvent):
         self._typing_task: asyncio.Task | None = None
         self._typing_started: bool = False
         self._typing_keepalive_interval: float = 5.0
+        self._typing_max_duration: float = 120.0
         self._reply_mention_sent: bool = False
 
     # ------------------------------------------------------------------
@@ -104,7 +105,12 @@ class RocketChatMessageEvent(AstrMessageEvent):
         """延迟后启动 typing，并按官方续期窗口持续保活。"""
         try:
             delay = float(getattr(self.adapter, "typing_indicator_delay", 0.8))
-            logger.debug(f"[RocketChat][Event] typing worker started, delay={delay}s room={self.room_id!r}")
+            logger.debug(
+                "[RocketChat][Event] typing worker started, delay=%ss room=%r max_duration=%ss",
+                delay,
+                self.room_id,
+                self._typing_max_duration,
+            )
             if delay > 0:
                 await asyncio.sleep(delay)
 
@@ -114,8 +120,28 @@ class RocketChatMessageEvent(AstrMessageEvent):
             logger.debug(f"[RocketChat][Event] typing started room={self.room_id!r}")
 
             # 对齐官方客户端续期模型：在 typing 超时窗口内定期 renew。
+            started_at = asyncio.get_running_loop().time()
             while True:
-                await asyncio.sleep(self._typing_keepalive_interval)
+                elapsed = asyncio.get_running_loop().time() - started_at
+                remaining = self._typing_max_duration - elapsed
+                if remaining <= 0:
+                    logger.warning(
+                        "[RocketChat][Event] typing auto-stopped after max duration room=%r max_duration=%ss",
+                        self.room_id,
+                        self._typing_max_duration,
+                    )
+                    break
+
+                await asyncio.sleep(min(self._typing_keepalive_interval, remaining))
+                elapsed = asyncio.get_running_loop().time() - started_at
+                if elapsed >= self._typing_max_duration:
+                    logger.warning(
+                        "[RocketChat][Event] typing auto-stopped after max duration room=%r max_duration=%ss",
+                        self.room_id,
+                        self._typing_max_duration,
+                    )
+                    break
+
                 await self.adapter.send_typing(self.room_id, True)
                 logger.debug(
                     "[RocketChat][Event] typing renewed room=%r interval=%ss",
@@ -128,6 +154,15 @@ class RocketChatMessageEvent(AstrMessageEvent):
             raise
         except Exception as exc:
             logger.warning(f"[RocketChat][Event] typing worker failed: {exc!r}")
+        finally:
+            if self._typing_started:
+                self._typing_started = False
+                try:
+                    await self.adapter.send_typing(self.room_id, False)
+                except Exception as exc:
+                    logger.warning(f"[RocketChat][Event] typing worker stop failed: {exc!r}")
+            if self._typing_task is asyncio.current_task():
+                self._typing_task = None
 
     # ------------------------------------------------------------------
     # 核心：将 MessageChain 发送到 Rocket.Chat
