@@ -67,13 +67,25 @@ class RocketChatMediaBridge:
 
         return "file"
 
-    def get_all_attachments_recursive(self, payload: dict) -> List[dict]:
+    def get_all_attachments_recursive(
+        self,
+        payload: dict,
+        *,
+        skip_quote_attachments: bool = False,
+    ) -> List[dict]:
         res = []
         att_raw = payload.get("attachments", [])
         atts = [att_raw] if isinstance(att_raw, dict) else [a for a in att_raw if isinstance(a, dict)]
         for att in atts:
+            if skip_quote_attachments and att.get("message_link"):
+                continue
             res.append(att)
-            res.extend(self.get_all_attachments_recursive(att))
+            res.extend(
+                self.get_all_attachments_recursive(
+                    att,
+                    skip_quote_attachments=skip_quote_attachments,
+                )
+            )
         return res
 
     def _is_encrypted_media_attachment(self, file_obj: dict) -> bool:
@@ -289,7 +301,13 @@ class RocketChatMediaBridge:
             if materialized:
                 results.append(materialized)
 
-        all_attachments = self.get_all_attachments_recursive(raw_msg)
+        # 引用消息的预览附件会内嵌原消息的媒体结构。
+        # 这里如果继续递归，会把引用里的图片/文件误当成当前消息自己的媒体，
+        # 随后引用消息又会被单独拉取并构建一次，最终在 AstrBot 历史里重复出现。
+        all_attachments = self.get_all_attachments_recursive(
+            raw_msg,
+            skip_quote_attachments=True,
+        )
 
         for context in [raw_msg] + all_attachments:
             files_raw = context.get("files", [])
