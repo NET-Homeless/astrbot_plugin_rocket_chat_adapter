@@ -27,14 +27,20 @@ Do not treat the Electron shell repo as the primary source for chat behavior unl
 ## File Ownership
 
 - `main.py`: plugin registration only
-- `rocketchat_adapter.py`: REST/DDP orchestration, inbound routing, outbound entrypoints
+- `rocketchat_adapter.py`: platform lifecycle, config, caches, REST helpers, bridge orchestration
+- `rocketchat_realtime.py`: DDP/WebSocket handshake, subscriptions, result dispatch, dynamic room subscribe
+- `rocketchat_inbound.py`: inbound normalization, quote parsing, wake/mention detection, AstrBot event assembly
+- `rocketchat_sender.py`: outbound text/quote/typing/send_by_session routing
 - `rocketchat_event.py`: AstrBot `MessageChain` splitting and reply flow
 - `rocketchat_e2ee.py`: E2EE protocol, room keys, encrypted message/media payloads
 - `rocketchat_media.py`: media download/upload bridge and fallback behavior
 
 When adding logic:
 
-- Protocol and room routing go in `rocketchat_adapter.py`
+- Platform lifecycle, caches, and shared REST helpers go in `rocketchat_adapter.py`
+- DDP handshake/subscription/result handling goes in `rocketchat_realtime.py`
+- Inbound parsing and AstrBot event construction go in `rocketchat_inbound.py`
+- Outbound text/quote/typing/send-by-session routing goes in `rocketchat_sender.py`
 - E2EE details go in `rocketchat_e2ee.py`
 - Message component sequencing goes in `rocketchat_event.py`
 - Media download/upload/fallback stays in `rocketchat_media.py`
@@ -72,6 +78,7 @@ When adding logic:
 
 When behavior changes, sync these files if relevant:
 
+- `AGENTS.md`
 - `README.md`
 - `metadata.yaml`
 - `docs/DEVELOPMENT_KNOWLEDGE_BASE.md`
@@ -82,6 +89,6 @@ Do not leave README support claims behind the real implementation.
 
 Before claiming a change is done:
 
-- Run `python -m py_compile rocketchat_adapter.py rocketchat_e2ee.py rocketchat_event.py rocketchat_media.py`
+- Run `python -m py_compile rocketchat_adapter.py rocketchat_realtime.py rocketchat_inbound.py rocketchat_sender.py rocketchat_e2ee.py rocketchat_event.py rocketchat_media.py main.py`
 - If touching DDP behavior, verify method payload shape and result/error logging
 - If touching E2EE, check that plaintext rooms are unaffected by failure paths
