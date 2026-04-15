@@ -253,7 +253,7 @@ class RocketChatMessageEvent(AstrMessageEvent):
         )
         mention_username = await self._consume_reply_mention_username()
         if self.quote_original:
-            logger.info(
+            logger.debug(
                 f"[RocketChat][Event] 触发引用回复 quote_original=True thread_id={self.thread_id!r}"
             )
             # 频道 @mention 场景：仅用 attachments 显示引用框，不创建线程
@@ -268,7 +268,7 @@ class RocketChatMessageEvent(AstrMessageEvent):
             # 第一段文本已作为引用发出，后续内容走普通发送
             self.quote_original = False
         else:
-            logger.info(
+            logger.debug(
                 f"[RocketChat][Event] 普通发送 quote_original=False thread_id={self.thread_id!r}"
             )
             await self.adapter.send_text(

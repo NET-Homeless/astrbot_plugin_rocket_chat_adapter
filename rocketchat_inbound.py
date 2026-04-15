@@ -1,0 +1,307 @@
+from __future__ import annotations
+
+import json
+import re
+import time
+from typing import Any, Optional
+from urllib.parse import parse_qs, urlparse
+
+from astrbot.api import logger
+from astrbot.api.message_components import Plain, Reply
+from astrbot.api.platform import AstrBotMessage, Group, MessageMember, MessageType
+
+from .rocketchat_event import RocketChatMessageEvent
+
+
+class RocketChatInboundBridge:
+    def __init__(self, adapter: Any) -> None:
+        self.adapter = adapter
+
+    def extract_mentions_for_wake(self, raw_msg: dict) -> list[Any]:
+        mentions = raw_msg.get("mentions")
+        if isinstance(mentions, list) and mentions:
+            return mentions
+
+        e2e_mentions = raw_msg.get("e2eMentions")
+        if isinstance(e2e_mentions, dict):
+            merged: list[Any] = []
+            merged.extend(e2e_mentions.get("e2eUserMentions", []) or [])
+            merged.extend(e2e_mentions.get("e2eChannelMentions", []) or [])
+            return merged
+
+        if isinstance(e2e_mentions, list):
+            return e2e_mentions
+
+        return []
+
+    async def _build_components_recursively(
+        self,
+        current_payload: dict,
+        *,
+        seen_quote_ids: set[str],
+        current_depth: int = 0,
+        max_depth: int = 3,
+    ) -> list:
+        chain = []
+        if current_depth >= max_depth:
+            return chain
+
+        msg_text = current_payload.get("msg", "").strip()
+
+        local_images = await self.adapter._media.extract_image_components(current_payload)
+        local_recs = await self.adapter._media.extract_record_components(current_payload)
+        local_vids = await self.adapter._media.extract_video_components(current_payload)
+        local_files = await self.adapter._media.extract_file_components(current_payload)
+
+        quote_ids = []
+
+        for url_obj in current_payload.get("urls", []):
+            u_str = url_obj.get("url") or ""
+            p_url = url_obj.get("parsedUrl", {})
+            if p_url and "query" in p_url and "msg" in p_url["query"]:
+                q_id = p_url["query"]["msg"]
+                if q_id and q_id not in quote_ids:
+                    quote_ids.append(q_id)
+                    logger.debug(f"[RocketChat][IN] 从urls.parsedUrl识别引用: msg_id={q_id}")
+            elif "msg=" in u_str:
+                parsed = urlparse(u_str)
+                qs = parse_qs(parsed.query)
+                if "msg" in qs:
+                    q_id = qs["msg"][0]
+                    if q_id and q_id not in quote_ids:
+                        quote_ids.append(q_id)
+                        logger.debug(
+                            f"[RocketChat][IN] 从urls手动parse识别引用: msg_id={q_id} url={u_str[:80]}"
+                        )
+
+        att_raw = current_payload.get("attachments", [])
+        direct_atts = [att_raw] if isinstance(att_raw, dict) else [a for a in att_raw if isinstance(a, dict)]
+        for att in direct_atts:
+            link = att.get("message_link") or ""
+            if "msg=" in link:
+                parsed = urlparse(link)
+                qs = parse_qs(parsed.query)
+                if "msg" in qs:
+                    q_id = qs["msg"][0]
+                    if q_id and q_id not in quote_ids:
+                        quote_ids.append(q_id)
+                        logger.debug(f"[RocketChat][IN] 从直接attachment.message_link识别引用: msg_id={q_id}")
+
+        link_pattern = re.compile(
+            r"\[([^\]]*)\]\(([^)]*msg=[^)]*)\)|"
+            r"((?:https?|http)://[^\s)]+msg=[^\s)]*)",
+            re.IGNORECASE,
+        )
+
+        if not quote_ids:
+            for match in link_pattern.finditer(msg_text):
+                markdown_url = match.group(2)
+                direct_url = match.group(3)
+                u_str = markdown_url or direct_url or ""
+                if u_str and "msg=" in u_str:
+                    u_clean = u_str.strip("[]() ")
+                    parsed = urlparse(u_clean)
+                    qs = parse_qs(parsed.query)
+                    if "msg" in qs:
+                        q_id = qs["msg"][0]
+                        if q_id and q_id not in quote_ids:
+                            quote_ids.append(q_id)
+
+        found_reply_comps = []
+        for q_id in quote_ids:
+            if q_id in seen_quote_ids:
+                continue
+            seen_quote_ids.add(q_id)
+            try:
+                q_msg = await self.adapter._fetch_message_by_id(q_id)
+                if not q_msg:
+                    logger.debug(f"[RocketChat][IN] 被引用消息不存在或无权限访问: msgId={q_id}")
+                    continue
+
+                q_components = await self._build_components_recursively(
+                    q_msg,
+                    seen_quote_ids=seen_quote_ids,
+                    current_depth=current_depth + 1,
+                    max_depth=max_depth,
+                )
+                if not q_components:
+                    continue
+
+                q_sender_id = q_msg.get("u", {}).get("_id", "")
+                q_sender_name = q_msg.get("u", {}).get("name") or q_msg.get("u", {}).get("username", "")
+                q_ts_raw = q_msg.get("ts")
+                if isinstance(q_ts_raw, dict):
+                    q_timestamp = int(q_ts_raw.get("$date", time.time() * 1000) / 1000)
+                else:
+                    q_timestamp = int(time.time())
+
+                q_msg_text = "".join([c.text for c in q_components if isinstance(c, Plain)]).strip()
+                found_reply_comps.append(
+                    Reply(
+                        id=q_id,
+                        chain=q_components,
+                        sender_id=q_sender_id,
+                        sender_nickname=q_sender_name,
+                        time=q_timestamp,
+                        message_str=q_msg_text,
+                    )
+                )
+            except Exception as exc:
+                logger.warning(f"[RocketChat][IN] 递归处理被引用消息出错: msgId={q_id} error={exc!r}")
+
+        chain.extend(found_reply_comps)
+
+        cleaned_msg_text = link_pattern.sub("", msg_text).strip()
+        if cleaned_msg_text:
+            chain.append(Plain(text=cleaned_msg_text))
+            if current_depth == 0:
+                logger.debug(f"[RocketChat][IN] 清理后文本: clean_text={cleaned_msg_text!r}")
+
+        if local_images or local_recs or local_vids or local_files:
+            logger.debug(
+                f"[RocketChat][IN] 深度{current_depth}提取媒体: "
+                f"images={len(local_images)} records={len(local_recs)} "
+                f"videos={len(local_vids)} files={len(local_files)}"
+            )
+            chain.extend(local_images)
+            chain.extend(local_recs)
+            chain.extend(local_vids)
+            chain.extend(local_files)
+
+        return chain
+
+    async def process_incoming_message(self, raw_msg: dict) -> None:
+        try:
+            logger.debug(
+                f"[RocketChat][IN-RAW] msg_id={raw_msg.get('_id')} "
+                f"sender={raw_msg.get('u', {}).get('username')} "
+                f"room={raw_msg.get('rid')} "
+                f"text_len={len(raw_msg.get('msg', ''))} "
+                f"attachments={len(raw_msg.get('attachments', []))} "
+                f"mentions={len(raw_msg.get('mentions', []))} "
+                f"has_files={bool(raw_msg.get('files') or raw_msg.get('file'))} "
+                f"has_urls={bool(raw_msg.get('urls'))} "
+                f"is_thread={bool(raw_msg.get('tmid'))} "
+                f"is_system={bool(raw_msg.get('t') and raw_msg.get('t') != 'e2e')}"
+            )
+            logger.debug(f"[RocketChat][IN-FULL] {json.dumps(raw_msg, ensure_ascii=False, default=str)}")
+
+            raw_msg = await self.adapter._maybe_decrypt_incoming_message(raw_msg)
+            if not raw_msg:
+                logger.debug("[RocketChat][IN] skip undecipherable e2e message")
+                return
+
+            if raw_msg.get("t") and raw_msg.get("t") != "e2e":
+                return
+
+            if raw_msg.get("u", {}).get("_id") == self.adapter.user_id:
+                logger.debug("[RocketChat][IN] skip self message")
+                return
+
+            components = await self._build_components_recursively(raw_msg, seen_quote_ids=set())
+            msg_text = "".join([c.text for c in components if isinstance(c, Plain)]).strip()
+
+            if not msg_text and not [c for c in components if not isinstance(c, Plain)]:
+                logger.debug("[RocketChat][IN] skip empty/unsupported message")
+                return
+
+            room_id: str = raw_msg.get("rid", "")
+            sender_id: str = raw_msg.get("u", {}).get("_id", "")
+            sender_username: str = raw_msg.get("u", {}).get("username", "")
+            sender_name: str = raw_msg.get("u", {}).get("name") or sender_username
+            thread_id: Optional[str] = raw_msg.get("tmid")
+
+            ts_raw = raw_msg.get("ts")
+            if isinstance(ts_raw, dict):
+                timestamp = int(ts_raw.get("$date", time.time() * 1000) / 1000)
+            else:
+                timestamp = int(time.time())
+
+            room_type = await self.adapter._get_room_type(room_id)
+            msg_type = MessageType.FRIEND_MESSAGE if room_type == "d" else MessageType.GROUP_MESSAGE
+
+            abm = AstrBotMessage()
+            abm.type = msg_type
+            abm.self_id = self.adapter.user_id
+            abm.session_id = room_id
+            abm.message_id = raw_msg.get("_id", "")
+            abm.sender = MessageMember(user_id=sender_id, nickname=sender_name)
+            abm.message = components
+            abm.message_str = msg_text
+            abm.raw_message = raw_msg
+            abm.timestamp = timestamp
+            abm.group = Group(group_id=room_id) if msg_type == MessageType.GROUP_MESSAGE else None
+
+            bot_mentioned = False
+            mentions = self.extract_mentions_for_wake(raw_msg)
+            for mention in mentions:
+                if isinstance(mention, str):
+                    normalized = mention.lstrip("@")
+                    if normalized in {self.adapter.user_id, self.adapter.bot_username}:
+                        bot_mentioned = True
+                        break
+                if isinstance(mention, dict) and (
+                    mention.get("_id") == self.adapter.user_id
+                    or mention.get("username") == self.adapter.bot_username
+                ):
+                    bot_mentioned = True
+                    break
+
+            if not bot_mentioned and self.adapter.bot_username:
+                bot_mentioned = f"@{self.adapter.bot_username}" in (abm.message_str or "")
+
+            if bot_mentioned:
+                bot_mentions = [f"@{self.adapter.bot_username} ", f"@{self.adapter.bot_username}"]
+                new_msg_text = ""
+                for comp in abm.message:
+                    if isinstance(comp, Plain):
+                        for bot_mention in bot_mentions:
+                            comp.text = comp.text.replace(bot_mention, "")
+                        new_msg_text += comp.text
+                abm.message_str = new_msg_text.strip()
+                logger.debug(f"[RocketChat][IN] bot mentioned, clean_text={abm.message_str!r}")
+
+            is_thread_msg = bool(raw_msg.get("tmid"))
+            should_quote = (
+                msg_type == MessageType.GROUP_MESSAGE
+                and bot_mentioned
+                and not is_thread_msg
+            )
+
+            logger.debug(
+                f"[RocketChat][IN] 回复场景判定: msg_type={msg_type} bot_mentioned={bot_mentioned} "
+                f"is_thread={is_thread_msg} -> should_quote={should_quote}"
+            )
+
+            event = RocketChatMessageEvent(
+                message_str=abm.message_str,
+                message_obj=abm,
+                platform_meta=self.adapter.meta(),
+                session_id=abm.session_id,
+                room_id=room_id,
+                thread_id=thread_id,
+                quote_original=should_quote,
+                adapter=self.adapter,
+            )
+
+            if bot_mentioned or msg_type == MessageType.FRIEND_MESSAGE:
+                event.is_at_or_wake_command = True
+
+            if (
+                msg_type == MessageType.GROUP_MESSAGE and bot_mentioned
+            ) or msg_type == MessageType.FRIEND_MESSAGE:
+                event.start_typing_indicator()
+
+            logger.debug(
+                "[RocketChat][IN] → commit type=%s room=%r msg=%r wake=%s"
+                % (
+                    "DM" if msg_type == MessageType.FRIEND_MESSAGE else "Group",
+                    room_id,
+                    (abm.message_str[:60] + "…") if len(abm.message_str) > 60 else abm.message_str,
+                    event.is_at_or_wake_command,
+                )
+            )
+            self.adapter.commit_event(event)
+        except Exception as exc:
+            logger.error(f"[RocketChat][IN] unhandled processing error: {exc!r}", exc_info=True)
+            raise

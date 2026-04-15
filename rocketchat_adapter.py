@@ -11,29 +11,23 @@ Rocket.Chat 平台适配器（Platform Adapter）
 from __future__ import annotations
 
 import asyncio
-import json
-import time
 from asyncio import Queue
 from typing import Any, Callable, Dict, List, Optional
-from urllib.parse import urlparse
 
 import aiohttp
 from astrbot.api import logger
 from astrbot.api.event import MessageChain
-from astrbot.api.message_components import File, Image, Plain, Record, Reply, Video
 from astrbot.api.platform import (
-    AstrBotMessage,
-    Group,
-    MessageMember,
-    MessageType,
     Platform,
     PlatformMetadata,
     register_platform_adapter,
 )
 
 from .rocketchat_e2ee import RocketChatE2EEManager
-from .rocketchat_event import RocketChatMessageEvent
+from .rocketchat_inbound import RocketChatInboundBridge
 from .rocketchat_media import RocketChatMediaBridge
+from .rocketchat_realtime import RocketChatRealtimeBridge
+from .rocketchat_sender import RocketChatSenderBridge
 
 
 def _coerce_bool(value: Any) -> bool:
@@ -192,7 +186,10 @@ class RocketChatAdapter(Platform):
             enabled=self.enable_e2ee,
             password=self.e2ee_password,
         )
+        self._inbound = RocketChatInboundBridge(self)
         self._media = RocketChatMediaBridge(self)
+        self._realtime = RocketChatRealtimeBridge(self)
+        self._sender = RocketChatSenderBridge(self)
 
     # ------------------------------------------------------------------ #
     #  Platform 抽象方法实现                                                #
@@ -441,9 +438,9 @@ class RocketChatAdapter(Platform):
                 else:
                     logger.debug(f"[RocketChat] 获取消息详情失败: msgId={msg_id} response={data}")
         except asyncio.TimeoutError:
-            logger.warning(f"[RocketChat] 获取消息详情超时: msgId={msg_id}")
+            logger.debug(f"[RocketChat] 获取消息详情超时: msgId={msg_id}")
         except Exception as exc:
-            logger.warning(f"[RocketChat] 无法拉取被引用的消息明细 msgId={msg_id}: {exc!r}")
+            logger.debug(f"[RocketChat] 无法拉取被引用的消息明细 msgId={msg_id}: {exc!r}")
         return None
 
     async def _maybe_decrypt_incoming_message(self, raw_msg: Optional[dict]) -> Optional[dict]:
@@ -458,279 +455,42 @@ class RocketChatAdapter(Platform):
     # ------------------------------------------------------------------ #
 
     async def _ws_connect_and_listen(self) -> None:
-        """建立 WebSocket 连接，完成 DDP 握手、认证、订阅，然后进入消息监听循环。"""
-        # 将 http(s) 替换为 ws(s)
-        ws_url = (
-            self.server_url.replace("https://", "wss://", 1).replace(
-                "http://", "ws://", 1
-            )
-        ) + "/websocket"
-
-        # 重连时重置订阅集合，让本次连接重新订阅所有房间
-        self._subscribed_rooms.clear()
-
-        async with self._http_session.ws_connect(
-            ws_url,
-            heartbeat=30.0,  # aiohttp 层面 TCP 心跳
-            max_msg_size=8 * 1024 * 1024,  # 限制单条消息最大 8MB 防止超大帧导致内存激增 (DoS风险)
-        ) as ws:
-            self._ws = ws
-            try:
-                # DDP 三步握手：connect → login → subscribe
-                await self._ddp_connect(ws)
-                await self._ddp_login(ws)
-
-                subscriptions = await self._get_subscriptions()
-                await self._ddp_subscribe_rooms(ws, subscriptions)
-                await self._ddp_subscribe_user_events(ws)
-
-                logger.info(
-                    f"[RocketChat] WebSocket 就绪，共订阅 {len(subscriptions)} 个房间"
-                )
-
-                e2ee_task = asyncio.create_task(self._e2ee.on_ws_ready())
-                self._background_tasks.add(e2ee_task)
-                e2ee_task.add_done_callback(self._background_tasks.discard)
-
-                # 进入主监听循环
-                await self._ws_listen_loop(ws)
-            finally:
-                self._ws = None
+        await self._realtime.ws_connect_and_listen()
 
     async def _ddp_connect(self, ws: aiohttp.ClientWebSocketResponse) -> None:
-        """发送 DDP connect 握手报文并等待 connected 确认。"""
-        await ws.send_json(
-            {
-                "msg": "connect",
-                "version": "1",
-                "support": ["1"],
-            }
-        )
-
-        async for raw in ws:
-            if raw.type != aiohttp.WSMsgType.TEXT:
-                continue
-            data = json.loads(raw.data)
-            if data.get("msg") == "ping":
-                await ws.send_json({"msg": "pong"})
-            elif data.get("msg") == "connected":
-                logger.debug("[RocketChat] DDP connect 握手成功")
-                return
-
-        raise RuntimeError("[RocketChat] DDP connect 未收到 connected 响应")
+        await self._realtime.ddp_connect(ws)
 
     async def _ddp_login(self, ws: aiohttp.ClientWebSocketResponse) -> None:
-        """使用 REST authToken 进行 DDP 认证。"""
-        await ws.send_json(
-            {
-                "msg": "method",
-                "method": "login",
-                "id": "ddp-login",
-                "params": [{"resume": self.auth_token}],
-            }
-        )
-
-        async for raw in ws:
-            if raw.type != aiohttp.WSMsgType.TEXT:
-                continue
-            data = json.loads(raw.data)
-            if data.get("msg") == "ping":
-                await ws.send_json({"msg": "pong"})
-            elif data.get("msg") == "result" and data.get("id") == "ddp-login":
-                if "error" in data:
-                    raise RuntimeError(f"[RocketChat] DDP 登录失败: {data['error']}")
-                logger.debug("[RocketChat] DDP 登录成功")
-                return
-
-        raise RuntimeError("[RocketChat] DDP login 未收到 result 响应")
+        await self._realtime.ddp_login(ws)
 
     async def _ddp_subscribe_rooms(
         self,
         ws: aiohttp.ClientWebSocketResponse,
         subscriptions: List[dict],
     ) -> None:
-        """为每个已订阅的房间建立 stream-room-messages 订阅。"""
-        for sub in subscriptions:
-            room_id = sub.get("rid")
-            if not room_id:
-                continue
-            # 从订阅数据顺带缓存房间类型和名称，减少后续 API 调用
-            room_type = sub.get("t")
-            if room_type:
-                self._room_type_cache[room_id] = room_type
-            room_name = sub.get("name") or sub.get("fname")
-            if room_name:
-                self._room_name_cache[room_id] = room_name
-            self._cache_room_info(
-                {
-                    "_id": room_id,
-                    "t": room_type or "c",
-                    "name": sub.get("name"),
-                    "fname": sub.get("fname"),
-                    "encrypted": bool(sub.get("encrypted", False)),
-                    "e2eKeyId": sub.get("e2eKeyId"),
-                }
-            )
-            await ws.send_json(
-                {
-                    "msg": "sub",
-                    "id": f"room-{room_id}",
-                    "name": "stream-room-messages",
-                    "params": [room_id, False],
-                }
-            )
-            self._subscribed_rooms.add(room_id)
+        await self._realtime.ddp_subscribe_rooms(ws, subscriptions)
 
     async def _ddp_subscribe_user_events(
         self, ws: aiohttp.ClientWebSocketResponse
     ) -> None:
-        """
-        订阅用户级别事件流（stream-notify-user），
-        用于感知机器人被加入新房间，从而动态补充订阅。
-        """
-        await ws.send_json(
-            {
-                "msg": "sub",
-                "id": f"user-notif-{self.user_id}",
-                "name": "stream-notify-user",
-                "params": [f"{self.user_id}/rooms-changed", False],
-            }
-        )
+        await self._realtime.ddp_subscribe_user_events(ws)
 
     async def _ws_listen_loop(self, ws: aiohttp.ClientWebSocketResponse) -> None:
-        """持续读取 WebSocket 帧，分发给各处理器。"""
-        async for raw in ws:
-            if not self._running:
-                break
-
-            if raw.type == aiohttp.WSMsgType.TEXT:
-                try:
-                    data = json.loads(raw.data)
-                    await self._dispatch_ddp(data, ws)
-                except json.JSONDecodeError:
-                    logger.warning(f"[RocketChat] 收到非 JSON 帧: {raw.data[:200]}")
-                except Exception as exc:
-                    logger.error(
-                        f"[RocketChat] 处理 DDP 消息时出错: {exc!r}",
-                        exc_info=True,
-                    )
-
-            elif raw.type in (
-                aiohttp.WSMsgType.CLOSE,
-                aiohttp.WSMsgType.CLOSED,
-                aiohttp.WSMsgType.CLOSING,
-                aiohttp.WSMsgType.ERROR,
-            ):
-                logger.debug(f"[RocketChat] WebSocket 帧类型: {raw.type}")
-                break
+        await self._realtime.ws_listen_loop(ws)
 
     async def _dispatch_ddp(
         self,
         data: dict,
         ws: aiohttp.ClientWebSocketResponse,
     ) -> None:
-        """根据 DDP msg 字段将消息路由到对应处理器。"""
-        msg_type = data.get("msg")
-        collection = data.get("collection", "")
-
-        if msg_type == "ping":
-            # 应用层心跳：服务器发 ping，客户端必须回 pong
-            await ws.send_json({"msg": "pong"})
-
-        elif msg_type == "changed":
-            if collection == "stream-room-messages":
-                # 房间新消息推送
-                args: List[dict] = data.get("fields", {}).get("args", [])
-                for raw_msg in args:
-                    # 并发并使用信号量控制上限，避免突发高流量导致 OOM 或过载
-                    async def process(msg: dict):
-                        async with self._message_semaphore:
-                            await self._process_incoming_message(msg)
-
-                    task = asyncio.create_task(process(raw_msg))
-                    self._background_tasks.add(task)
-                    task.add_done_callback(self._background_tasks.discard)
-
-            elif collection == "stream-notify-user":
-                # 用户级别通知（如：被加入新房间）
-                await self._handle_user_notification(data, ws)
-
-        elif msg_type == "result":
-            # DDP method 调用结果
-            result_id = data.get("id", "")
-            future = self._pending_ddp_results.pop(result_id, None)
-            if future and not future.done():
-                future.set_result(data)
-            if result_id.startswith("typing-"):
-                error = data.get("error")
-                if error:
-                    logger.warning(
-                        f"[RocketChat] typing method 调用被服务端拒绝: id={result_id} error={error}"
-                    )
-                else:
-                    logger.debug(
-                        f"[RocketChat] typing method 调用成功: id={result_id} result={data.get('result')}"
-                    )
-
-        elif msg_type == "added":
-            # DDP 初始化数据，暂不处理
-            pass
-
-        elif msg_type == "ready":
-            # 订阅就绪确认，暂不处理
-            pass
+        await self._realtime.dispatch_ddp(data, ws)
 
     async def _handle_user_notification(
         self,
         data: dict,
         ws: aiohttp.ClientWebSocketResponse,
     ) -> None:
-        """处理 stream-notify-user 事件，动态订阅新加入的房间。"""
-        fields = data.get("fields", {})
-        event_name = fields.get("eventName", "")
-        args: list = fields.get("args", [])
-        if not args:
-            return
-
-        event_type = args[0] if len(args) > 0 else ""
-        room_payload = args[1] if len(args) > 1 and isinstance(args[1], dict) else None
-        room_id = ""
-        if room_payload:
-            room_id = room_payload.get("_id") or room_payload.get("rid") or ""
-
-        if room_id and event_name.endswith("/rooms-changed"):
-            room_type = room_payload.get("t")
-            if isinstance(room_type, str) and room_type:
-                self._cache_room_info(
-                    {
-                        "_id": room_id,
-                        "t": room_type,
-                        "name": room_payload.get("name"),
-                        "fname": room_payload.get("fname"),
-                        "encrypted": bool(room_payload.get("encrypted", False)),
-                        "e2eKeyId": room_payload.get("e2eKeyId"),
-                    }
-                )
-                logger.debug(
-                    f"[RocketChat][room] cached from notify room_id={room_id!r} type={room_type!r} event={event_type!r}"
-                )
-
-        # 只在真正新加入房间时订阅，updated 仅表示房间有活动，不需要重新订阅
-        if (
-            event_type == "inserted"
-            and room_id
-            and room_id not in self._subscribed_rooms
-        ):
-            await ws.send_json(
-                {
-                    "msg": "sub",
-                    "id": f"room-{room_id}",
-                    "name": "stream-room-messages",
-                    "params": [room_id, False],
-                }
-            )
-            self._subscribed_rooms.add(room_id)
-            logger.info(f"[RocketChat] 动态订阅新房间: {room_id}")
+        await self._realtime.handle_user_notification(data, ws)
 
     async def _ddp_call(
         self,
@@ -738,28 +498,7 @@ class RocketChatAdapter(Platform):
         params: Optional[list[Any]] = None,
         timeout: float = 10.0,
     ) -> Any:
-        if not self._ws or self._ws.closed:
-            raise RuntimeError("ddp websocket not ready")
-
-        self._ddp_call_id += 1
-        call_id = f"ddp-{self._ddp_call_id}"
-        future = asyncio.get_running_loop().create_future()
-        self._pending_ddp_results[call_id] = future
-        try:
-            await self._ws.send_json(
-                {
-                    "msg": "method",
-                    "method": method,
-                    "id": call_id,
-                    "params": params or [],
-                }
-            )
-            data = await asyncio.wait_for(future, timeout=timeout)
-            if data.get("error"):
-                raise RuntimeError(data["error"])
-            return data.get("result")
-        finally:
-            self._pending_ddp_results.pop(call_id, None)
+        return await self._realtime.ddp_call(method, params=params, timeout=timeout)
 
     async def _normalize_media_url(self, media_url: str) -> str:
         """将 Rocket.Chat 返回的相对媒体地址补全为绝对 URL，并加上认证参数。"""
@@ -798,352 +537,17 @@ class RocketChatAdapter(Platform):
         return await self._media.extract_video_components(raw_msg)
 
     def _extract_mentions_for_wake(self, raw_msg: dict) -> list[Any]:
-        mentions = raw_msg.get("mentions")
-        if isinstance(mentions, list) and mentions:
-            return mentions
-
-        e2e_mentions = raw_msg.get("e2eMentions")
-        if isinstance(e2e_mentions, dict):
-            merged: list[Any] = []
-            merged.extend(e2e_mentions.get("e2eUserMentions", []) or [])
-            merged.extend(e2e_mentions.get("e2eChannelMentions", []) or [])
-            return merged
-
-        if isinstance(e2e_mentions, list):
-            return e2e_mentions
-
-        return []
+        return self._inbound.extract_mentions_for_wake(raw_msg)
 
     async def _process_incoming_message(self, raw_msg: dict) -> None:
-        """
-        将 Rocket.Chat 原始消息转换为 AstrBotMessage，构造事件并提交队列。
-        """
-        try:
-            # ---- 调试日志：打印原始消息结构 ----
-            logger.info(
-                f"[RocketChat][IN-RAW] msg_id={raw_msg.get('_id')} "
-                f"sender={raw_msg.get('u', {}).get('username')} "
-                f"room={raw_msg.get('rid')} "
-                f"text_len={len(raw_msg.get('msg', ''))} "
-                f"attachments={len(raw_msg.get('attachments', []))} "
-                f"mentions={len(raw_msg.get('mentions', []))} "
-                f"has_files={bool(raw_msg.get('files') or raw_msg.get('file'))} "
-                f"has_urls={bool(raw_msg.get('urls'))} "
-                f"is_thread={bool(raw_msg.get('tmid'))} "
-                f"is_system={bool(raw_msg.get('t') and raw_msg.get('t') != 'e2e')}"
-            )
-            logger.debug(f"[RocketChat][IN-FULL] {json.dumps(raw_msg, ensure_ascii=False, default=str)}")
-
-            raw_msg = await self._maybe_decrypt_incoming_message(raw_msg)
-            if not raw_msg:
-                logger.debug("[RocketChat][IN] skip undecipherable e2e message")
-                return
-
-            # ---- 过滤规则 ----
-            # 1. 系统消息（有 t 字段，如用户加入/离开通知；e2e 消息除外）
-            if raw_msg.get("t") and raw_msg.get("t") != "e2e":
-                return
-
-            # 2. 机器人自身发出的消息
-            if raw_msg.get("u", {}).get("_id") == self.user_id:
-                logger.debug("[RocketChat][IN] skip self message")
-                return
-
-            # 3. 空消息（无文本且无任何可处理媒体）
-            # --- 构建消息组件流 (按时序排列文本和媒体，完美兼容多模态大模型的视觉理解) ---
-            import re
-            
-            seen_quote_ids = set()
-
-            async def _build_components_recursively(current_payload: dict, current_depth: int = 0, max_depth: int = 3) -> list:
-                """将原始附表及正文转化为 Component 流，使用 Reply 组件标准化引用"""
-                chain = []
-                if current_depth >= max_depth:
-                    return chain
-
-                msg_text = current_payload.get("msg", "").strip()
-                
-                # --- 提取自身的图片和媒体内容 ---
-                local_images = await self._extract_image_components(current_payload)
-                local_recs = await self._extract_record_components(current_payload)
-                local_vids = await self._extract_video_components(current_payload)
-                local_files = await self._extract_file_components(current_payload)
-
-                # --- 识别引用 ID (优先使用系统提供的结构化数据) ---
-                quote_ids = []
-                
-                # 1. 扫描系统解析出的 urls 数组 (推荐做法)
-                from urllib.parse import urlparse, parse_qs
-                for url_obj in current_payload.get("urls", []):
-                    u_str = url_obj.get("url") or ""
-                    # 尝试从预解析的 parsedUrl 获取，否则手动解析
-                    p_url = url_obj.get("parsedUrl", {})
-                    if p_url and "query" in p_url and "msg" in p_url["query"]:
-                        q_id = p_url["query"]["msg"]
-                        if q_id and q_id not in quote_ids:
-                            quote_ids.append(q_id)
-                            logger.debug(f"[RocketChat][IN] 从urls.parsedUrl识别引用: msg_id={q_id}")
-                    elif "msg=" in u_str:
-                        parsed = urlparse(u_str)
-                        qs = parse_qs(parsed.query)
-                        if "msg" in qs:
-                            q_id = qs["msg"][0]
-                            if q_id and q_id not in quote_ids:
-                                quote_ids.append(q_id)
-                                logger.debug(f"[RocketChat][IN] 从urls手动parse识别引用: msg_id={q_id} url={u_str[:80]}")
-
-                # 2. 扫描直接子级附件中的消息链接（仅一层，不递归）
-                # 这样保证引用的嵌套结构是正确的
-                att_raw = current_payload.get("attachments", [])
-                direct_atts = [att_raw] if isinstance(att_raw, dict) else [a for a in att_raw if isinstance(a, dict)]
-                for att in direct_atts:
-                    link = att.get("message_link") or ""
-                    if "msg=" in link:
-                        parsed = urlparse(link)
-                        qs = parse_qs(parsed.query)
-                        if "msg" in qs:
-                            q_id = qs["msg"][0]
-                            if q_id and q_id not in quote_ids:
-                                quote_ids.append(q_id)
-                                logger.debug(f"[RocketChat][IN] 从直接attachment.message_link识别引用: msg_id={q_id}")
-
-                # 3. 兜底扫描正文 (仅用于定位链接以清理文本) ---
-                # 改进的正则，可以更准确地识别包含 msg= 参数的链接
-                # 支持两种格式：
-                # 1. Markdown: [任意文本](URL?msg=id)
-                # 2. 直接URL: https://...?msg=id
-                link_pattern = re.compile(
-                    r'\[([^\]]*)\]\(([^)]*msg=[^)]*)\)|'           # Markdown格式: [text](url?msg=...)
-                    r'((?:https?|http)://[^\s)]+msg=[^\s)]*)',     # 直接URL (以msg参数结尾)
-                    re.IGNORECASE
-                )
-                
-                # 如果 urls 数组为空，尝试正则提取作为补充
-                if not quote_ids:
-                    for match in link_pattern.finditer(msg_text):
-                        # match.groups() 返回 (markdown_text, markdown_url, direct_url)
-                        markdown_url = match.group(2)
-                        direct_url = match.group(3)
-                        u_str = markdown_url or direct_url or ""
-                        if u_str and "msg=" in u_str:
-                            # 移除 markdown 包裹字符
-                            u_clean = u_str.strip("[]() ")
-                            parsed = urlparse(u_clean)
-                            qs = parse_qs(parsed.query)
-                            if "msg" in qs:
-                                q_id = qs["msg"][0]
-                                if q_id and q_id not in quote_ids:
-                                    quote_ids.append(q_id)
-
-                # --- 只有在未达最大深度时才进一步拉取引用详情 ---
-                found_reply_comps = []
-                for q_id in quote_ids:
-                    if q_id not in seen_quote_ids:
-                        seen_quote_ids.add(q_id)
-                        try:
-                            q_msg = await self._fetch_message_by_id(q_id)
-                            if q_msg:
-                                # 递归处理被引用消息 (Depth + 1)
-                                q_components = await _build_components_recursively(q_msg, current_depth + 1, max_depth)
-                                if q_components:
-                                    q_sender_id = q_msg.get("u", {}).get("_id", "")
-                                    q_sender_name = q_msg.get("u", {}).get("name") or q_msg.get("u", {}).get("username", "")
-                                    q_ts_raw = q_msg.get("ts")
-                                    if isinstance(q_ts_raw, dict):
-                                        q_timestamp = int(q_ts_raw.get("$date", time.time() * 1000) / 1000)
-                                    else:
-                                        q_timestamp = int(time.time())
-                                    
-                                    q_msg_text = "".join([c.text for c in q_components if isinstance(c, Plain)]).strip()
-                                    
-                                    reply_comp = Reply(
-                                        id=q_id,
-                                        chain=q_components,
-                                        sender_id=q_sender_id,
-                                        sender_nickname=q_sender_name,
-                                        time=q_timestamp,
-                                        message_str=q_msg_text,
-                                    )
-                                    found_reply_comps.append(reply_comp)
-                            else:
-                                logger.debug(f"[RocketChat][IN] 被引用消息不存在或无权限访问: msgId={q_id}")
-                        except Exception as e:
-                            logger.warning(f"[RocketChat][IN] 递归处理被引用消息出错: msgId={q_id} error={e!r}")
-                
-                # 按识别顺序放入链条头部
-                chain.extend(found_reply_comps)
-
-                # --- 清理当前文本中的引用标记，保留自身实质文案 ---
-                cleaned_msg_text = link_pattern.sub("", msg_text).strip()
-                if cleaned_msg_text:
-                    chain.append(Plain(text=cleaned_msg_text))
-                    if current_depth == 0:  # 仅顶层消息日志
-                        logger.debug(f"[RocketChat][IN] 清理后文本: clean_text={cleaned_msg_text!r}")
-
-                # --- 铺设本层级的媒体内容 ---
-                if local_images or local_recs or local_vids or local_files:
-                    logger.debug(
-                        f"[RocketChat][IN] 深度{current_depth}提取媒体: "
-                        f"images={len(local_images)} records={len(local_recs)} "
-                        f"videos={len(local_vids)} files={len(local_files)}"
-                    )
-                    chain.extend(local_images)
-                    chain.extend(local_recs)
-                    chain.extend(local_vids)
-                    chain.extend(local_files)
-
-                return chain
-
-            components = await _build_components_recursively(raw_msg)
-            
-            # 用于快速获取最终平摊出来的纯文本，用于指令判断和日志
-            msg_text = "".join([c.text for c in components if isinstance(c, Plain)]).strip()
-
-            if not msg_text and not [c for c in components if not isinstance(c, Plain)]:
-                logger.debug("[RocketChat][IN] skip empty/unsupported message")
-                return
-
-            # ---- 基本字段提取 ----
-            room_id: str = raw_msg.get("rid", "")
-            sender_id: str = raw_msg.get("u", {}).get("_id", "")
-            sender_username: str = raw_msg.get("u", {}).get("username", "")
-            sender_name: str = raw_msg.get("u", {}).get("name") or sender_username
-            thread_id: Optional[str] = raw_msg.get("tmid")
-            
-            ts_raw = raw_msg.get("ts")
-            if isinstance(ts_raw, dict):
-                timestamp = int(ts_raw.get("$date", time.time() * 1000) / 1000)
-            else:
-                timestamp = int(time.time())
-
-            room_type = await self._get_room_type(room_id)
-            msg_type = (
-                MessageType.FRIEND_MESSAGE
-                if room_type == "d"
-                else MessageType.GROUP_MESSAGE
-            )
-
-            # ---- 构造 AstrBotMessage ----
-            abm = AstrBotMessage()
-            abm.type = msg_type
-            abm.self_id = self.user_id
-            abm.session_id = room_id
-            abm.message_id = raw_msg.get("_id", "")
-            abm.sender = MessageMember(user_id=sender_id, nickname=sender_name)
-            abm.message = components
-            abm.message_str = msg_text
-            abm.raw_message = raw_msg
-            abm.timestamp = timestamp
-            abm.group = None
-
-            if msg_type == MessageType.GROUP_MESSAGE:
-                abm.group = Group(group_id=room_id)
-
-            # ---- 检测 @mention，决定是否唤醒 AstrBot ----
-            bot_mentioned = False
-            mentions = self._extract_mentions_for_wake(raw_msg)
-            for m in mentions:
-                if isinstance(m, str):
-                    normalized = m.lstrip("@")
-                    if normalized in {self.user_id, self.bot_username}:
-                        bot_mentioned = True
-                        break
-                if isinstance(m, dict) and (
-                    m.get("_id") == self.user_id or m.get("username") == self.bot_username
-                ):
-                    bot_mentioned = True
-                    break
-            if not bot_mentioned and self.bot_username:
-                bot_mentioned = f"@{self.bot_username}" in (abm.message_str or "")
-            
-            if bot_mentioned:
-                # 遍地清理 @botusername，绝对不可以把全局替换后的纯文本重新塞进单一组件，这样会破坏多模态组件流时序！
-                bot_mentions = [f"@{self.bot_username} ", f"@{self.bot_username}"]
-                new_msg_text = ""
-                for comp in abm.message:
-                    if isinstance(comp, Plain):
-                        for bm in bot_mentions:
-                            comp.text = comp.text.replace(bm, "")
-                        new_msg_text += comp.text
-                
-                abm.message_str = new_msg_text.strip()
-                logger.debug(
-                    f"[RocketChat][IN] bot mentioned, clean_text={abm.message_str!r}"
-                )
-
-            # ---- 判断回复场景 ----
-            # is_thread_msg: 收到的消息本身就在线程里（有 tmid）
-            is_thread_msg = bool(raw_msg.get("tmid"))
-            # 频道 @mention 且不在线程里 → 引用原消息回复到大厅
-            should_quote = (
-                msg_type == MessageType.GROUP_MESSAGE
-                and bot_mentioned
-                and not is_thread_msg
-            )
-
-            logger.info(
-                f"[RocketChat][IN] 回复场景判定: msg_type={msg_type} bot_mentioned={bot_mentioned} is_thread={is_thread_msg} -> should_quote={should_quote}"
-            )
-
-            # ---- 构造平台事件 ----
-            event = RocketChatMessageEvent(
-                message_str=abm.message_str,
-                message_obj=abm,
-                platform_meta=self.meta(),
-                session_id=abm.session_id,
-                room_id=room_id,
-                thread_id=thread_id,  # 线程消息时为父消息 ID，否则 None
-                quote_original=should_quote,
-                adapter=self,
-            )
-            # 群聊中 @mention 触发唤醒；私信始终处理
-            if bot_mentioned or msg_type == MessageType.FRIEND_MESSAGE:
-                event.is_at_or_wake_command = True
-
-            # 群聊 / 线程中仅在 @bot 时启用延迟 typing；
-            # 私聊则收到消息后直接启用延迟 typing。
-            if (
-                msg_type == MessageType.GROUP_MESSAGE and bot_mentioned
-            ) or msg_type == MessageType.FRIEND_MESSAGE:
-                event.start_typing_indicator()
-
-            logger.debug(
-                "[RocketChat][IN] → commit type=%s room=%r msg=%r wake=%s"
-                % (
-                    "DM" if msg_type == MessageType.FRIEND_MESSAGE else "Group",
-                    room_id,
-                    (abm.message_str[:60] + "…")
-                    if len(abm.message_str) > 60
-                    else abm.message_str,
-                    event.is_at_or_wake_command,
-                )
-            )
-            self.commit_event(event)
-        except Exception as exc:
-            logger.error(
-                f"[RocketChat][IN] unhandled processing error: {exc!r}", exc_info=True
-            )
-            raise
+        await self._inbound.process_incoming_message(raw_msg)
 
     # ------------------------------------------------------------------ #
     #  消息发送方法（供 RocketChatMessageEvent 调用）                       #
     # ------------------------------------------------------------------ #
 
     async def _post_json_message(self, url: str, payload: dict) -> bool:
-        try:
-            async with self._http_session.post(
-                url,
-                json=payload,
-                headers=self._auth_headers(),
-            ) as resp:
-                data = await resp.json()
-                if not data.get("success"):
-                    logger.error(f"[RocketChat] 发送消息失败: {data}")
-                    return False
-                return True
-        except Exception as exc:
-            logger.error(f"[RocketChat] 发送消息异常: {exc!r}")
-            return False
+        return await self._sender.post_json_message(url, payload)
 
     async def _send_structured_message(
         self,
@@ -1154,35 +558,12 @@ class RocketChatAdapter(Platform):
         tmid: Optional[str] = None,
         e2e_mentions: Optional[dict[str, Any]] = None,
     ) -> bool:
-        room_info = await self._get_room_info(room_id)
-        is_e2ee_room = room_info.get("encrypted") and room_info.get("t") in {"d", "p"}
-
-        if is_e2ee_room:
-            encrypted_payload = await self._e2ee.build_send_message(
-                room_id,
-                text=text,
-                attachments=attachments,
-                tmid=tmid,
-                e2e_mentions=e2e_mentions,
-            )
-            if not encrypted_payload:
-                logger.warning(
-                    f"[RocketChat][E2EE] 房间为加密房间，当前无法安全发送，已跳过 room_id={room_id!r}"
-                )
-                return False
-            return await self._post_json_message(
-                f"{self.server_url}/api/v1/chat.sendMessage",
-                encrypted_payload,
-            )
-
-        payload: dict[str, Any] = {"roomId": room_id, "text": text}
-        if attachments:
-            payload["attachments"] = attachments
-        if tmid:
-            payload["tmid"] = tmid
-        return await self._post_json_message(
-            f"{self.server_url}/api/v1/chat.postMessage",
-            payload,
+        return await self._sender.send_structured_message(
+            room_id,
+            text,
+            attachments=attachments,
+            tmid=tmid,
+            e2e_mentions=e2e_mentions,
         )
 
     async def _build_explicit_reply_mention(
@@ -1190,29 +571,10 @@ class RocketChatAdapter(Platform):
         room_id: str,
         mention_username: Optional[str],
     ) -> tuple[str | None, dict[str, Any] | None]:
-        room_info = await self._get_room_info(room_id)
-        if not (
-            mention_username
-            and room_info.get("encrypted")
-            and room_info.get("t") == "p"
-        ):
-            return None, None
-
-        normalized = mention_username.lstrip("@").strip()
-        if not normalized:
-            return None, None
-
-        return (
-            f"@{normalized}",
-            {
-                "e2eUserMentions": [f"@{normalized}"],
-                "e2eChannelMentions": [],
-            },
-        )
+        return await self._sender.build_explicit_reply_mention(room_id, mention_username)
 
     async def _should_explicit_reply_mention(self, room_id: str) -> bool:
-        room_info = await self._get_room_info(room_id)
-        return bool(room_info.get("encrypted") and room_info.get("t") == "p")
+        return await self._sender.should_explicit_reply_mention(room_id)
 
     async def send_text(
         self,
@@ -1221,66 +583,10 @@ class RocketChatAdapter(Platform):
         tmid: Optional[str] = None,
         mention_username: Optional[str] = None,
     ) -> None:
-        """
-        发送纯文本消息。
-
-        :param room_id: 目标房间 ID
-        :param text:    消息正文
-        :param tmid:    可选，回复的线程消息 ID（创建/追加线程）
-        """
-        mention_text, e2e_mentions = await self._build_explicit_reply_mention(
-            room_id,
-            mention_username,
-        )
-        final_text = text
-        if mention_text:
-            final_text = f"{mention_text} {text}".strip()
-        await self._send_structured_message(
-            room_id,
-            final_text,
-            tmid=tmid,
-            e2e_mentions=e2e_mentions,
-        )
+        await self._sender.send_text(room_id, text, tmid=tmid, mention_username=mention_username)
 
     async def send_typing(self, room_id: str, flag: bool) -> None:
-        """
-        通过 Rocket.Chat Realtime API 发送 typing 状态。
-
-        :param room_id: 目标房间 ID
-        :param flag:    True 表示正在输入，False 表示结束输入
-        """
-        if not self._ws or self._ws.closed or not self.bot_username:
-            logger.warning(
-                f"[RocketChat] typing 跳过: ws={self._ws is not None and not getattr(self._ws, 'closed', True)} bot_username={self.bot_username!r}"
-            )
-            return
-
-        try:
-            logger.debug(
-                f"[RocketChat] send typing room_id={room_id!r} user={self.bot_username!r} flag={flag}"
-            )
-
-            # 使用现代 user-activity API，确保兼容性
-            # 每次 method 调用使用唯一的 DDP ID
-            self._ddp_call_id += 1
-
-            await self._ws.send_json(
-                {
-                    "msg": "method",
-                    "method": "stream-notify-room",
-                    "id": f"typing-{self._ddp_call_id}",
-                    "params": [
-                        f"{room_id}/user-activity",
-                        self.bot_username,
-                        ["user-typing"] if flag else [],
-                        {},
-                    ],
-                }
-            )
-        except Exception as exc:
-            logger.warning(
-                f"[RocketChat] 发送 typing 状态失败 room_id={room_id!r} flag={flag}: {exc!r}"
-            )
+        await self._sender.send_typing(room_id, flag)
 
     async def send_with_quote(
         self,
@@ -1290,35 +596,12 @@ class RocketChatAdapter(Platform):
         tmid: Optional[str] = None,
         mention_username: Optional[str] = None,
     ) -> None:
-        """
-        发送带引用原始消息的回复。通过文本格式实现引用显示。
-
-        :param room_id:      目标房间 ID
-        :param text:         机器人回复正文
-        :param original_msg: 被引用的原始消息 raw_msg dict
-        :param tmid:         可选线程 ID
-        """
-        msg_id = original_msg.get("_id", "")
-        link = self._build_message_link(room_id, msg_id)
-        mention_text, e2e_mentions = await self._build_explicit_reply_mention(
+        await self._sender.send_with_quote(
             room_id,
-            mention_username,
-        )
-
-        # 构造最终正文：使用 Rocket.Chat 的引用格式 [ ](link) 实现引用显示
-        reply_line = text
-        if mention_text:
-            reply_line = f"{mention_text} {text}".strip()
-        final_text = f"[ ]({link})\n{reply_line}" if link else reply_line
-
-        logger.info(
-            f"[RocketChat] send_with_quote() 发送: quote_msg_id={msg_id!r} tmid={tmid!r}"
-        )
-        await self._send_structured_message(
-            room_id,
-            final_text,
+            text,
+            original_msg,
             tmid=tmid,
-            e2e_mentions=e2e_mentions,
+            mention_username=mention_username,
         )
 
     async def send_image_url(
@@ -1328,12 +611,7 @@ class RocketChatAdapter(Platform):
         text: str = "",
         tmid: Optional[str] = None,
     ) -> None:
-        await self._media.send_image_url(
-            room_id,
-            image_url,
-            text=text,
-            tmid=tmid,
-        )
+        await self._sender.send_image_url(room_id, image_url, text=text, tmid=tmid)
 
     async def send_image_file(
         self,
@@ -1342,12 +620,7 @@ class RocketChatAdapter(Platform):
         description: str = "",
         tmid: Optional[str] = None,
     ) -> None:
-        await self._media.send_image_file(
-            room_id,
-            file_path,
-            description=description,
-            tmid=tmid,
-        )
+        await self._sender.send_image_file(room_id, file_path, description=description, tmid=tmid)
 
     async def send_file(
         self,
@@ -1357,7 +630,7 @@ class RocketChatAdapter(Platform):
         description: str = "",
         tmid: Optional[str] = None,
     ) -> None:
-        await self._media.send_file(
+        await self._sender.send_file(
             room_id,
             file_path,
             filename=filename,
@@ -1374,7 +647,7 @@ class RocketChatAdapter(Platform):
         text: str = "",
         tmid: Optional[str] = None,
     ) -> bool:
-        return await self._media.send_remote_media_fallback(
+        return await self._sender.send_remote_media_fallback(
             room_id,
             media_url,
             media_kind=media_kind,
@@ -1387,102 +660,23 @@ class RocketChatAdapter(Platform):
         file_ref: str,
         default_suffix: str,
     ) -> tuple[str | None, Callable[[], None] | None]:
-        """将远端/本地/Base64 媒体引用解析为可上传的本地路径。"""
-        if file_ref.startswith("http://") or file_ref.startswith("https://"):
-            return await self._download_remote_media(file_ref, default_suffix)
-        if file_ref.startswith("base64://"):
-            return self._decode_base64_media(file_ref, default_suffix)
-
-        local_path = file_ref.replace("file:///", "").replace("file://", "")
-        return (local_path or None, None)
+        return await self._sender.resolve_outbound_media_path(file_ref, default_suffix)
 
     async def _download_remote_media(
         self,
         url: str,
         default_suffix: str,
     ) -> tuple[str | None, Callable[[], None] | None]:
-        return await self._media.download_remote_media(url, default_suffix)
+        return await self._sender.download_remote_media(url, default_suffix)
 
     def _decode_base64_media(
         self,
         file_ref: str,
         default_suffix: str,
     ) -> tuple[str | None, Callable[[], None] | None]:
-        return self._media.decode_base64_media(file_ref, default_suffix)
+        return self._sender.decode_base64_media(file_ref, default_suffix)
 
     async def _send_message_chain(
         self, room_id: str, message_chain: MessageChain, tmid: Optional[str] = None
     ) -> None:
-        """
-        将 MessageChain 发送到指定房间（内部复用方法）。
-        """
-        # 预先提取 Reply 组件和全量文本
-        reply_comp = next((c for c in message_chain.chain if isinstance(c, Reply)), None)
-        full_text = "".join([c.text for c in message_chain.chain if isinstance(c, Plain)]).strip()
-        
-        # 如果有引用组件，优先尝试将其与文本合并发送
-        reply_sent = False
-        if reply_comp:
-            q_msg = await self._fetch_message_by_id(reply_comp.id)
-            if q_msg:
-                await self.send_with_quote(room_id, full_text, q_msg, tmid)
-                reply_sent = True
-            else:
-                # 降级：如果拉不到消息，构造一个链接引用
-                link = self._build_message_link(room_id, reply_comp.id)
-                if link:
-                    await self.send_text(room_id, f"[ ]({link}) {full_text}", tmid)
-                    reply_sent = True
-
-        # 如果没有引用组件，或者引用组件发送失败，则走常规的时序发送流程
-        if not reply_sent:
-            text_parts: List[str] = []
-            for comp in message_chain.chain:
-                if isinstance(comp, Plain):
-                    text_parts.append(comp.text)
-                elif isinstance(comp, (Image, File, Record, Video)):
-                    if text_parts:
-                        await self.send_text(room_id, "".join(text_parts), tmid)
-                        text_parts.clear()
-                    
-                    # 媒体分发逻辑保持不变...
-
-                if isinstance(comp, Image):
-                    file_ref: str = comp.file or ""
-                    if file_ref.startswith("http"):
-                        await self.send_image_url(room_id, file_ref, tmid=tmid)
-                    else:
-                        local_path = file_ref.replace("file:///", "").replace("file://", "")
-                        if local_path:
-                            await self.send_image_file(room_id, local_path, tmid=tmid)
-
-                elif isinstance(comp, File):
-                    file_ref = comp.file or getattr(comp, "url", None) or ""
-                    if file_ref.startswith("http://") or file_ref.startswith("https://"):
-                        await self.send_text(
-                            room_id,
-                            f"{comp.name}: {file_ref}" if getattr(comp, "name", None) else file_ref,
-                            tmid,
-                        )
-                    else:
-                        local_path = file_ref.replace("file:///", "").replace("file://", "")
-                        if local_path:
-                            await self.send_file(room_id, local_path, filename=getattr(comp, "name", None), tmid=tmid)
-
-                elif isinstance(comp, (Record, Video)):
-                    file_ref = comp.file or getattr(comp, "url", None) or ""
-                    suffix = ".mp4" if isinstance(comp, Video) else ".ogg"
-                    media_path, cleanup = await self._resolve_outbound_media_path(file_ref, suffix)
-                    if media_path:
-                        try:
-                            await self.send_file(room_id, media_path, tmid=tmid)
-                        finally:
-                            if cleanup:
-                                cleanup()
-            else:
-                fallback = str(comp)
-                if fallback:
-                    text_parts.append(fallback)
-
-        if text_parts:
-            await self.send_text(room_id, "".join(text_parts), tmid)
+        await self._sender.send_message_chain(room_id, message_chain, tmid=tmid)
