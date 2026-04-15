@@ -17,9 +17,9 @@
 - ✅ **自动重连** — WebSocket 断线后自动重连，无需人工干预
 - ✅ **动态订阅** — 机器人被加入新房间后自动订阅，无需重启
 - ✅ **全局管理员** — 与 AstrBot 核心权限系统无缝集成
-- ✅ **增强型图片上传** — 本地图片原生上传；外链图片自动代理下载转存，无视防盗链阻断
-- ✅ **Base64 多媒体识别** — 原生支持处理文转图 Base64 流，并内置智能重命名拦截，彻底告别无意义长串乱码文件名
-- ✅ **全模态 E2EE 加密** — 在纯文本加密通信外，通过极简、无冗余的安全协议体结构破除版本壁垒，实现加密媒体音视频的极致稳定收发
+- ✅ **远程媒体转存** — 图片、语音、视频优先下载到本地后再统一上传，尽量避免外链防盗链或直链失效
+- ✅ **Base64 媒体发送** — 支持将 `base64://` 媒体引用落地为临时文件后发送
+- ✅ **E2EE 媒体闭环** — 加密私聊/私有群组中的图片、语音、视频和普通文件支持按官方协议上传、确认、接收和解密
 
 ---
 
@@ -142,32 +142,40 @@ Rocket.Chat 适配器已接入 AstrBot 的全局权限管理系统。
 ```
 AstrBot 框架
     │
-    ├── RocketChatAdapterPlugin (Star)       ← main.py，插件入口，触发注册
+    ├── RocketChatAdapterPlugin (Star)          ← main.py，插件入口，触发注册
     │
-    └── RocketChatAdapter (Platform)         ← rocketchat_adapter.py
+    └── RocketChatAdapter (Platform)            ← rocketchat_adapter.py，主编排层
+            ├── RocketChatRealtimeBridge        ← rocketchat_realtime.py
+            │     ├── DDP connect / login
+            │     ├── stream-room-messages
+            │     ├── stream-notify-user
+            │     └── DDP method result 分发
             │
-            ├── REST API (aiohttp)
-            │     ├── POST /api/v1/login         → 获取 authToken / userId
-            │     ├── GET  /api/v1/subscriptions.get → 获取已订阅房间列表
-            │     ├── GET  /api/v1/rooms.info     → 获取房间类型（带缓存）
-            │     ├── POST /api/v1/chat.postMessage → 普通房间发送文本 / 引用回复
-            │     ├── POST /api/v1/chat.sendMessage → E2EE 房间发送密文消息
-            │     ├── GET/POST /api/v1/e2e.*       → E2EE 密钥获取 / 协商 / 分发
-            │     ├── POST /api/v1/rooms.upload   → 普通房间上传文件（图片/语音/视频/普通文件）
-            │     └── POST /api/v1/rooms.media + /api/v1/rooms.mediaConfirm → E2EE 房间文件上传与消息确认
+            ├── RocketChatInboundBridge         ← rocketchat_inbound.py
+            │     ├── E2EE 消息解密后的入站归一化
+            │     ├── 引用消息递归解析
+            │     └── AstrBotMessage / Event 组装
             │
-            └── WebSocket DDP (aiohttp)
-                  ├── connect 握手
-                  ├── login (resume authToken)
-                  ├── stream-room-messages 订阅（每个房间）
-                  ├── stream-notify-user 订阅（感知新加入房间）
-                  └── 自动重连（断线后 reconnect_delay 秒）
+            ├── RocketChatSenderBridge          ← rocketchat_sender.py
+            │     ├── 文本 / 引用 / typing 发送
+            │     └── 主动 send_by_session 消息链分发
+            │
+            ├── RocketChatMediaBridge           ← rocketchat_media.py
+            │     ├── 普通房间 rooms.upload
+            │     ├── E2EE 房间 rooms.media + mediaConfirm
+            │     ├── 媒体下载 / 临时文件 / Base64 解码
+            │     └── 加密房间远程媒体 fallback
+            │
+            └── RocketChatE2EEManager           ← rocketchat_e2ee.py
+                  ├── 客户端密钥与房间密钥
+                  ├── 文本消息加解密
+                  └── 媒体元数据 / 文件内容加解密
 
-RocketChatMessageEvent (AstrMessageEvent)   ← rocketchat_event.py
+RocketChatMessageEvent (AstrMessageEvent)      ← rocketchat_event.py
     └── send(MessageChain)
-          ├── Plain / At / AtAll → 发送文本（支持 Markdown 原生引用回复）
-          ├── Image / Record / Video → 统一转为本地临时文件上传，避免防盗链
-          └── File → 本地上传或退化为链接
+          ├── Plain / At / AtAll → 文本发送 / 引用回复 / 线程回复
+          ├── Image / Record / Video → 统一转为可上传文件路径
+          └── File → 本地上传或文本链接退化
 ```
 
 ### 消息流转图
@@ -176,10 +184,10 @@ RocketChatMessageEvent (AstrMessageEvent)   ← rocketchat_event.py
 Rocket.Chat 用户发消息
     │
     ▼
-WebSocket DDP stream-room-messages
+RocketChatRealtimeBridge.ws_listen_loop()
     │
     ▼
-RocketChatAdapter._process_incoming_message()
+RocketChatInboundBridge.process_incoming_message()
     │  构造 AstrBotMessage + RocketChatMessageEvent
     ▼
 commit_event(event)  →  AstrBot 事件队列
@@ -188,11 +196,10 @@ commit_event(event)  →  AstrBot 事件队列
 AstrBot 框架处理（指令匹配 / LLM 推理）
     │
     ▼
-event.send(MessageChain)
-    │
-    ▼
 RocketChatMessageEvent.send()
-    │  REST API chat.postMessage / rooms.upload
+    │
+    ├── RocketChatSenderBridge.send_text / send_with_quote
+    └── RocketChatMediaBridge.upload_plain_file / upload_encrypted_file
     ▼
 Rocket.Chat 房间收到回复
 ```
@@ -268,7 +275,7 @@ A: 请检查：
 
 **Q: 机器人无法收到某个频道的消息？**
 
-A: 请确保机器人账号已加入该频道（成为成员），加入后重启插件即可自动订阅。
+A: 请确保机器人账号已加入该频道（成为成员）。如果是运行中才被拉进新房间，适配器会通过 `stream-notify-user` 自动增量订阅，通常不需要重启。
 
 **Q: 发送图片失败？**
 
@@ -295,12 +302,19 @@ A: 在 AstrBot 平台配置中添加多个 `rocket_chat` 实例，每个实例�
 
 ```
 astrbot_plugin_rocket_chat_adapter/
-├── main.py                  # 插件入口，注册 Star 子类
-├── rocketchat_adapter.py    # Platform 适配器实现（连接 & 消息转换）
-├── rocketchat_event.py      # AstrMessageEvent 实现（消息回复）
-├── metadata.yaml            # 插件元数据
-├── requirements.txt         # Python 依赖
-└── README.md                # 本文档
+├── main.py                      # 插件入口，导入即注册
+├── rocketchat_adapter.py        # 平台主适配器，负责配置、缓存、生命周期和编排
+├── rocketchat_realtime.py       # DDP / WebSocket 握手、订阅、分发、动态订阅
+├── rocketchat_inbound.py        # 入站消息解析、引用递归、唤醒判断、事件组装
+├── rocketchat_sender.py         # 文本/引用/typing/消息链发送编排
+├── rocketchat_media.py          # 普通与 E2EE 媒体收发、下载与 fallback
+├── rocketchat_e2ee.py           # Rocket.Chat E2EE 协议与密钥管理
+├── rocketchat_event.py          # AstrMessageEvent 实现（回复链路）
+├── metadata.yaml                # 插件元数据
+├── requirements.txt             # Python 依赖
+├── docs/
+│   └── DEVELOPMENT_KNOWLEDGE_BASE.md
+└── README.md                    # 本文档
 ```
 
 ---

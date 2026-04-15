@@ -12,7 +12,16 @@
   - AstrBot 插件入口，只负责注册平台
 - [rocketchat_adapter.py](/D:/Workspace/astrbot_plugin_rocket_chat_adapter/rocketchat_adapter.py)
   - 平台主适配器
-  - 负责 REST 登录、DDP 连接、房间订阅、入站消息归一化、出站发送入口
+  - 负责配置读取、缓存、生命周期、REST 辅助方法和各 bridge 编排
+- [rocketchat_realtime.py](/D:/Workspace/astrbot_plugin_rocket_chat_adapter/rocketchat_realtime.py)
+  - DDP / WebSocket 桥接层
+  - 负责 connect、resume login、房间订阅、动态订阅、DDP result 分发
+- [rocketchat_inbound.py](/D:/Workspace/astrbot_plugin_rocket_chat_adapter/rocketchat_inbound.py)
+  - 入站消息桥接层
+  - 负责消息解密后的归一化、引用递归、mention 唤醒判断、AstrBot 事件组装
+- [rocketchat_sender.py](/D:/Workspace/astrbot_plugin_rocket_chat_adapter/rocketchat_sender.py)
+  - 出站发送桥接层
+  - 负责文本、引用、typing、`send_by_session` 的消息链分发
 - [rocketchat_event.py](/D:/Workspace/astrbot_plugin_rocket_chat_adapter/rocketchat_event.py)
   - AstrBot 事件对象
   - 负责把 `MessageChain` 组件拆成文本、图片、文件、语音、视频，并调用 adapter/media 发出
@@ -26,6 +35,9 @@
 后续继续扩功能时的原则：
 
 - 平台级协议和路由放 `adapter`
+- DDP 握手、订阅、实时分发放 `realtime`
+- 入站消息解析和 AstrBot 事件组装放 `inbound`
+- 文本、引用、typing、消息链分发放 `sender`
 - E2EE 协议细节放 `e2ee`
 - 组件拆解与发送顺序放 `event`
 - 上传、下载、媒体 fallback 放 `media`
@@ -135,7 +147,8 @@ DDP 正常工作至少要走完这几步：
 
 当前实现位置：
 
-- [rocketchat_adapter.py](/D:/Workspace/astrbot_plugin_rocket_chat_adapter/rocketchat_adapter.py)
+- [rocketchat_realtime.py](/D:/Workspace/astrbot_plugin_rocket_chat_adapter/rocketchat_realtime.py)
+- [rocketchat_sender.py](/D:/Workspace/astrbot_plugin_rocket_chat_adapter/rocketchat_sender.py)
 - [rocketchat_event.py](/D:/Workspace/astrbot_plugin_rocket_chat_adapter/rocketchat_event.py)
 
 ### 5.3 Typing 不显示时先查什么
