@@ -7,7 +7,7 @@ from typing import Any, Optional
 from urllib.parse import parse_qs, urlparse
 
 from astrbot.api import logger
-from astrbot.api.message_components import Plain, Reply
+from astrbot.api.message_components import At, Plain, Reply
 from astrbot.api.platform import AstrBotMessage, Group, MessageMember, MessageType
 
 from .rocketchat_event import RocketChatMessageEvent
@@ -33,6 +33,96 @@ class RocketChatInboundBridge:
             return e2e_mentions
 
         return []
+
+    def _iter_textual_mentions(self, raw_msg: dict) -> list[tuple[str, str, str]]:
+        seen: set[str] = set()
+        resolved: list[tuple[str, str, str]] = []
+
+        for mention in self.extract_mentions_for_wake(raw_msg):
+            if isinstance(mention, dict):
+                username = str(mention.get("username") or "").strip()
+                if not username or username in seen:
+                    continue
+                mention_id = str(
+                    mention.get("_id") or mention.get("id") or username
+                ).strip()
+                display_name = str(mention.get("name") or username).strip() or username
+                resolved.append((username, mention_id, display_name))
+                seen.add(username)
+                continue
+
+            if isinstance(mention, str):
+                username = mention.lstrip("@").strip()
+                if not username or username in seen:
+                    continue
+                resolved.append((username, username, username))
+                seen.add(username)
+
+        return resolved
+
+    def _build_text_components(self, raw_msg: dict, text: str) -> list[Any]:
+        if not text:
+            return []
+
+        mentions = self._iter_textual_mentions(raw_msg)
+        if not mentions:
+            return [Plain(text=text)]
+
+        token_map = {
+            f"@{username}": (mention_id, display_name)
+            for username, mention_id, display_name in mentions
+        }
+        pattern = re.compile(
+            "("
+            + "|".join(
+                re.escape(token)
+                for token in sorted(token_map.keys(), key=len, reverse=True)
+            )
+            + ")"
+        )
+
+        chain: list[Any] = []
+        for part in pattern.split(text):
+            if not part or not part.strip():
+                continue
+            mention_meta = token_map.get(part)
+            if mention_meta:
+                mention_id, display_name = mention_meta
+                chain.append(At(qq=mention_id, name=display_name))
+            else:
+                chain.append(Plain(text=part))
+        return chain
+
+    def _build_plain_text(self, components: list[Any]) -> str:
+        plain_text = "".join(
+            comp.text for comp in components if isinstance(comp, Plain) and comp.text
+        )
+        return re.sub(r"\s+", " ", plain_text).strip()
+
+    def _classify_mentions(self, raw_msg: dict) -> tuple[bool, bool]:
+        bot_mentioned = False
+        has_other_user_mentions = False
+
+        for mention in self.extract_mentions_for_wake(raw_msg):
+            if isinstance(mention, str):
+                normalized = mention.lstrip("@").strip()
+                if normalized in {self.adapter.user_id, self.adapter.bot_username}:
+                    bot_mentioned = True
+                elif normalized:
+                    has_other_user_mentions = True
+                continue
+
+            if isinstance(mention, dict):
+                is_bot = (
+                    mention.get("_id") == self.adapter.user_id
+                    or mention.get("username") == self.adapter.bot_username
+                )
+                if is_bot:
+                    bot_mentioned = True
+                elif mention.get("_id") or mention.get("username") or mention.get("name"):
+                    has_other_user_mentions = True
+
+        return bot_mentioned, has_other_user_mentions
 
     async def _build_components_recursively(
         self,
@@ -153,7 +243,7 @@ class RocketChatInboundBridge:
 
         cleaned_msg_text = link_pattern.sub("", msg_text).strip()
         if cleaned_msg_text:
-            chain.append(Plain(text=cleaned_msg_text))
+            chain.extend(self._build_text_components(current_payload, cleaned_msg_text))
             if current_depth == 0:
                 logger.debug(f"[RocketChat][IN] 清理后文本: clean_text={cleaned_msg_text!r}")
 
@@ -199,7 +289,7 @@ class RocketChatInboundBridge:
                 return
 
             components = await self._build_components_recursively(raw_msg, seen_quote_ids=set())
-            msg_text = "".join([c.text for c in components if isinstance(c, Plain)]).strip()
+            msg_text = self._build_plain_text(components)
 
             if not msg_text and not [c for c in components if not isinstance(c, Plain)]:
                 logger.debug("[RocketChat][IN] skip empty/unsupported message")
@@ -232,39 +322,36 @@ class RocketChatInboundBridge:
             abm.timestamp = timestamp
             abm.group = Group(group_id=room_id) if msg_type == MessageType.GROUP_MESSAGE else None
 
-            bot_mentioned = False
-            mentions = self.extract_mentions_for_wake(raw_msg)
-            for mention in mentions:
-                if isinstance(mention, str):
-                    normalized = mention.lstrip("@")
-                    if normalized in {self.adapter.user_id, self.adapter.bot_username}:
-                        bot_mentioned = True
-                        break
-                if isinstance(mention, dict) and (
-                    mention.get("_id") == self.adapter.user_id
-                    or mention.get("username") == self.adapter.bot_username
-                ):
-                    bot_mentioned = True
-                    break
+            bot_mentioned, has_other_user_mentions = self._classify_mentions(raw_msg)
 
             if not bot_mentioned and self.adapter.bot_username:
                 bot_mentioned = f"@{self.adapter.bot_username}" in (abm.message_str or "")
+                has_other_user_mentions = bool(has_other_user_mentions or "@" in (abm.message_str or ""))
 
             if bot_mentioned:
-                bot_mentions = [f"@{self.adapter.bot_username} ", f"@{self.adapter.bot_username}"]
-                new_msg_text = ""
-                for comp in abm.message:
-                    if isinstance(comp, Plain):
-                        for bot_mention in bot_mentions:
-                            comp.text = comp.text.replace(bot_mention, "")
-                        new_msg_text += comp.text
-                abm.message_str = new_msg_text.strip()
                 logger.debug(f"[RocketChat][IN] bot mentioned, clean_text={abm.message_str!r}")
+
+            has_non_text_payload = any(
+                not isinstance(comp, (Plain, At)) for comp in abm.message
+            )
+            suppress_multi_mention_only_wake = (
+                msg_type == MessageType.GROUP_MESSAGE
+                and bot_mentioned
+                and has_other_user_mentions
+                and not abm.message_str
+                and not has_non_text_payload
+            )
+            if suppress_multi_mention_only_wake:
+                logger.debug(
+                    "[RocketChat][IN] suppress wake for multi-mention-only message "
+                    f"room={room_id!r} msg_id={abm.message_id!r}"
+                )
 
             is_thread_msg = bool(raw_msg.get("tmid"))
             should_quote = (
                 msg_type == MessageType.GROUP_MESSAGE
                 and bot_mentioned
+                and not suppress_multi_mention_only_wake
                 and not is_thread_msg
             )
 
@@ -284,11 +371,16 @@ class RocketChatInboundBridge:
                 adapter=self.adapter,
             )
 
-            if bot_mentioned or msg_type == MessageType.FRIEND_MESSAGE:
+            if (
+                (bot_mentioned and not suppress_multi_mention_only_wake)
+                or msg_type == MessageType.FRIEND_MESSAGE
+            ):
                 event.is_at_or_wake_command = True
 
             if (
-                msg_type == MessageType.GROUP_MESSAGE and bot_mentioned
+                msg_type == MessageType.GROUP_MESSAGE
+                and bot_mentioned
+                and not suppress_multi_mention_only_wake
             ) or msg_type == MessageType.FRIEND_MESSAGE:
                 event.start_typing_indicator()
 
