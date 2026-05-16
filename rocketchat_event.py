@@ -97,7 +97,7 @@ class RocketChatMessageEvent(AstrMessageEvent):
         if self._typing_started:
             self._typing_started = False
             try:
-                await self.adapter.send_typing(self.room_id, False)
+                await self.adapter.send_typing(self.room_id, False, tmid=self.thread_id)
             except Exception as exc:
                 logger.warning(f"[RocketChat][Event] stop typing failed: {exc!r}")
 
@@ -115,7 +115,7 @@ class RocketChatMessageEvent(AstrMessageEvent):
                 await asyncio.sleep(delay)
 
             # 发送 start typing
-            await self.adapter.send_typing(self.room_id, True)
+            await self.adapter.send_typing(self.room_id, True, tmid=self.thread_id)
             self._typing_started = True
             logger.debug(f"[RocketChat][Event] typing started room={self.room_id!r}")
 
@@ -142,7 +142,7 @@ class RocketChatMessageEvent(AstrMessageEvent):
                     )
                     break
 
-                await self.adapter.send_typing(self.room_id, True)
+                await self.adapter.send_typing(self.room_id, True, tmid=self.thread_id)
                 logger.debug(
                     "[RocketChat][Event] typing renewed room=%r interval=%ss",
                     self.room_id,
@@ -158,7 +158,7 @@ class RocketChatMessageEvent(AstrMessageEvent):
             if self._typing_started:
                 self._typing_started = False
                 try:
-                    await self.adapter.send_typing(self.room_id, False)
+                    await self.adapter.send_typing(self.room_id, False, tmid=self.thread_id)
                 except Exception as exc:
                     logger.warning(f"[RocketChat][Event] typing worker stop failed: {exc!r}")
             if self._typing_task is asyncio.current_task():

@@ -111,7 +111,12 @@ class RocketChatSenderBridge:
             e2e_mentions=e2e_mentions,
         )
 
-    async def send_typing(self, room_id: str, flag: bool) -> None:
+    async def send_typing(
+        self,
+        room_id: str,
+        flag: bool,
+        tmid: Optional[str] = None,
+    ) -> None:
         if not self.adapter._ws or self.adapter._ws.closed or not self.adapter.bot_username:
             logger.debug(
                 f"[RocketChat] typing 跳过: ws={self.adapter._ws is not None and not getattr(self.adapter._ws, 'closed', True)} "
@@ -120,26 +125,30 @@ class RocketChatSenderBridge:
             return
 
         try:
+            extras = {"tmid": tmid} if tmid else {}
+            params = [
+                f"{room_id}/user-activity",
+                self.adapter.bot_username,
+                ["user-typing"] if flag else [],
+                extras,
+            ]
             logger.debug(
-                f"[RocketChat] send typing room_id={room_id!r} user={self.adapter.bot_username!r} flag={flag}"
+                f"[RocketChat] send typing room_id={room_id!r} tmid={tmid!r} "
+                f"user={self.adapter.bot_username!r} flag={flag}"
             )
-            self.adapter._ddp_call_id += 1
-            await self.adapter._ws.send_json(
-                {
-                    "msg": "method",
-                    "method": "stream-notify-room",
-                    "id": f"typing-{self.adapter._ddp_call_id}",
-                    "params": [
-                        f"{room_id}/user-activity",
-                        self.adapter.bot_username,
-                        ["user-typing"] if flag else [],
-                        {},
-                    ],
-                }
+            result = await self.adapter._realtime.ddp_call(
+                "stream-notify-room",
+                params,
+                timeout=10.0,
+            )
+            logger.debug(
+                f"[RocketChat] typing method 调用成功 room_id={room_id!r} "
+                f"tmid={tmid!r} flag={flag} result={result}"
             )
         except Exception as exc:
             logger.warning(
-                f"[RocketChat] 发送 typing 状态失败 room_id={room_id!r} flag={flag}: {exc!r}"
+                f"[RocketChat] 发送 typing 状态失败 room_id={room_id!r} "
+                f"tmid={tmid!r} flag={flag}: {exc!r}"
             )
 
     async def send_with_quote(

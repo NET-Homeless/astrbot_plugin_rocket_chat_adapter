@@ -13,7 +13,7 @@
 - ✅ **实时消息接收** — 基于 WebSocket（DDP 协议）订阅频道、私有群组、私信消息
 - ✅ **消息发送** — 通过 REST API 发送文本、图片、语音、视频和普通文件
 - ✅ **E2EE 消息闭环** — 按 Rocket.Chat 官方 E2EE 协议收发加密私聊/私有群组的文本与媒体消息
-- ✅ **输入中提示** — 群聊/线程中 `@bot` 后支持延迟 typing；私聊也支持延迟 typing
+- ✅ **输入中提示** — 群聊/线程中 `@bot` 或回复 bot 消息后支持延迟 typing；私聊也支持延迟 typing
 - ✅ **自动重连** — WebSocket 断线后自动重连，无需人工干预
 - ✅ **动态订阅** — 机器人被加入新房间后自动订阅，无需重启
 - ✅ **全局管理员** — 与 AstrBot 核心权限系统无缝集成
@@ -125,8 +125,9 @@ git clone https://github.com/NET-Homeless/astrbot_plugin_rocket_chat_adapter
 
 ### 输入中提示（Typing）
 
-- **群聊 / 线程**：只有在 `@bot` 后才会启动延迟 typing
+- **群聊 / 线程**：在 `@bot` 或回复 bot 消息后启动延迟 typing
 - **私聊**：只要用户给 bot 账号发消息，就会启动延迟 typing
+- **线程支持**：线程内 typing 会通过 `extras.tmid` 归属到对应线程
 - **延迟控制**：默认延迟 `0.5s`，如果 bot 在延迟时间内已经完成回复，则不会显示 typing
 - **停止时机**：真正发送消息前会自动发送 `typing=false`
 
@@ -231,7 +232,7 @@ Rocket.Chat 房间收到回复
 | 出站普通文件 | 普通:`rooms.upload` / E2EE:`rooms.media + mediaConfirm` | `File` 组件发送 | ✅ 已实现 | 本地文件上传；远端 URL 退化为文本链接 |
 | 出站语音回复 | 普通:`rooms.upload` / E2EE:`rooms.media + mediaConfirm` | `Record` 组件发送 | ✅ 已实现 | 本地文件、HTTP(S)、Base64 均可上传；加密房间远程下载失败时降级为加密文本链接 |
 | 出站视频回复 | 普通:`rooms.upload` / E2EE:`rooms.media + mediaConfirm` | `Video` 组件发送 | ✅ 已实现 | 本地文件、HTTP(S) 均可上传；加密房间远程下载失败时降级为加密文本链接 |
-| 出站输入中状态 | `stream-notify-room` | typing 指示器 | ✅ 已实现 | 群聊/线程仅在 `@bot` 时启用；私聊也支持；受 `typing_indicator_delay` 控制 |
+| 出站输入中状态 | `stream-notify-room` | typing 指示器 | ✅ 已实现 | 群聊/线程在 `@bot` 或回复 bot 消息时启用；私聊也支持；受 `typing_indicator_delay` 控制 |
 | 系统/审计事件 | 加入/退出/改名/权限变化等 | 无统一映射 | ❌ 不支持 | 当前版本不建模为 AstrBot 事件 |
 | 交互状态事件 | 编辑、撤回、反应、已读、在线状态 | 无统一映射 | ❌ 不支持 | 输入中已实现，其余状态仍不在当前适配器范围 |
 | 其他富媒体语义 | 转发等 | 文本兜底或忽略 | ⚠️ 降级处理 | 非消息闭环基线的一部分 |

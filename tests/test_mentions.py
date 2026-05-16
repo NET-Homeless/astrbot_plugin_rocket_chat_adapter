@@ -76,7 +76,21 @@ def _would_astrbot_reply_wake(event: object) -> bool:
 
 class RocketChatMentionTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self) -> None:
-        rocketchat_event.RocketChatMessageEvent.start_typing_indicator = lambda self: None
+        original_start_typing_indicator = (
+            rocketchat_event.RocketChatMessageEvent.start_typing_indicator
+        )
+        self.addCleanup(
+            setattr,
+            rocketchat_event.RocketChatMessageEvent,
+            "start_typing_indicator",
+            original_start_typing_indicator,
+        )
+        self.started_typing_events: list = []
+
+        def record_typing_start(event: object) -> None:
+            self.started_typing_events.append(event)
+
+        rocketchat_event.RocketChatMessageEvent.start_typing_indicator = record_typing_start
         self.adapter = _DummyAdapter()
         self.bridge = RocketChatInboundBridge(self.adapter)
 
@@ -101,6 +115,7 @@ class RocketChatMentionTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(event.is_at_or_wake_command)
         self.assertEqual(event.message_str, "")
         self.assertTrue(all(isinstance(comp, At) for comp in event.message_obj.message))
+        self.assertEqual(self.started_typing_events, [])
 
     async def test_multi_mention_with_real_text_keeps_wake_and_strips_mentions(self) -> None:
         raw_msg = {
@@ -123,6 +138,7 @@ class RocketChatMentionTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(event.is_at_or_wake_command)
         self.assertEqual(event.message_str, "帮我看看")
         self.assertEqual(event.message_obj.type, MessageType.GROUP_MESSAGE)
+        self.assertEqual(self.started_typing_events, [event])
 
     async def test_quote_bot_image_and_mention_other_user_preserves_reply_wake(self) -> None:
         self.adapter._fetched_messages["bot-image"] = {
@@ -163,6 +179,7 @@ class RocketChatMentionTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(
             any(isinstance(comp, Reply) for comp in event.message_obj.message)
         )
+        self.assertEqual(self.started_typing_events, [event])
 
     async def test_quote_bot_image_and_mention_other_user_with_text_preserves_reply_wake(self) -> None:
         self.adapter._fetched_messages["bot-image"] = {
@@ -202,6 +219,7 @@ class RocketChatMentionTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(
             any(isinstance(comp, Reply) for comp in event.message_obj.message)
         )
+        self.assertEqual(self.started_typing_events, [event])
 
     async def test_quote_bot_image_without_bot_mention_preserves_reply_wake(self) -> None:
         self.adapter._fetched_messages["bot-image"] = {
@@ -239,6 +257,7 @@ class RocketChatMentionTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(
             any(isinstance(comp, Reply) for comp in event.message_obj.message)
         )
+        self.assertEqual(self.started_typing_events, [event])
 
     async def test_duplicate_quote_bot_image_delivery_is_processed_once(self) -> None:
         self.adapter._fetched_messages["bot-image"] = {
@@ -285,6 +304,7 @@ class RocketChatMentionTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(
             any(isinstance(comp, Reply) for comp in event.message_obj.message)
         )
+        self.assertEqual(self.started_typing_events, [event])
 
     async def test_empty_delivery_does_not_block_later_content_update(self) -> None:
         raw_msg = {
@@ -312,6 +332,7 @@ class RocketChatMentionTests(unittest.IsolatedAsyncioTestCase):
         event = self.adapter._committed_events[0]
         self.assertTrue(event.is_at_or_wake_command)
         self.assertEqual(event.message_str, "ping")
+        self.assertEqual(self.started_typing_events, [event])
 
     async def test_duplicate_ddp_delivery_is_processed_once(self) -> None:
         raw_msg = {
@@ -333,6 +354,7 @@ class RocketChatMentionTests(unittest.IsolatedAsyncioTestCase):
         event = self.adapter._committed_events[0]
         self.assertTrue(event.is_at_or_wake_command)
         self.assertEqual(event.message_str, "帮我看看")
+        self.assertEqual(self.started_typing_events, [event])
 
     async def test_duplicate_e2ee_delivery_is_processed_once(self) -> None:
         raw_msg = {
@@ -362,6 +384,7 @@ class RocketChatMentionTests(unittest.IsolatedAsyncioTestCase):
         event = self.adapter._committed_events[0]
         self.assertTrue(event.is_at_or_wake_command)
         self.assertEqual(event.message_str, "加密消息")
+        self.assertEqual(self.started_typing_events, [event])
 
 
 if __name__ == "__main__":

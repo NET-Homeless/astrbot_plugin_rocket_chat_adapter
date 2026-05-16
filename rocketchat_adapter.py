@@ -588,8 +588,13 @@ class RocketChatAdapter(Platform):
     ) -> None:
         await self._sender.send_text(room_id, text, tmid=tmid, mention_username=mention_username)
 
-    async def send_typing(self, room_id: str, flag: bool) -> None:
-        await self._sender.send_typing(room_id, flag)
+    async def send_typing(
+        self,
+        room_id: str,
+        flag: bool,
+        tmid: Optional[str] = None,
+    ) -> None:
+        await self._sender.send_typing(room_id, flag, tmid=tmid)
 
     async def send_with_quote(
         self,

@@ -153,6 +153,13 @@ class RocketChatInboundBridge:
         seen[message_id] = now
         return True
 
+    def _has_reply_to_self(self, components: list) -> bool:
+        return any(
+            isinstance(comp, Reply)
+            and str(getattr(comp, "sender_id", "")) == str(self.adapter.user_id)
+            for comp in components
+        )
+
     async def _build_components_recursively(
         self,
         current_payload: dict,
@@ -352,6 +359,7 @@ class RocketChatInboundBridge:
             abm.group = Group(group_id=room_id) if msg_type == MessageType.GROUP_MESSAGE else None
 
             bot_mentioned, has_other_user_mentions = self._classify_mentions(raw_msg)
+            reply_to_self = self._has_reply_to_self(components)
 
             if not bot_mentioned and self.adapter.bot_username:
                 bot_mentioned = f"@{self.adapter.bot_username}" in (abm.message_str or "")
@@ -401,21 +409,21 @@ class RocketChatInboundBridge:
                 adapter=self.adapter,
             )
 
-            if (
-                (bot_mentioned and not suppress_wake)
-                or msg_type == MessageType.FRIEND_MESSAGE
-            ):
-                event.is_at_or_wake_command = True
-
-            if (
-                msg_type == MessageType.GROUP_MESSAGE
-                and bot_mentioned
-                and not suppress_wake
-            ) or msg_type == MessageType.FRIEND_MESSAGE:
-                event.start_typing_indicator()
-
             if not self._claim_incoming_message(raw_msg):
                 return
+
+            explicit_wake = (
+                (bot_mentioned and not suppress_wake)
+                or msg_type == MessageType.FRIEND_MESSAGE
+            )
+            reply_wake = msg_type == MessageType.GROUP_MESSAGE and reply_to_self
+            should_wake_astrbot = explicit_wake or reply_wake
+            if explicit_wake:
+                event.is_at_or_wake_command = True
+
+            if should_wake_astrbot:
+                event.start_typing_indicator()
+
             logger.debug(
                 "[RocketChat][IN] → commit type=%s room=%r msg=%r wake=%s"
                 % (

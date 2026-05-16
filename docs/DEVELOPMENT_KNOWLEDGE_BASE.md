@@ -112,7 +112,7 @@ DDP 正常工作至少要走完这几步：
 ### 4.3 DDP 调试要看 method result
 
 像 typing 这种 `msg=method` 的调用，不能只看“我发出去了”，还要看服务端返回的 `result/error`。  
-本适配器里已经对 `typing-*` 结果做单独日志处理，后续新增 DDP method 也建议沿用这个思路。
+本适配器里 `send_typing()` 会通过统一 DDP call 等待 result，后续新增 DDP method 也建议沿用这个思路。
 
 ---
 
@@ -142,8 +142,9 @@ DDP 正常工作至少要走完这几步：
 - 使用 `roomId/user-activity`
 - 用户标识使用 bot 的 `username`
 - 第 3 个参数为 `["user-typing"]` 或空数组
-- 第 4 个参数补上 `{}`
+- 第 4 个参数为 `extras`；普通房间为 `{}`，线程 typing 必须带 `{"tmid": thread_id}`
 - typing 开始后每 5 秒续期一次，直到真正回复前发送 stop
+- 频道中除了显式 `@bot`，回复 bot 历史消息也会触发 AstrBot 回复，因此也应启动 typing
 
 当前实现位置：
 
@@ -158,7 +159,7 @@ DDP 正常工作至少要走完这几步：
 1. Bot 是否已通过 DDP `resume` 登录成功
 2. 房间 ID 是否正确
 3. `send_typing()` 的 method result 是否有 `error`
-4. payload 是否包含 `roomId/user-activity`、`username`、`["user-typing"]`、`{}`
+4. payload 是否包含 `roomId/user-activity`、`username`、`["user-typing"]`、`extras`
 5. 房间内其他用户客户端是否开启 typing indicator
 6. Rocket.Chat 服务端是否对这类 method 做了限流或权限限制
 
