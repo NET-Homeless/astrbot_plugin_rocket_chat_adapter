@@ -256,6 +256,15 @@ E2EE 下文本和媒体必须分开看：
 
 优先扩 `rocketchat_media.py`，不要在 `event.py` 里复制一份上传分支。
 
+### 7.5 普通房间上传接口兼容
+
+Rocket.Chat 官方已将 `rooms.upload/:rid` 在 6.10.0 标为 deprecated，并在 8.0.0 移除。普通未加密房间上传也应优先使用：
+
+1. `POST /api/v1/rooms.media/{rid}` 上传文件，拿到 `file._id`
+2. `POST /api/v1/rooms.mediaConfirm/{rid}/{fileId}` 确认并生成消息
+
+7.13.3 已支持这套新接口；为兼容更老服务端，只在 `rooms.media` / `rooms.mediaConfirm` 明确不可用时回退旧 `rooms.upload/{rid}`，不要在普通错误（权限、文件类型、大小限制）时回退，避免掩盖真实失败原因。
+
 ---
 
 ## 8. 回复与引用语义

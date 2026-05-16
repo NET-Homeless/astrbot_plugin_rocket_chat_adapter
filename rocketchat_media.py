@@ -19,6 +19,7 @@ class RocketChatMediaBridge:
 
     def __init__(self, adapter: Any) -> None:
         self.adapter = adapter
+        self._plain_upload_force_legacy = False
 
     def classify_file_kind(self, file_obj: dict) -> str:
         candidates: List[str] = []
@@ -446,22 +447,76 @@ class RocketChatMediaBridge:
         url: str,
         form: aiohttp.FormData,
     ) -> Optional[dict[str, Any]]:
+        status, data = await self.post_multipart_json_response(url, form)
+        if data and data.get("success", bool(status is not None and status < 400)):
+            return data
+        return None
+
+    async def post_multipart_json_response(
+        self,
+        url: str,
+        form: aiohttp.FormData,
+    ) -> tuple[int | None, Optional[dict[str, Any]]]:
         headers = {
             "X-Auth-Token": self.adapter.auth_token,
             "X-User-Id": self.adapter.user_id,
         }
         try:
             async with self.adapter._http_session.post(url, data=form, headers=headers) as resp:
-                data = await resp.json(content_type=None)
+                try:
+                    data = await resp.json(content_type=None)
+                except Exception:
+                    text = await resp.text()
+                    data = {"success": False, "error": text}
                 if resp.status >= 400 or not data.get("success", resp.status < 400):
                     logger.error(f"[RocketChat] 上传请求失败: status={resp.status} data={data}")
-                    return None
-                return data
+                    return resp.status, None if data is None else data
+                return resp.status, data
         except Exception as exc:
             logger.error(f"[RocketChat] 上传请求异常: {exc!r}")
-            return None
+            return None, None
 
-    async def upload_plain_file(
+    async def post_json_response(
+        self,
+        url: str,
+        payload: dict[str, Any],
+    ) -> tuple[int | None, Optional[dict[str, Any]]]:
+        try:
+            async with self.adapter._http_session.post(
+                url,
+                json=payload,
+                headers=self.adapter._auth_headers(),
+            ) as resp:
+                try:
+                    data = await resp.json(content_type=None)
+                except Exception:
+                    text = await resp.text()
+                    data = {"success": False, "error": text}
+                if resp.status >= 400 or not data.get("success", resp.status < 400):
+                    logger.error(f"[RocketChat] JSON 请求失败: status={resp.status} data={data}")
+                    return resp.status, data
+                return resp.status, data
+        except Exception as exc:
+            logger.error(f"[RocketChat] JSON 请求异常: {exc!r}")
+            return None, None
+
+    def _is_endpoint_unavailable(
+        self,
+        status: int | None,
+        data: Optional[dict[str, Any]],
+    ) -> bool:
+        if status in {404, 405}:
+            return True
+        if not isinstance(data, dict):
+            return False
+        detail = " ".join(
+            str(data.get(key, ""))
+            for key in ("error", "errorType", "message")
+            if data.get(key)
+        ).lower()
+        return "endpoint" in detail and "not" in detail and "found" in detail
+
+    async def upload_legacy_plain_file(
         self,
         room_id: str,
         file_path: str,
@@ -479,6 +534,85 @@ class RocketChatMediaBridge:
             if tmid:
                 form.add_field("tmid", tmid)
             return bool(await self.post_multipart_json(url, form))
+
+    async def upload_plain_file(
+        self,
+        room_id: str,
+        file_path: str,
+        resolved_name: str,
+        description: str = "",
+        tmid: Optional[str] = None,
+    ) -> bool:
+        if self._plain_upload_force_legacy:
+            return await self.upload_legacy_plain_file(
+                room_id,
+                file_path,
+                resolved_name,
+                description=description,
+                tmid=tmid,
+            )
+
+        media_url = f"{self.adapter.server_url}/api/v1/rooms.media/{room_id}"
+        with open(file_path, "rb") as fp:
+            form = aiohttp.FormData()
+            content_type = self.infer_upload_content_type(file_path, resolved_name)
+            form.add_field("file", fp, filename=resolved_name, content_type=content_type)
+            upload_status, upload_resp = await self.post_multipart_json_response(media_url, form)
+
+        upload_ok = bool(
+            upload_resp
+            and upload_resp.get("success", bool(upload_status is not None and upload_status < 400))
+        )
+        if not upload_ok:
+            if self._is_endpoint_unavailable(upload_status, upload_resp):
+                self._plain_upload_force_legacy = True
+                logger.warning(
+                    "[RocketChat] rooms.media 不可用，回退到旧 rooms.upload 上传接口"
+                )
+                return await self.upload_legacy_plain_file(
+                    room_id,
+                    file_path,
+                    resolved_name,
+                    description=description,
+                    tmid=tmid,
+                )
+            return False
+
+        uploaded_file = upload_resp.get("file") or {}
+        file_id = uploaded_file.get("_id")
+        if not file_id:
+            logger.error(f"[RocketChat] rooms.media 响应缺少文件 ID: {upload_resp}")
+            return False
+
+        confirm_payload: dict[str, Any] = {}
+        if description:
+            confirm_payload["description"] = description
+        if tmid:
+            confirm_payload["tmid"] = tmid
+        confirm_status, confirm_resp = await self.post_json_response(
+            f"{self.adapter.server_url}/api/v1/rooms.mediaConfirm/{room_id}/{file_id}",
+            confirm_payload,
+        )
+        confirm_ok = bool(
+            confirm_resp
+            and confirm_resp.get("success", bool(confirm_status is not None and confirm_status < 400))
+        )
+        if confirm_ok:
+            return True
+
+        if self._is_endpoint_unavailable(confirm_status, confirm_resp):
+            self._plain_upload_force_legacy = True
+            logger.warning(
+                "[RocketChat] rooms.mediaConfirm 不可用，回退到旧 rooms.upload 上传接口"
+            )
+            return await self.upload_legacy_plain_file(
+                room_id,
+                file_path,
+                resolved_name,
+                description=description,
+                tmid=tmid,
+            )
+        return False
 
     async def upload_encrypted_file(
         self,

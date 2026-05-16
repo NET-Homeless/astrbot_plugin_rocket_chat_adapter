@@ -30,7 +30,7 @@
 | Python | >= 3.10 |
 | AstrBot | >= 4.0 |
 | aiohttp | >= 3.9 |
-| Rocket.Chat Server | >= 5.0（推荐 6.x）|
+| Rocket.Chat Server | >= 5.0（兼容 7.x / 8.x，推荐使用官方维护版本）|
 
 ---
 
@@ -162,7 +162,7 @@ AstrBot 框架
             │     └── 主动 send_by_session 消息链分发
             │
             ├── RocketChatMediaBridge           ← rocketchat_media.py
-            │     ├── 普通房间 rooms.upload
+            │     ├── 普通房间 rooms.media + mediaConfirm（旧版回退 rooms.upload）
             │     ├── E2EE 房间 rooms.media + mediaConfirm
             │     ├── 媒体下载 / 临时文件 / Base64 解码
             │     └── 加密房间远程媒体 fallback
@@ -228,10 +228,10 @@ Rocket.Chat 房间收到回复
 | 入站视频消息 | `files` / `file` 中视频附件 | `Video` 组件 | ✅ 已实现 | 基于 MIME / 文件名 / URL 严格识别 |
 | 房间订阅变更 | `stream-notify-user`（被加入新房间） | 动态订阅房间消息流 | ✅ 已实现 | 无需重启插件 |
 | 出站文本回复 | 普通:`chat.postMessage` / E2EE:`chat.sendMessage` | `event.send` / `send_by_session` | ✅ 已实现 | 支持线程 `tmid` 和 Markdown 原生引用 |
-| 出站图片回复 | 普通:`rooms.upload` / E2EE:`rooms.media + mediaConfirm` | `Image` 组件发送 | ✅ 已实现 | 统一转本地上传避免防盗链；加密房间远程下载失败时降级为加密文本链接 |
-| 出站普通文件 | 普通:`rooms.upload` / E2EE:`rooms.media + mediaConfirm` | `File` 组件发送 | ✅ 已实现 | 本地文件上传；远端 URL 退化为文本链接 |
-| 出站语音回复 | 普通:`rooms.upload` / E2EE:`rooms.media + mediaConfirm` | `Record` 组件发送 | ✅ 已实现 | 本地文件、HTTP(S)、Base64 均可上传；加密房间远程下载失败时降级为加密文本链接 |
-| 出站视频回复 | 普通:`rooms.upload` / E2EE:`rooms.media + mediaConfirm` | `Video` 组件发送 | ✅ 已实现 | 本地文件、HTTP(S) 均可上传；加密房间远程下载失败时降级为加密文本链接 |
+| 出站图片回复 | 普通:`rooms.media + mediaConfirm` / E2EE:`rooms.media + mediaConfirm` | `Image` 组件发送 | ✅ 已实现 | 普通房间新接口优先，旧版服务端缺失时回退 `rooms.upload`；加密房间远程下载失败时降级为加密文本链接 |
+| 出站普通文件 | 普通:`rooms.media + mediaConfirm` / E2EE:`rooms.media + mediaConfirm` | `File` 组件发送 | ✅ 已实现 | 本地文件上传；远端 URL 退化为文本链接 |
+| 出站语音回复 | 普通:`rooms.media + mediaConfirm` / E2EE:`rooms.media + mediaConfirm` | `Record` 组件发送 | ✅ 已实现 | 本地文件、HTTP(S)、Base64 均可上传；加密房间远程下载失败时降级为加密文本链接 |
+| 出站视频回复 | 普通:`rooms.media + mediaConfirm` / E2EE:`rooms.media + mediaConfirm` | `Video` 组件发送 | ✅ 已实现 | 本地文件、HTTP(S) 均可上传；加密房间远程下载失败时降级为加密文本链接 |
 | 出站输入中状态 | `stream-notify-room` | typing 指示器 | ✅ 已实现 | 群聊/线程在 `@bot` 或回复 bot 消息时启用；私聊也支持；受 `typing_indicator_delay` 控制 |
 | 系统/审计事件 | 加入/退出/改名/权限变化等 | 无统一映射 | ❌ 不支持 | 当前版本不建模为 AstrBot 事件 |
 | 交互状态事件 | 编辑、撤回、反应、已读、在线状态 | 无统一映射 | ❌ 不支持 | 输入中已实现，其余状态仍不在当前适配器范围 |
