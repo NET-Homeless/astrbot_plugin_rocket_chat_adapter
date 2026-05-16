@@ -16,6 +16,8 @@ from .rocketchat_event import RocketChatMessageEvent
 class RocketChatInboundBridge:
     def __init__(self, adapter: Any) -> None:
         self.adapter = adapter
+        self._processed_message_ttl_seconds = 10 * 60
+        self._processed_message_cache_limit = 4096
 
     def extract_mentions_for_wake(self, raw_msg: dict) -> list[Any]:
         mentions = raw_msg.get("mentions")
@@ -123,6 +125,33 @@ class RocketChatInboundBridge:
                     has_other_user_mentions = True
 
         return bot_mentioned, has_other_user_mentions
+
+    def _claim_incoming_message(self, raw_msg: dict) -> bool:
+        message_id = str(raw_msg.get("_id") or "").strip()
+        if not message_id:
+            return True
+
+        seen = getattr(self.adapter, "_processed_message_ids", None)
+        if not isinstance(seen, dict):
+            return True
+
+        now = time.time()
+        expires_before = now - self._processed_message_ttl_seconds
+        if len(seen) > self._processed_message_cache_limit:
+            for cached_id, timestamp in list(seen.items()):
+                if timestamp < expires_before:
+                    seen.pop(cached_id, None)
+            while len(seen) > self._processed_message_cache_limit:
+                seen.pop(next(iter(seen)), None)
+
+        if message_id in seen:
+            logger.debug(
+                f"[RocketChat][IN] skip duplicate message msg_id={message_id!r}"
+            )
+            return False
+
+        seen[message_id] = now
+        return True
 
     async def _build_components_recursively(
         self,
@@ -331,17 +360,18 @@ class RocketChatInboundBridge:
             if bot_mentioned:
                 logger.debug(f"[RocketChat][IN] bot mentioned, clean_text={abm.message_str!r}")
 
-            has_non_text_payload = any(
-                not isinstance(comp, (Plain, At)) for comp in abm.message
+            has_current_non_text_payload = any(
+                not isinstance(comp, (Plain, At, Reply)) for comp in abm.message
             )
             suppress_multi_mention_only_wake = (
                 msg_type == MessageType.GROUP_MESSAGE
                 and bot_mentioned
                 and has_other_user_mentions
                 and not abm.message_str
-                and not has_non_text_payload
+                and not has_current_non_text_payload
             )
-            if suppress_multi_mention_only_wake:
+            suppress_wake = suppress_multi_mention_only_wake
+            if suppress_wake:
                 logger.debug(
                     "[RocketChat][IN] suppress wake for multi-mention-only message "
                     f"room={room_id!r} msg_id={abm.message_id!r}"
@@ -351,7 +381,7 @@ class RocketChatInboundBridge:
             should_quote = (
                 msg_type == MessageType.GROUP_MESSAGE
                 and bot_mentioned
-                and not suppress_multi_mention_only_wake
+                and not suppress_wake
                 and not is_thread_msg
             )
 
@@ -372,7 +402,7 @@ class RocketChatInboundBridge:
             )
 
             if (
-                (bot_mentioned and not suppress_multi_mention_only_wake)
+                (bot_mentioned and not suppress_wake)
                 or msg_type == MessageType.FRIEND_MESSAGE
             ):
                 event.is_at_or_wake_command = True
@@ -380,10 +410,12 @@ class RocketChatInboundBridge:
             if (
                 msg_type == MessageType.GROUP_MESSAGE
                 and bot_mentioned
-                and not suppress_multi_mention_only_wake
+                and not suppress_wake
             ) or msg_type == MessageType.FRIEND_MESSAGE:
                 event.start_typing_indicator()
 
+            if not self._claim_incoming_message(raw_msg):
+                return
             logger.debug(
                 "[RocketChat][IN] → commit type=%s room=%r msg=%r wake=%s"
                 % (

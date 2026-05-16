@@ -174,6 +174,9 @@ class RocketChatAdapter(Platform):
         self._background_tasks: set[asyncio.Task] = set()
         # 并发处理控制，防止瞬间过多消息导致处理积压
         self._message_semaphore = asyncio.Semaphore(100)
+        # 已处理入站消息 ID 缓存，防止 Rocket.Chat message updated / link preview
+        # 等重复 DDP 推送导致同一条消息触发多次回复。
+        self._processed_message_ids: Dict[str, float] = {}
 
         self._meta = PlatformMetadata(
             name="rocket_chat",
