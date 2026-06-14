@@ -25,6 +25,9 @@
 - [rocketchat_event.py](/D:/Workspace/astrbot_plugin_rocket_chat_adapter/rocketchat_event.py)
   - AstrBot 事件对象
   - 负责把 `MessageChain` 组件拆成文本、图片、文件、语音、视频，并调用 adapter/media 发出
+- [rocketchat_components.py](/D:/Workspace/astrbot_plugin_rocket_chat_adapter/rocketchat_components.py)
+  - 出站非核心消息组件渲染层
+  - 负责把 `Nodes` / `Node` / `Forward` 等 Rocket.Chat 无原生类型的组件转成可读 Markdown 文本
 - [rocketchat_e2ee.py](/D:/Workspace/astrbot_plugin_rocket_chat_adapter/rocketchat_e2ee.py)
   - Rocket.Chat E2EE 协议实现
   - 负责客户端密钥、房间密钥、文本加解密、加密媒体消息体构造
@@ -40,6 +43,7 @@
 - 文本、引用、typing、消息链分发放 `sender`
 - E2EE 协议细节放 `e2ee`
 - 组件拆解与发送顺序放 `event`
+- 非核心组件的可读文本渲染放 `components`
 - 上传、下载、媒体 fallback 放 `media`
 
 ---
@@ -244,7 +248,19 @@ E2EE 下文本和媒体必须分开看：
 
 `File` 的远端 URL 当前继续按文本链接发送，不强行做远端拉取上传。这个行为简单、稳、可预期，除非后面业务明确要求，不建议把它改成复杂分支。
 
-### 7.4 媒体逻辑尽量收口到 `rocketchat_media.py`
+### 7.4 转发等非核心组件展示策略
+
+Rocket.Chat 没有 QQ 合并转发的原生消息类型。出站 `Nodes` / `Node` / `Forward` 应在 `rocketchat_components.py` 中转成可读 Markdown 文本：
+
+- `Nodes` 展示合并转发标题、节点数量、每个节点的昵称/uin 和文本内容
+- `Node` 展示单个转发节点
+- 只有 `Forward.id` 而没有节点内容时，展示“合并转发消息”和转发 ID
+- 转发节点里的图片、文件、语音、视频先以 `[图片]` / `[文件: name]` 等文本占位展示
+- E2EE 房间沿用同一套渲染结果，再作为普通文本进入 `build_send_message()` 加密发送
+
+不要把未知组件直接 `str(comp)` 发到 Rocket.Chat；Pydantic/dataclass 默认字符串会泄漏 `type=xxx` 之类内部表示，用户不可读。
+
+### 7.5 媒体逻辑尽量收口到 `rocketchat_media.py`
 
 如果后续再加：
 
@@ -256,7 +272,7 @@ E2EE 下文本和媒体必须分开看：
 
 优先扩 `rocketchat_media.py`，不要在 `event.py` 里复制一份上传分支。
 
-### 7.5 普通房间上传接口兼容
+### 7.6 普通房间上传接口兼容
 
 Rocket.Chat 官方已将 `rooms.upload/:rid` 在 6.10.0 标为 deprecated，并在 8.0.0 移除。普通未加密房间上传也应优先使用：
 

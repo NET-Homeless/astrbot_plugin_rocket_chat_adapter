@@ -6,6 +6,8 @@ from astrbot.api import logger
 from astrbot.api.event import MessageChain
 from astrbot.api.message_components import File, Image, Plain, Record, Reply, Video
 
+from .rocketchat_components import append_rendered_component, render_message_chain_text
+
 
 class RocketChatSenderBridge:
     def __init__(self, adapter: Any) -> None:
@@ -269,7 +271,11 @@ class RocketChatSenderBridge:
         tmid: Optional[str] = None,
     ) -> None:
         reply_comp = next((c for c in message_chain.chain if isinstance(c, Reply)), None)
-        full_text = "".join([c.text for c in message_chain.chain if isinstance(c, Plain)]).strip()
+        full_text = render_message_chain_text(
+            message_chain,
+            plain_type=Plain,
+            reply_type=Reply,
+        )
 
         reply_sent = False
         if reply_comp:
@@ -288,52 +294,55 @@ class RocketChatSenderBridge:
             for comp in message_chain.chain:
                 if isinstance(comp, Plain):
                     text_parts.append(comp.text)
+
                 elif isinstance(comp, (Image, File, Record, Video)):
                     if text_parts:
                         await self.send_text(room_id, "".join(text_parts), tmid)
                         text_parts.clear()
 
-                if isinstance(comp, Image):
-                    file_ref: str = comp.file or ""
-                    if file_ref.startswith("http"):
-                        await self.send_image_url(room_id, file_ref, tmid=tmid)
-                    else:
-                        local_path = file_ref.replace("file:///", "").replace("file://", "")
-                        if local_path:
-                            await self.send_image_file(room_id, local_path, tmid=tmid)
+                    if isinstance(comp, Image):
+                        file_ref: str = comp.file or ""
+                        if file_ref.startswith("http"):
+                            await self.send_image_url(room_id, file_ref, tmid=tmid)
+                        else:
+                            local_path = file_ref.replace("file:///", "").replace("file://", "")
+                            if local_path:
+                                await self.send_image_file(room_id, local_path, tmid=tmid)
 
-                elif isinstance(comp, File):
-                    file_ref = comp.file or getattr(comp, "url", None) or ""
-                    if file_ref.startswith("http://") or file_ref.startswith("https://"):
-                        await self.send_text(
-                            room_id,
-                            f"{comp.name}: {file_ref}" if getattr(comp, "name", None) else file_ref,
-                            tmid,
-                        )
-                    else:
-                        local_path = file_ref.replace("file:///", "").replace("file://", "")
-                        if local_path:
-                            await self.send_file(
+                    elif isinstance(comp, File):
+                        file_ref = comp.file or getattr(comp, "url", None) or ""
+                        if file_ref.startswith("http://") or file_ref.startswith("https://"):
+                            await self.send_text(
                                 room_id,
-                                local_path,
-                                filename=getattr(comp, "name", None),
-                                tmid=tmid,
+                                f"{comp.name}: {file_ref}" if getattr(comp, "name", None) else file_ref,
+                                tmid,
                             )
+                        else:
+                            local_path = file_ref.replace("file:///", "").replace("file://", "")
+                            if local_path:
+                                await self.send_file(
+                                    room_id,
+                                    local_path,
+                                    filename=getattr(comp, "name", None),
+                                    tmid=tmid,
+                                )
 
-                elif isinstance(comp, (Record, Video)):
-                    file_ref = comp.file or getattr(comp, "url", None) or ""
-                    suffix = ".mp4" if isinstance(comp, Video) else ".ogg"
-                    media_path, cleanup = await self.resolve_outbound_media_path(file_ref, suffix)
-                    if media_path:
-                        try:
-                            await self.send_file(room_id, media_path, tmid=tmid)
-                        finally:
-                            if cleanup:
-                                cleanup()
+                    elif isinstance(comp, (Record, Video)):
+                        file_ref = comp.file or getattr(comp, "url", None) or ""
+                        suffix = ".mp4" if isinstance(comp, Video) else ".ogg"
+                        media_path, cleanup = await self.resolve_outbound_media_path(file_ref, suffix)
+                        if media_path:
+                            try:
+                                await self.send_file(room_id, media_path, tmid=tmid)
+                            finally:
+                                if cleanup:
+                                    cleanup()
+
+                elif isinstance(comp, Reply):
+                    pass
+
                 else:
-                    fallback = str(comp)
-                    if fallback:
-                        text_parts.append(fallback)
+                    append_rendered_component(text_parts, comp)
 
             if text_parts:
                 await self.send_text(room_id, "".join(text_parts), tmid)

@@ -108,7 +108,27 @@ def install_astrbot_stubs() -> None:
         time: int = 0
         message_str: str = ""
 
-    for cls in (Plain, At, AtAll, Image, Record, Video, File, Reply):
+    @dataclass
+    class Forward:
+        id: str = ""
+        type: str = field(init=False, default="Forward")
+
+    @dataclass
+    class Node:
+        content: list = field(default_factory=list)
+        id: int = 0
+        name: str = ""
+        uin: str = "0"
+        seq: str | list | None = ""
+        time: int = 0
+        type: str = field(init=False, default="Node")
+
+    @dataclass
+    class Nodes:
+        nodes: list = field(default_factory=list)
+        type: str = field(init=False, default="Nodes")
+
+    for cls in (Plain, At, AtAll, Image, Record, Video, File, Reply, Forward, Node, Nodes):
         setattr(message_components_mod, cls.__name__, cls)
 
     event_mod = types.ModuleType("astrbot.api.event")
@@ -193,4 +213,3 @@ def install_astrbot_stubs() -> None:
     sys.modules["astrbot.api.message_components"] = message_components_mod
     sys.modules["astrbot.api.event"] = event_mod
     sys.modules["astrbot.api.platform"] = platform_mod
-

@@ -19,6 +19,8 @@ from astrbot.api.message_components import (
 )
 from astrbot.api.platform import AstrBotMessage, PlatformMetadata
 
+from .rocketchat_components import append_rendered_component
+
 if TYPE_CHECKING:
     from .rocketchat_adapter import RocketChatAdapter
 
@@ -229,10 +231,7 @@ class RocketChatMessageEvent(AstrMessageEvent):
                     pass
 
                 else:
-                    # 其他组件（Forward 等）暂时转文本兜底
-                    fallback = str(comp)
-                    if fallback:
-                        text_parts.append(fallback)
+                    append_rendered_component(text_parts, comp)
 
             # 发送剩余文本
             remaining_text = "".join(text_parts).strip()
