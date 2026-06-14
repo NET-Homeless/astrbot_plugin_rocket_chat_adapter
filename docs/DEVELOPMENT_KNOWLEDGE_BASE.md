@@ -8,30 +8,30 @@
 
 当前仓库的职责划分已经比较清晰，后续扩展尽量沿用，不要再把逻辑揉回 `rocketchat_adapter.py` 单文件。
 
-- [main.py](/D:/Workspace/astrbot_plugin_rocket_chat_adapter/main.py)
+- [main.py](../main.py)
   - AstrBot 插件入口，只负责注册平台
-- [rocketchat_adapter.py](/D:/Workspace/astrbot_plugin_rocket_chat_adapter/rocketchat_adapter.py)
+- [rocketchat_adapter.py](../rocketchat_adapter.py)
   - 平台主适配器
   - 负责配置读取、缓存、生命周期、REST 辅助方法和各 bridge 编排
-- [rocketchat_realtime.py](/D:/Workspace/astrbot_plugin_rocket_chat_adapter/rocketchat_realtime.py)
+- [rocketchat_realtime.py](../rocketchat_realtime.py)
   - DDP / WebSocket 桥接层
   - 负责 connect、resume login、房间订阅、动态订阅、DDP result 分发
-- [rocketchat_inbound.py](/D:/Workspace/astrbot_plugin_rocket_chat_adapter/rocketchat_inbound.py)
+- [rocketchat_inbound.py](../rocketchat_inbound.py)
   - 入站消息桥接层
   - 负责消息解密后的归一化、引用递归、mention 唤醒判断、AstrBot 事件组装
-- [rocketchat_sender.py](/D:/Workspace/astrbot_plugin_rocket_chat_adapter/rocketchat_sender.py)
+- [rocketchat_sender.py](../rocketchat_sender.py)
   - 出站发送桥接层
   - 负责文本、引用、typing、`send_by_session` 的消息链分发
-- [rocketchat_event.py](/D:/Workspace/astrbot_plugin_rocket_chat_adapter/rocketchat_event.py)
+- [rocketchat_event.py](../rocketchat_event.py)
   - AstrBot 事件对象
   - 负责把 `MessageChain` 组件拆成文本、图片、文件、语音、视频，并调用 adapter/media 发出
-- [rocketchat_components.py](/D:/Workspace/astrbot_plugin_rocket_chat_adapter/rocketchat_components.py)
+- [rocketchat_components.py](../rocketchat_components.py)
   - 出站非核心消息组件渲染层
   - 负责把 `Nodes` / `Node` / `Forward` 等 Rocket.Chat 无原生类型的组件转成可读 Markdown 文本
-- [rocketchat_e2ee.py](/D:/Workspace/astrbot_plugin_rocket_chat_adapter/rocketchat_e2ee.py)
+- [rocketchat_e2ee.py](../rocketchat_e2ee.py)
   - Rocket.Chat E2EE 协议实现
   - 负责客户端密钥、房间密钥、文本加解密、加密媒体消息体构造
-- [rocketchat_media.py](/D:/Workspace/astrbot_plugin_rocket_chat_adapter/rocketchat_media.py)
+- [rocketchat_media.py](../rocketchat_media.py)
   - 普通房间与加密房间的媒体上传桥接层
   - 负责本地文件上传、远端媒体下载、本地临时文件管理、加密房间媒体 fallback
 
@@ -152,9 +152,9 @@ DDP 正常工作至少要走完这几步：
 
 当前实现位置：
 
-- [rocketchat_realtime.py](/D:/Workspace/astrbot_plugin_rocket_chat_adapter/rocketchat_realtime.py)
-- [rocketchat_sender.py](/D:/Workspace/astrbot_plugin_rocket_chat_adapter/rocketchat_sender.py)
-- [rocketchat_event.py](/D:/Workspace/astrbot_plugin_rocket_chat_adapter/rocketchat_event.py)
+- [rocketchat_realtime.py](../rocketchat_realtime.py)
+- [rocketchat_sender.py](../rocketchat_sender.py)
+- [rocketchat_event.py](../rocketchat_event.py)
 
 ### 5.3 Typing 不显示时先查什么
 
@@ -305,7 +305,7 @@ Rocket.Chat 官方已将 `rooms.upload/:rid` 在 6.10.0 标为 deprecated，并�
 
 以后每次改功能，至少同步检查这几处：
 
-- [README.md](/D:/Workspace/astrbot_plugin_rocket_chat_adapter/README.md) 的功能特性
+- [README.md](../README.md) 的功能特性
 - E2EE 支持边界
 - 事件支持矩阵
 - 已知限制

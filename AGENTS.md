@@ -11,7 +11,7 @@ Work should preserve three core guarantees:
 
 Detailed implementation notes live in:
 
-- [docs/DEVELOPMENT_KNOWLEDGE_BASE.md](/D:/Workspace/astrbot_plugin_rocket_chat_adapter/docs/DEVELOPMENT_KNOWLEDGE_BASE.md)
+- [docs/DEVELOPMENT_KNOWLEDGE_BASE.md](docs/DEVELOPMENT_KNOWLEDGE_BASE.md)
 
 ## Source Of Truth
 
