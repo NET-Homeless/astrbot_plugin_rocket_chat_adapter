@@ -351,3 +351,81 @@ Rocket.Chat 官方已将 `rooms.upload/:rid` 在 6.10.0 标为 deprecated，并�
 3. 最后才参考第三方帖子或模型回答
 
 这样最省时间，也最不容易被过期资料带偏。
+
+---
+
+## 12. AstrBot 框架约束已验证结论
+
+以下结论基于 OrbStack Docker 容器中的 AstrBot 源码验证，非猜测。源码路径：`<orbstack-containers>/astrbot/AstrBot/astrbot/core/platform/`（含 `platform.py`、`manager.py`、`sources/` 等）。
+
+### 12.1 平台配置校验方式
+
+AstrBot 没有独立的配置校验 hook。所有校验直接在 `Platform.__init__` 中通过 `raise ValueError` 完成。
+
+官方适配器示例：
+
+- Slack: `if not self.bot_token: raise ValueError("Slack bot_token 是必需的")`
+- Mattermost: `if not self.base_url: raise ValueError("Mattermost URL 是必需的")`
+- LINE: `if not channel_access_token or not channel_secret: raise ValueError(...)`
+
+本适配器的 `_validate_config()` 沿用同一模式。
+
+### 12.2 初始化异常处理
+
+`PlatformManager.initialize()` 对每个平台执行：
+
+```python
+try:
+    await self.load_platform(platform)
+except Exception as e:
+    logger.error(f"初始化 {platform} 平台适配器失败: {e}")
+```
+
+即：`__init__` 抛 `ValueError` 时，该适配器不会被加载，但其他平台正常启动，不会级联失败。
+
+### 12.3 `send_by_session` 约定
+
+`Platform.send_by_session()` 基类实现只上报统计指标（`Metric.upload`）。每个具体适配器必须 override 并在末尾调用 `await super().send_by_session(session, message_chain)`，否则框架统计会缺失。
+
+本适配器 `rocketchat_adapter.py` 的 `send_by_session()` 已遵守此约定。
+
+### 12.4 Platform 构造函数签名
+
+基类 `Platform.__init__(config, event_queue)` 接受 2 个参数。但实际适配器统一使用 3 参数签名 `(platform_config, platform_settings, event_queue)`，因为 `PlatformManager.load_platform()` 以 3 个位置参数实例化：
+
+```python
+cls_type(platform_config, self.settings, self.event_queue)
+```
+
+---
+
+## 13. Rocket.Chat REST API 合规性验证
+
+以下结论基于 [developer.rocket.chat](https://developer.rocket.chat) 官方文档和官方 Web 客户端源码交叉验证。
+
+### 13.1 认证方式
+
+登录后拿到 `authToken` 和 `userId`，后续 REST 请求通过 `X-Auth-Token` + `X-User-Id` Header 传递。本适配器的 `_get_auth_headers()` 实现正确。
+
+### 13.2 已验证端点
+
+| 端点 | 方法 | 查询参数 | 响应格式 | 状态 |
+|---|---|---|---|---|
+| `/api/v1/subscriptions.get` | GET | `updatedSince`（可选） | `{ success, update: [...], remove: [...] }` | 合规 |
+| `/api/v1/rooms.info` | GET | `roomId`（必填） | `{ success, room: {...} }` | 合规 |
+| `/api/v1/chat.getMessage` | GET | `msgId`（必填） | `{ success, message: {...} }` | 合规 |
+| `/api/v1/rooms.media/{rid}` | POST | — | `{ success, file: { _id, url } }` | 合规 |
+| `/api/v1/rooms.mediaConfirm/{rid}/{fileId}` | POST | — | `{ success, message: {...} }` | 合规 |
+
+### 13.3 Typing 指示器 (DDP Realtime)
+
+官方 Web 客户端源码 (`apps/meteor/app/ui/client/lib/UserAction.ts`) 确认：
+
+- 使用 `stream-notify-room` method
+- 事件路径: `{roomId}/user-activity`
+- 用户标识: `shownName(getUser())`（即 username）
+- 活动类型: typing 时为 `["user-typing"]`，停止时为 `[]`
+- 第四个参数 `extras`: 普通房间 `{}`，线程消息 `{"tmid": threadId}`
+- 续期间隔: `RENEW = TIMEOUT / 3 = 15000 / 3 = 5000ms`（每 5 秒续期一次）
+
+本适配器 `rocketchat_sender.py` 的 `send_typing()` 实现与以上完全对齐。

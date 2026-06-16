@@ -67,6 +67,19 @@ When adding logic:
 - `stream-notify-room` payload must include the fourth `extras` argument
 - Typing is not one-shot: renew while the bot is still generating a reply
 
+## Configuration Validation
+
+- `_validate_config()` runs inside `__init__` and raises `ValueError` on invalid config.
+- This matches the AstrBot framework convention: Slack, Mattermost, and LINE built-in adapters all validate config the same way.
+- `PlatformManager.initialize()` catches the exception, logs it, and skips the adapter — other platforms are unaffected.
+- When adding new config items, validate them in `_validate_config()` rather than failing at runtime.
+
+## REST Authentication
+
+- `_get_auth_headers()` returns `X-Auth-Token` / `X-User-Id` only when both credentials are present; returns `{}` otherwise. All REST calls must use this method — never construct auth headers inline.
+- `_is_own_server_url()` compares `scheme + netloc` (not string prefix) to decide whether a URL belongs to the configured server. Always use it before attaching credentials to a URL.
+- Do not attach auth query parameters to URLs that do not belong to the bot's own server.
+
 ## AstrBot-Specific Rules
 
 - `enable_e2ee` must remain a boolean config item
