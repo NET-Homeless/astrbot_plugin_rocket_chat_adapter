@@ -107,7 +107,7 @@ class RocketChatRealtimeBridge:
             room_name = sub.get("name") or sub.get("fname")
             if room_name:
                 self.adapter._room_name_cache[room_id] = room_name
-            self.adapter._cache_room_info(
+            await self.adapter._cache_room_info(
                 {
                     "_id": room_id,
                     "t": room_type or "c",
@@ -232,7 +232,7 @@ class RocketChatRealtimeBridge:
         if room_id and event_name.endswith("/rooms-changed"):
             room_type = room_payload.get("t")
             if isinstance(room_type, str) and room_type:
-                self.adapter._cache_room_info(
+                await self.adapter._cache_room_info(
                     {
                         "_id": room_id,
                         "t": room_type,

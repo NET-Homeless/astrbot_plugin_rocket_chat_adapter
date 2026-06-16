@@ -99,14 +99,29 @@ class RocketChatMediaBridge:
         )
 
     async def download_remote_bytes(self, url: str) -> Optional[bytes]:
+        """
+        下载远程媒体字节数据。
+
+        对于 Rocket.Chat 服务器的 URL，自动添加认证 Header。
+
+        Args:
+            url: 媒体 URL
+
+        Returns:
+            下载的字节数据，失败返回 None
+        """
         parsed = urlparse(url)
         if parsed.scheme not in {"http", "https"}:
             logger.warning(f"[RocketChat] 拒绝下载不支持的媒体协议: {url}")
             return None
 
+        # 指向本服务器的媒体需要带上认证 Header；外部链接不带
+        headers = self.adapter._get_auth_headers() if self.adapter._is_own_server_url(url) else {}
+
         try:
             async with self.adapter._http_session.get(
                 url,
+                headers=headers,
                 timeout=aiohttp.ClientTimeout(total=30, connect=10),
                 allow_redirects=True,
                 max_redirects=3,
@@ -457,10 +472,7 @@ class RocketChatMediaBridge:
         url: str,
         form: aiohttp.FormData,
     ) -> tuple[int | None, Optional[dict[str, Any]]]:
-        headers = {
-            "X-Auth-Token": self.adapter.auth_token,
-            "X-User-Id": self.adapter.user_id,
-        }
+        headers = self.adapter._get_auth_headers()
         try:
             async with self.adapter._http_session.post(url, data=form, headers=headers) as resp:
                 try:
@@ -485,7 +497,7 @@ class RocketChatMediaBridge:
             async with self.adapter._http_session.post(
                 url,
                 json=payload,
-                headers=self.adapter._auth_headers(),
+                headers=self.adapter._get_auth_headers(),
             ) as resp:
                 try:
                     data = await resp.json(content_type=None)

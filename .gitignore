@@ -210,3 +210,4 @@ __marimo__/
 .omc/
 .tmp_*/
 .claude/
+.alma-snapshots

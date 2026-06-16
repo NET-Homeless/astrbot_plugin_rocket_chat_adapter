@@ -750,7 +750,7 @@ class RocketChatE2EEManager:
         for attempt, delay in enumerate((0.5, 1.0, 1.0, 2.0, 2.0), start=1):
             await asyncio.sleep(delay)
             room_info = await self.adapter._get_room_info(room_id, refresh=True)
-            self.adapter._cache_room_info(room_info)
+            await self.adapter._cache_room_info(room_info)
             subscription = await self._get_subscription(room_id, refresh=True)
             imported = await self._load_room_key_from_subscription(
                 room_id,
@@ -785,7 +785,7 @@ class RocketChatE2EEManager:
         )
         await self._maybe_share_room_key(room_id, session_key)
         room_info = await self.adapter._get_room_info(room_id, refresh=True)
-        self.adapter._cache_room_info(room_info)
+        await self.adapter._cache_room_info(room_info)
         logger.info(f"[RocketChat][E2EE] 已创建房间密钥 room_id={room_id!r} key_id={key_id}")
         return session_key
 
@@ -957,7 +957,7 @@ class RocketChatE2EEManager:
         async with self.adapter._http_session.get(
             url,
             params=params,
-            headers=self.adapter._auth_headers(),
+            headers=self.adapter._get_auth_headers(),
         ) as resp:
             data = await resp.json()
         if not data.get("success"):
@@ -969,7 +969,7 @@ class RocketChatE2EEManager:
         async with self.adapter._http_session.post(
             url,
             json=payload,
-            headers=self.adapter._auth_headers(),
+            headers=self.adapter._get_auth_headers(),
         ) as resp:
             data = await resp.json()
         if not data.get("success"):

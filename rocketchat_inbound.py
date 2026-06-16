@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import re
 import time
@@ -18,6 +19,8 @@ class RocketChatInboundBridge:
         self.adapter = adapter
         self._processed_message_ttl_seconds = 10 * 60
         self._processed_message_cache_limit = 4096
+        # 消息去重锁，防止并发处理导致重复消息
+        self._dedup_lock: Optional[asyncio.Lock] = None
 
     def extract_mentions_for_wake(self, raw_msg: dict) -> list[Any]:
         mentions = raw_msg.get("mentions")
@@ -126,7 +129,18 @@ class RocketChatInboundBridge:
 
         return bot_mentioned, has_other_user_mentions
 
-    def _claim_incoming_message(self, raw_msg: dict) -> bool:
+    async def _claim_incoming_message(self, raw_msg: dict) -> bool:
+        """
+        检查并标记消息为已处理，防止重复处理。
+
+        使用 asyncio.Lock 保护临界区，避免并发竞态条件导致同一消息被处理多次。
+
+        Args:
+            raw_msg: 原始消息字典
+
+        Returns:
+            True 表示这是新消息，应该处理；False 表示重复消息，应该跳过
+        """
         message_id = str(raw_msg.get("_id") or "").strip()
         if not message_id:
             return True
@@ -135,23 +149,33 @@ class RocketChatInboundBridge:
         if not isinstance(seen, dict):
             return True
 
-        now = time.time()
-        expires_before = now - self._processed_message_ttl_seconds
-        if len(seen) > self._processed_message_cache_limit:
-            for cached_id, timestamp in list(seen.items()):
-                if timestamp < expires_before:
-                    seen.pop(cached_id, None)
-            while len(seen) > self._processed_message_cache_limit:
-                seen.pop(next(iter(seen)), None)
+        # 延迟初始化锁（在事件循环中）
+        if self._dedup_lock is None:
+            self._dedup_lock = asyncio.Lock()
 
-        if message_id in seen:
-            logger.debug(
-                f"[RocketChat][IN] skip duplicate message msg_id={message_id!r}"
-            )
-            return False
+        # 使用锁保护整个 check-then-set 操作，确保原子性
+        async with self._dedup_lock:
+            now = time.time()
+            expires_before = now - self._processed_message_ttl_seconds
 
-        seen[message_id] = now
-        return True
+            # 清理过期条目（仅在超过限制时）
+            if len(seen) > self._processed_message_cache_limit:
+                for cached_id, timestamp in list(seen.items()):
+                    if timestamp < expires_before:
+                        seen.pop(cached_id, None)
+                while len(seen) > self._processed_message_cache_limit:
+                    seen.pop(next(iter(seen)), None)
+
+            # 检查是否已处理
+            if message_id in seen:
+                logger.debug(
+                    f"[RocketChat][IN] skip duplicate message msg_id={message_id!r}"
+                )
+                return False
+
+            # 标记为已处理
+            seen[message_id] = now
+            return True
 
     def _has_reply_to_self(self, components: list) -> bool:
         return any(
@@ -409,7 +433,7 @@ class RocketChatInboundBridge:
                 adapter=self.adapter,
             )
 
-            if not self._claim_incoming_message(raw_msg):
+            if not await self._claim_incoming_message(raw_msg):
                 return
 
             explicit_wake = (

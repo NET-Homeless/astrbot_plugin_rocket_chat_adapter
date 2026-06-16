@@ -1,4 +1,4 @@
 # Rocket.Chat 适配器依赖
 # AstrBot 本身已内置 aiohttp，此处声明以确保版本兼容
-aiohttp>=3.9.0
-cryptography>=42.0.0
+aiohttp>=3.9.0,<4.0.0
+cryptography>=42.0.0,<44.0.0

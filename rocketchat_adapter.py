@@ -13,6 +13,7 @@ from __future__ import annotations
 import asyncio
 from asyncio import Queue
 from typing import Any, Callable, Dict, List, Optional
+from urllib.parse import urlparse
 
 import aiohttp
 from astrbot.api import logger
@@ -146,6 +147,9 @@ class RocketChatAdapter(Platform):
         self.enable_e2ee: bool = _coerce_bool(platform_config.get("enable_e2ee", False))
         self.e2ee_password: str = str(platform_config.get("e2ee_password", ""))
 
+        # 配置验证
+        self._validate_config()
+
         # 运行时状态
         self.auth_token: Optional[str] = None
         self.user_id: Optional[str] = None
@@ -164,6 +168,8 @@ class RocketChatAdapter(Platform):
         self._room_name_cache: Dict[str, str] = {}
         # 房间完整信息缓存（类型/名称/加密状态/e2eKeyId）
         self._room_info_cache: Dict[str, dict] = {}
+        # 房间信息缓存锁，防止并发更新导致数据覆盖丢失
+        self._room_cache_locks: Dict[str, asyncio.Lock] = {}
         # 已订阅房间集合，防止重复订阅导致消息被多次处理
         self._subscribed_rooms: set = set()
         # DDP method 调用 ID 计数器，确保每次调用 ID 唯一
@@ -193,6 +199,46 @@ class RocketChatAdapter(Platform):
         self._media = RocketChatMediaBridge(self)
         self._realtime = RocketChatRealtimeBridge(self)
         self._sender = RocketChatSenderBridge(self)
+
+    def _validate_config(self) -> None:
+        """
+        验证配置项的有效性，在初始化时立即报错而非运行时失败。
+
+        Raises:
+            ValueError: 配置项无效时抛出异常
+        """
+        if not self.username:
+            raise ValueError(
+                "[RocketChat] 配置项 'username' 不能为空。"
+                "请在 AstrBot 配置中设置 Rocket.Chat 用户名。"
+            )
+
+        if not self.password:
+            raise ValueError(
+                "[RocketChat] 配置项 'password' 不能为空。"
+                "请在 AstrBot 配置中设置 Rocket.Chat 密码。"
+            )
+
+        if self.enable_e2ee and not self.e2ee_password:
+            raise ValueError(
+                "[RocketChat] 启用 E2EE (enable_e2ee=true) 时必须提供 'e2ee_password'。"
+                "E2EE 密码用于加密/解密私钥，请在 Rocket.Chat 网页端设置后填入配置。"
+            )
+
+        if self.reconnect_delay < 0:
+            raise ValueError(
+                f"[RocketChat] 配置项 'reconnect_delay' 必须为非负数，当前值: {self.reconnect_delay}"
+            )
+
+        if self.typing_indicator_delay < 0:
+            raise ValueError(
+                f"[RocketChat] 配置项 'typing_indicator_delay' 必须为非负数，当前值: {self.typing_indicator_delay}"
+            )
+
+        if self.remote_media_max_size <= 0:
+            raise ValueError(
+                f"[RocketChat] 配置项 'remote_media_max_size' 必须为正数，当前值: {self.remote_media_max_size}"
+            )
 
     # ------------------------------------------------------------------ #
     #  Platform 抽象方法实现                                                #
@@ -322,18 +368,10 @@ class RocketChatAdapter(Platform):
             f"[RocketChat] 登录成功 | 用户: {self.bot_username} | userId: {self.user_id}"
         )
 
-    def _auth_headers(self) -> dict:
-        """构造认证请求头。"""
-        return {
-            "X-Auth-Token": self.auth_token,
-            "X-User-Id": self.user_id,
-            "Content-Type": "application/json",
-        }
-
     async def _get_subscriptions(self) -> List[dict]:
         """获取机器人所有订阅的房间列表。"""
         url = f"{self.server_url}/api/v1/subscriptions.get"
-        async with self._http_session.get(url, headers=self._auth_headers()) as resp:
+        async with self._http_session.get(url, headers=self._get_auth_headers()) as resp:
             data = await resp.json()
         subscriptions = data.get("update", []) if data.get("success") else []
         for sub in subscriptions:
@@ -342,7 +380,7 @@ class RocketChatAdapter(Platform):
             room_id = sub.get("rid")
             if not room_id:
                 continue
-            self._cache_room_info(
+            await self._cache_room_info(
                 {
                     "_id": room_id,
                     "t": sub.get("t", self._room_type_cache.get(room_id, "c")),
@@ -354,20 +392,35 @@ class RocketChatAdapter(Platform):
             )
         return subscriptions
 
-    def _cache_room_info(self, room: dict) -> None:
+    async def _cache_room_info(self, room: dict) -> None:
+        """
+        缓存房间信息，使用房间级别的锁防止并发更新导致数据丢失。
+
+        使用独立的锁保护每个房间的缓存更新，避免不同房间之间互相阻塞。
+
+        Args:
+            room: 房间信息字典
+        """
         room_id = room.get("_id")
         if not room_id:
             return
-        cached = dict(self._room_info_cache.get(room_id, {}))
-        cached.update(room)
-        self._room_info_cache[room_id] = cached
 
-        room_type = cached.get("t")
-        if room_type:
-            self._room_type_cache[room_id] = room_type
-        room_name = cached.get("name") or cached.get("fname")
-        if room_name:
-            self._room_name_cache[room_id] = room_name
+        # 获取或创建房间级别的锁
+        if room_id not in self._room_cache_locks:
+            self._room_cache_locks[room_id] = asyncio.Lock()
+
+        # 使用锁保护整个读-合并-写操作
+        async with self._room_cache_locks[room_id]:
+            cached = dict(self._room_info_cache.get(room_id, {}))
+            cached.update(room)
+            self._room_info_cache[room_id] = cached
+
+            room_type = cached.get("t")
+            if room_type:
+                self._room_type_cache[room_id] = room_type
+            room_name = cached.get("name") or cached.get("fname")
+            if room_name:
+                self._room_name_cache[room_id] = room_name
 
     async def _get_room_info(self, room_id: str, refresh: bool = False) -> dict:
         if not refresh and room_id in self._room_info_cache:
@@ -379,7 +432,7 @@ class RocketChatAdapter(Platform):
         )
         try:
             async with self._http_session.get(
-                url, headers=self._auth_headers()
+                url, headers=self._get_auth_headers()
             ) as resp:
                 data = await resp.json()
             logger.debug(
@@ -387,13 +440,13 @@ class RocketChatAdapter(Platform):
             )
             if data.get("success"):
                 room = data.get("room", {}) or {}
-                self._cache_room_info(room)
+                await self._cache_room_info(room)
                 return self._room_info_cache.get(room_id, room)
         except Exception as exc:
             logger.warning(f"[RocketChat] 获取房间信息失败 room_id={room_id}: {exc}")
 
         fallback = self._room_info_cache.get(room_id, {"_id": room_id, "t": "c", "encrypted": False})
-        self._cache_room_info(fallback)
+        await self._cache_room_info(fallback)
         return fallback
 
     async def _get_room_type(self, room_id: str) -> str:
@@ -433,7 +486,7 @@ class RocketChatAdapter(Platform):
         """通过 API 获取指定消息详情。"""
         url = f"{self.server_url}/api/v1/chat.getMessage?msgId={msg_id}"
         try:
-            async with self._http_session.get(url, headers=self._auth_headers()) as resp:
+            async with self._http_session.get(url, headers=self._get_auth_headers()) as resp:
                 data = await resp.json()
                 if data.get("success"):
                     message = data.get("message")
@@ -504,7 +557,14 @@ class RocketChatAdapter(Platform):
         return await self._realtime.ddp_call(method, params=params, timeout=timeout)
 
     async def _normalize_media_url(self, media_url: str) -> str:
-        """将 Rocket.Chat 返回的相对媒体地址补全为绝对 URL，并加上认证参数。"""
+        """
+        将 Rocket.Chat 返回的相对媒体地址补全为绝对 URL，并加上认证参数。
+
+        注意:
+        - 媒体 URL 中保留认证参数是为了支持浏览器直接访问和客户端展示
+        - 程序下载时应同时使用 _get_auth_headers() 获取 Header（更安全）
+        - 这是双重认证策略：Header 用于程序，URL 参数用于浏览器
+        """
         url = media_url
         if not (url.startswith("http://") or url.startswith("https://")):
             if url.startswith("/"):
@@ -513,13 +573,50 @@ class RocketChatAdapter(Platform):
                 url = f"{self.server_url}/{url}"
 
         # 仅对指向自身服务器的链接附加认证 query 参数
-        if url.startswith(self.server_url) and self.user_id and self.auth_token:
+        if self.user_id and self.auth_token and self._is_own_server_url(url):
             # 避免重复附加
             if "rc_uid=" not in url and "rc_token=" not in url:
                 delimiter = "&" if "?" in url else "?"
                 url = f"{url}{delimiter}rc_uid={self.user_id}&rc_token={self.auth_token}"
 
         return url
+
+    def _is_own_server_url(self, url: str) -> bool:
+        """
+        判断给定 URL 是否指向当前配置的 Rocket.Chat 服务器。
+
+        通过比较 scheme + netloc（而非裸字符串前缀）判定，避免
+        ``http://host`` 与 ``http://hostname`` 这类前缀重叠导致的误判，
+        也防止外部链接碰巧以 server_url 开头而被错误地附加认证信息。
+
+        Args:
+            url: 待检测的绝对 URL
+
+        Returns:
+            True 表示该 URL 指向本服务器
+        """
+        own = urlparse(self.server_url)
+        target = urlparse(url)
+        return (
+            own.scheme == target.scheme
+            and own.netloc == target.netloc
+        )
+
+    def _get_auth_headers(self) -> dict:
+        """
+        获取 Rocket.Chat REST API 认证 Header。
+
+        仅在已登录（持有 userId 与 authToken）时返回有效头；未登录时返回
+        空字典，避免向请求里塞入 ``X-Auth-Token: None`` 这类无效值。
+
+        参考: https://developer.rocket.chat/apidocs/authentication-api
+        """
+        if self.user_id and self.auth_token:
+            return {
+                "X-Auth-Token": self.auth_token,
+                "X-User-Id": self.user_id,
+            }
+        return {}
 
     def _classify_file_kind(self, file_obj: dict) -> str:
         return self._media.classify_file_kind(file_obj)

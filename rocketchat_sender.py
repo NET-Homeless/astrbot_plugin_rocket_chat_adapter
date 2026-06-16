@@ -18,7 +18,7 @@ class RocketChatSenderBridge:
             async with self.adapter._http_session.post(
                 url,
                 json=payload,
-                headers=self.adapter._auth_headers(),
+                headers=self.adapter._get_auth_headers(),
             ) as resp:
                 data = await resp.json()
                 if not data.get("success"):
