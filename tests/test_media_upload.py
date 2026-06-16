@@ -19,11 +19,10 @@ class _DummyAdapter:
     auth_token = "token"
     user_id = "user-id"
 
-    def _auth_headers(self) -> dict[str, str]:
+    def _get_auth_headers(self) -> dict[str, str]:
         return {
             "X-Auth-Token": self.auth_token,
             "X-User-Id": self.user_id,
-            "Content-Type": "application/json",
         }
 
 

@@ -207,6 +207,12 @@ class RocketChatAdapter(Platform):
         Raises:
             ValueError: 配置项无效时抛出异常
         """
+        if not self.server_url:
+            raise ValueError(
+                "[RocketChat] 配置项 'server_url' 不能为空。"
+                "请在 AstrBot 配置中设置 Rocket.Chat 服务器地址（如 http://localhost:3000）。"
+            )
+
         if not self.username:
             raise ValueError(
                 "[RocketChat] 配置项 'username' 不能为空。"
@@ -405,12 +411,11 @@ class RocketChatAdapter(Platform):
         if not room_id:
             return
 
-        # 获取或创建房间级别的锁
-        if room_id not in self._room_cache_locks:
-            self._room_cache_locks[room_id] = asyncio.Lock()
+        # 获取或创建房间级别的锁（setdefault 保证原子性）
+        lock = self._room_cache_locks.setdefault(room_id, asyncio.Lock())
 
         # 使用锁保护整个读-合并-写操作
-        async with self._room_cache_locks[room_id]:
+        async with lock:
             cached = dict(self._room_info_cache.get(room_id, {}))
             cached.update(room)
             self._room_info_cache[room_id] = cached

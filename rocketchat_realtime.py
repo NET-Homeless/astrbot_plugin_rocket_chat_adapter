@@ -21,6 +21,14 @@ class RocketChatRealtimeBridge:
 
         self.adapter._subscribed_rooms.clear()
 
+        # 重连时清理房间缓存，防止长期运行导致缓存无限增长。
+        # 断线期间房间状态可能已变化（改名/删除/权限变更），
+        # 缓存会在下方 _get_subscriptions() 和 _cache_room_info() 中重建。
+        self.adapter._room_info_cache.clear()
+        self.adapter._room_type_cache.clear()
+        self.adapter._room_name_cache.clear()
+        self.adapter._room_cache_locks.clear()
+
         async with self.adapter._http_session.ws_connect(
             ws_url,
             heartbeat=30.0,

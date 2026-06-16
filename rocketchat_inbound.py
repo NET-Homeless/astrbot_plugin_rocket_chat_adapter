@@ -152,9 +152,10 @@ class RocketChatInboundBridge:
         # 延迟初始化锁（在事件循环中）
         if self._dedup_lock is None:
             self._dedup_lock = asyncio.Lock()
+        lock = self._dedup_lock
 
         # 使用锁保护整个 check-then-set 操作，确保原子性
-        async with self._dedup_lock:
+        async with lock:
             now = time.time()
             expires_before = now - self._processed_message_ttl_seconds
 
@@ -355,6 +356,12 @@ class RocketChatInboundBridge:
                 logger.debug("[RocketChat][IN] skip empty/unsupported message")
                 return
 
+            # 去重检查放在 empty check 之后：空消息（如 link preview 尚未生成的
+            # 首次投递）不应标记为已处理，否则后续同 ID 的内容更新会被误判为重复。
+            # 但放在 event 构造之前，避免重复消息触发无谓的 mention 分类和事件组装。
+            if not await self._claim_incoming_message(raw_msg):
+                return
+
             room_id: str = raw_msg.get("rid", "")
             sender_id: str = raw_msg.get("u", {}).get("_id", "")
             sender_username: str = raw_msg.get("u", {}).get("username", "")
@@ -432,9 +439,6 @@ class RocketChatInboundBridge:
                 quote_original=should_quote,
                 adapter=self.adapter,
             )
-
-            if not await self._claim_incoming_message(raw_msg):
-                return
 
             explicit_wake = (
                 (bot_mentioned and not suppress_wake)
