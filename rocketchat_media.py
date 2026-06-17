@@ -626,6 +626,62 @@ class RocketChatMediaBridge:
             )
         return False
 
+    async def upload_file_for_attachment(
+        self,
+        room_id: str,
+        file_path: str,
+        resolved_name: str,
+    ) -> Optional[dict[str, Any]]:
+        """
+        上传文件到 rooms.media，但 **不调用** rooms.mediaConfirm。
+
+        用于图文合并发送场景：先上传文件拿到 file_id / file_url，
+        再由调用方通过 chat.postMessage 把文字和图片附件放在同一条消息里发送。
+
+        Returns:
+            成功时返回 ``{"file_id", "file_url", "file_name", "content_type", "file_size"}``；
+            失败或 rooms.media 不可用时返回 ``None``（调用方应回退到逐条发送）。
+        """
+        if self._plain_upload_force_legacy:
+            return None
+
+        media_url = f"{self.adapter.server_url}/api/v1/rooms.media/{room_id}"
+        content_type = self.infer_upload_content_type(file_path, resolved_name)
+        file_size = os.path.getsize(file_path)
+
+        with open(file_path, "rb") as fp:
+            form = aiohttp.FormData()
+            form.add_field("file", fp, filename=resolved_name, content_type=content_type)
+            upload_status, upload_resp = await self.post_multipart_json_response(media_url, form)
+
+        upload_ok = bool(
+            upload_resp
+            and upload_resp.get("success", bool(upload_status is not None and upload_status < 400))
+        )
+        if not upload_ok:
+            if self._is_endpoint_unavailable(upload_status, upload_resp):
+                self._plain_upload_force_legacy = True
+                logger.warning(
+                    "[RocketChat] rooms.media 不可用，图文合并上传已禁用"
+                )
+            return None
+
+        uploaded_file = upload_resp.get("file") or {}
+        file_id = uploaded_file.get("_id")
+        if not file_id:
+            logger.error(f"[RocketChat] rooms.media 响应缺少文件 ID: {upload_resp}")
+            return None
+
+        file_url = uploaded_file.get("url") or f"/file-upload/{file_id}/{resolved_name}"
+
+        return {
+            "file_id": file_id,
+            "file_url": file_url,
+            "file_name": resolved_name,
+            "content_type": content_type,
+            "file_size": file_size,
+        }
+
     async def upload_encrypted_file(
         self,
         room_id: str,

@@ -211,3 +211,4 @@ __marimo__/
 .tmp_*/
 .claude/
 .alma-snapshots
+.DS_Store

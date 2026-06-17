@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import os
-from typing import Callable, TYPE_CHECKING
+from typing import Any, Callable, TYPE_CHECKING
 from urllib.parse import urlparse
 
 from astrbot.api import logger
@@ -179,6 +179,13 @@ class RocketChatMessageEvent(AstrMessageEvent):
         - 线程 @mention          → 在同一线程里回复（thread_id 已设置）
         - 私信                   → 直接回复（无 tmid，无引用）
 
+        图文合并（保序）：
+        - 普通房间中，仅当文本出现在 Image 之前时才会合并为单条消息
+          （文字放 msg，图片通过 attachments 挂载），与官方客户端行为一致。
+        - 如果 Image 出现在文本之前，为了保持原始视觉顺序，图片单独发送。
+        - E2EE 房间保持逐条发送行为（加密附件格式不同）。
+        - File / Record / Video 组件始终独立发送。
+
         注意：必须在末尾调用 await super().send(message)，
               框架依赖该调用更新内部发送状态与统计指标。
         """
@@ -190,7 +197,14 @@ class RocketChatMessageEvent(AstrMessageEvent):
         )
         await self.stop_typing_indicator()
 
+        # E2EE 房间保持现有逐条发送行为
+        room_info = await self.adapter._get_room_info(self.room_id)
+        is_e2ee = bool(room_info.get("encrypted") and room_info.get("t") in {"d", "p"})
+
         text_parts: list[str] = []
+        pending_images: list[Image] = []
+        # 标记当前段是否在图片之前就已经有文本（决定能否合并）
+        text_before_image = False
 
         try:
             for comp in message.chain:
@@ -201,23 +215,37 @@ class RocketChatMessageEvent(AstrMessageEvent):
                     text_parts.append("@all ")
 
                 elif isinstance(comp, At):
-                    # Rocket.Chat 支持 @username 格式的提及
-                    # AstrBot At 组件可能使用 name 或 qq 字段存储用户标识
                     mention_name = (
                         getattr(comp, "name", None) or getattr(comp, "qq", None) or ""
                     )
                     if mention_name:
                         text_parts.append(f"@{mention_name} ")
 
-                elif isinstance(comp, (Image, File, Record, Video)):
-                    combined = "".join(text_parts).strip()
-                    if combined:
-                        await self._flush_text(combined)
-                        text_parts.clear()
-
-                    if isinstance(comp, Image):
+                elif isinstance(comp, Image):
+                    if is_e2ee:
+                        # E2EE: 先发文本，再单独发图片
+                        await self._flush_group(
+                            text_parts, pending_images, text_before_image,
+                        )
+                        text_before_image = False
                         await self._send_image_component(comp)
-                    elif isinstance(comp, File):
+                    else:
+                        # 首次遇到图片时，检查前面是否有文本
+                        if not pending_images and not text_parts:
+                            pass  # 空段，直接加入
+                        elif not pending_images:
+                            # 第一张图片，记录之前是否有文本
+                            text_before_image = bool("".join(text_parts).strip())
+                        pending_images.append(comp)
+
+                elif isinstance(comp, (File, Record, Video)):
+                    # 非图片媒体：先 flush 当前段，再单独发送
+                    await self._flush_group(
+                        text_parts, pending_images, text_before_image,
+                    )
+                    text_before_image = False
+
+                    if isinstance(comp, File):
                         await self._send_file_component(comp)
                     elif isinstance(comp, Record):
                         await self._send_record_component(comp)
@@ -233,15 +261,140 @@ class RocketChatMessageEvent(AstrMessageEvent):
                 else:
                     append_rendered_component(text_parts, comp)
 
-            # 发送剩余文本
-            remaining_text = "".join(text_parts).strip()
-            if remaining_text:
-                await self._flush_text(remaining_text)
+            # 发送剩余内容
+            await self._flush_group(text_parts, pending_images, text_before_image)
 
             # ⚠️ 必须调用父类 send，框架在此更新发送状态 & 上报 Metric
             await super().send(message)
         finally:
             await self.stop_typing_indicator()
+
+    async def _flush_group(
+        self,
+        text_parts: list[str],
+        pending_images: list[Image],
+        text_before_image: bool,
+    ) -> None:
+        """
+        Flush 当前段的内容，保持原始顺序。
+
+        - 文本在前 + 图片在后 → 合并为一条消息（RC 渲染文本在附件之上，顺序一致）
+        - 图片在前（text_before_image=False）→ 图片单独发送以保持顺序，
+          文本随后单独发送
+        - 纯文本 / 纯图片 → 按类型发送
+        """
+        text = "".join(text_parts).strip()
+
+        if pending_images:
+            if text_before_image and text:
+                # 文本出现在图片之前 → 安全合并
+                await self._send_combined(text, list(pending_images))
+            else:
+                # 图片在前或没有文本 → 图片单独发送以保持顺序
+                for img in pending_images:
+                    await self._send_image_component(img)
+                if text:
+                    await self._flush_text(text)
+        elif text:
+            await self._flush_text(text)
+
+        text_parts.clear()
+        pending_images.clear()
+
+    async def _send_combined(
+        self, text: str, images: list[Image],
+    ) -> None:
+        """
+        将文本与图片合并为一条 Rocket.Chat 消息发送。
+
+        文字放在 msg 字段，每张图片通过 rooms.media 上传后以 attachment 挂载。
+        如果引用回复（quote_original）激活，第一段文本先走引用回复，图片随后单独发送。
+        """
+        if not text and not images:
+            return
+
+        # 引用回复场景：文本先走引用，图片作为独立消息发送
+        if self.quote_original and text:
+            await self._flush_text(text)
+            for img in images:
+                await self._send_image_component(img)
+            return
+
+        # 消费 reply mention username（首次发送时附加 @username）
+        mention_username = await self._consume_reply_mention_username()
+        final_text = text
+        if mention_username and final_text:
+            final_text = f"@{mention_username} {final_text}"
+
+        # 上传图片，收集 attachment 元数据
+        attachments: list[dict[str, Any]] = []
+        cleanups: list[Callable[[], None]] = []
+
+        try:
+            for img in images:
+                file_ref: str = img.file or ""
+                if not file_ref:
+                    continue
+
+                local_path: str | None = None
+                cleanup: Callable[[], None] | None = None
+
+                if file_ref.startswith("http://") or file_ref.startswith("https://"):
+                    local_path, cleanup = await self.adapter._download_remote_media(
+                        file_ref, ".png"
+                    )
+                else:
+                    local_path, cleanup = await self._resolve_uploadable_path(
+                        file_ref, default_suffix=".png"
+                    )
+
+                if cleanup:
+                    cleanups.append(cleanup)
+                if not local_path:
+                    continue
+
+                resolved_name = self._guess_filename(file_ref, local_path, "image.png")
+                info = await self.adapter._media.upload_file_for_attachment(
+                    self.room_id, local_path, resolved_name,
+                )
+                if info:
+                    att: dict[str, Any] = {
+                        "image_url": info["file_url"],
+                        "image_type": info["content_type"],
+                        "image_size": info["file_size"],
+                        "title": info["file_name"],
+                    }
+                    attachments.append(att)
+                    logger.debug(
+                        "[RocketChat][Event] _send_combined: uploaded image %s → %s",
+                        info["file_name"], info["file_url"],
+                    )
+                else:
+                    logger.warning(
+                        "[RocketChat][Event] _send_combined: upload failed for %s",
+                        resolved_name,
+                    )
+        finally:
+            for cleanup in cleanups:
+                cleanup()
+
+        # 发送合并消息
+        if attachments:
+            logger.debug(
+                "[RocketChat][Event] _send_combined: sending text=%r attachments=%d room=%s",
+                (final_text or "")[:60], len(attachments), self.room_id,
+            )
+            await self.adapter._sender.send_structured_message(
+                self.room_id,
+                text=final_text,
+                attachments=attachments,
+                tmid=self.thread_id,
+            )
+        elif final_text:
+            # 所有图片上传都失败，降级为纯文本
+            await self.adapter.send_text(
+                self.room_id, final_text, tmid=self.thread_id,
+            )
 
     async def _flush_text(self, text: str) -> None:
         """发送一段文本，自动选择引用回复或普通发送。"""

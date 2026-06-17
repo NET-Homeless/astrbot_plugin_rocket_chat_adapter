@@ -32,6 +32,9 @@ class _DummyEventAdapter:
         self.sent_quotes: list[tuple[str, str, dict, str | None, str | None]] = []
         self.typing_calls: list[tuple[str, bool, str | None]] = []
 
+    async def _get_room_info(self, room_id: str) -> dict:
+        return {"_id": room_id, "t": "c", "encrypted": False}
+
     async def send_typing(self, room_id: str, flag: bool, tmid: str | None = None) -> None:
         self.typing_calls.append((room_id, flag, tmid))
 
@@ -63,6 +66,9 @@ class _DummySenderAdapter:
         self.sent_texts: list[tuple[str, str, str | None]] = []
         self.sent_quotes: list[tuple[str, str, dict, str | None]] = []
         self.messages_by_id: dict[str, dict] = {}
+
+    async def _get_room_info(self, room_id: str) -> dict:
+        return {"_id": room_id, "t": "c", "encrypted": False}
 
     async def _fetch_message_by_id(self, msg_id: str) -> dict | None:
         return self.messages_by_id.get(msg_id)

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from typing import Any, Callable, Optional
 
 from astrbot.api import logger
@@ -290,26 +291,44 @@ class RocketChatSenderBridge:
                     reply_sent = True
 
         if not reply_sent:
+            # E2EE 房间保持现有逐条发送行为
+            room_info = await self.adapter._get_room_info(room_id)
+            is_e2ee = bool(room_info.get("encrypted") and room_info.get("t") in {"d", "p"})
+
             text_parts: list[str] = []
+            pending_images: list[Image] = []
+            text_before_image = False
+
             for comp in message_chain.chain:
                 if isinstance(comp, Plain):
                     text_parts.append(comp.text)
 
-                elif isinstance(comp, (Image, File, Record, Video)):
-                    if text_parts:
-                        await self.send_text(room_id, "".join(text_parts), tmid)
-                        text_parts.clear()
+                elif isinstance(comp, Image):
+                    if is_e2ee:
+                        # E2EE: 先发文本，再单独发图片
+                        await self._flush_group_chain(
+                            room_id, text_parts, pending_images,
+                            text_before_image, tmid,
+                        )
+                        text_before_image = False
+                        await self._send_single_image(comp, room_id, tmid)
+                    else:
+                        # 首次遇到图片时，检查前面是否有文本
+                        if not pending_images and not text_parts:
+                            pass  # 空段
+                        elif not pending_images:
+                            text_before_image = bool("".join(text_parts).strip())
+                        pending_images.append(comp)
 
-                    if isinstance(comp, Image):
-                        file_ref: str = comp.file or ""
-                        if file_ref.startswith("http"):
-                            await self.send_image_url(room_id, file_ref, tmid=tmid)
-                        else:
-                            local_path = file_ref.replace("file:///", "").replace("file://", "")
-                            if local_path:
-                                await self.send_image_file(room_id, local_path, tmid=tmid)
+                elif isinstance(comp, (File, Record, Video)):
+                    # 非图片媒体：先 flush 当前段，再单独发送
+                    await self._flush_group_chain(
+                        room_id, text_parts, pending_images,
+                        text_before_image, tmid,
+                    )
+                    text_before_image = False
 
-                    elif isinstance(comp, File):
+                    if isinstance(comp, File):
                         file_ref = comp.file or getattr(comp, "url", None) or ""
                         if file_ref.startswith("http://") or file_ref.startswith("https://"):
                             await self.send_text(
@@ -344,5 +363,122 @@ class RocketChatSenderBridge:
                 else:
                     append_rendered_component(text_parts, comp)
 
-            if text_parts:
-                await self.send_text(room_id, "".join(text_parts), tmid)
+            # 发送剩余内容
+            await self._flush_group_chain(
+                room_id, text_parts, pending_images, text_before_image, tmid,
+            )
+
+    async def _send_single_image(
+        self, comp: Image, room_id: str, tmid: Optional[str],
+    ) -> None:
+        """发送单张图片（保持顺序时使用）。"""
+        file_ref: str = comp.file or ""
+        if not file_ref:
+            return
+        if file_ref.startswith("http"):
+            await self.send_image_url(room_id, file_ref, tmid=tmid)
+        else:
+            local_path = file_ref.replace("file:///", "").replace("file://", "")
+            if local_path:
+                await self.send_image_file(room_id, local_path, tmid=tmid)
+
+    async def _flush_group_chain(
+        self,
+        room_id: str,
+        text_parts: list[str],
+        pending_images: list[Image],
+        text_before_image: bool,
+        tmid: Optional[str],
+    ) -> None:
+        """
+        Flush 当前段的内容，保持原始顺序。
+
+        - 文本在前 + 图片在后 → 合并为一条消息
+        - 图片在前 → 图片单独发送以保持顺序，文本随后单独发送
+        """
+        text = "".join(text_parts).strip()
+
+        if pending_images:
+            if text_before_image and text:
+                await self._send_combined_chain(
+                    room_id, text, list(pending_images), tmid,
+                )
+            else:
+                for img in pending_images:
+                    await self._send_single_image(img, room_id, tmid)
+                if text:
+                    await self.send_text(room_id, text, tmid)
+        elif text:
+            await self.send_text(room_id, text, tmid)
+
+        text_parts.clear()
+        pending_images.clear()
+
+    async def _send_combined_chain(
+        self,
+        room_id: str,
+        text: str,
+        images: list[Image],
+        tmid: Optional[str],
+    ) -> None:
+        """
+        将文本与图片合并为一条 Rocket.Chat 消息发送（send_by_session 路径）。
+
+        逻辑与 rocketchat_event.py 的 _send_combined 一致：
+        文字放 msg，图片通过 rooms.media 上传后以 attachment 挂载。
+        """
+        if not text and not images:
+            return
+
+        attachments: list[dict[str, Any]] = []
+        cleanups: list[Callable[[], None]] = []
+
+        try:
+            for img in images:
+                file_ref: str = img.file or ""
+                if not file_ref:
+                    continue
+
+                local_path: str | None = None
+                cleanup: Callable[[], None] | None = None
+
+                if file_ref.startswith("http://") or file_ref.startswith("https://"):
+                    local_path, cleanup = await self.adapter._download_remote_media(
+                        file_ref, ".png"
+                    )
+                else:
+                    local_path = file_ref.replace("file:///", "").replace("file://", "")
+                    if local_path:
+                        pass  # already a local path
+
+                if cleanup:
+                    cleanups.append(cleanup)
+                if not local_path:
+                    continue
+
+                resolved_name = os.path.basename(local_path) or "image.png"
+                info = await self.adapter._media.upload_file_for_attachment(
+                    room_id, local_path, resolved_name,
+                )
+                if info:
+                    att: dict[str, Any] = {
+                        "image_url": info["file_url"],
+                        "image_type": info["content_type"],
+                        "image_size": info["file_size"],
+                        "title": info["file_name"],
+                    }
+                    attachments.append(att)
+        finally:
+            for cleanup in cleanups:
+                cleanup()
+
+        if attachments:
+            logger.debug(
+                "[RocketChat][Sender] _send_combined_chain: text=%r attachments=%d room=%s",
+                (text or "")[:60], len(attachments), room_id,
+            )
+            await self.send_structured_message(
+                room_id, text=text, attachments=attachments, tmid=tmid,
+            )
+        elif text:
+            await self.send_text(room_id, text, tmid)
