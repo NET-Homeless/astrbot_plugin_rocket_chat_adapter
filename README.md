@@ -30,7 +30,7 @@
 | Python | >= 3.10 |
 | AstrBot | >= 4.0 |
 | aiohttp | >= 3.9 |
-| Rocket.Chat Server | >= 5.0（兼容 7.x / 8.x，推荐使用官方维护版本）|
+| Rocket.Chat Server | >= 8.5 LTS（当前实现以 8.5 官方行为为基线）|
 
 ---
 
@@ -79,7 +79,7 @@ git clone https://github.com/NET-Homeless/astrbot_plugin_rocket_chat_adapter
 | `typing_indicator_delay` | float | 否 | `0.5` | 输入中提示延迟秒数；若在该时间内已回复，则不会显示 typing |
 | `remote_media_max_size` | int | 否 | `20971520` | 远端媒体下载大小上限（字节） |
 | `enable_e2ee` | bool | 否 | `false` | 是否启用 Rocket.Chat 官方 E2EE 支持 |
-| `e2ee_password` | string | 否 | — | Rocket.Chat E2EE 私钥密码；仅在 `enable_e2ee=true` 时使用 |
+| `e2ee_password` | string | 否 | — | Rocket.Chat E2EE 私钥密码；仅在 `enable_e2ee=true` 时使用；为空时仅禁用加密房间支持，不影响普通房间 |
 
 ### 配置示例（JSON）
 
@@ -162,7 +162,7 @@ AstrBot 框架
             │     └── 主动 send_by_session 消息链分发
             │
             ├── RocketChatMediaBridge           ← rocketchat_media.py
-            │     ├── 普通房间 rooms.media + mediaConfirm（旧版回退 rooms.upload）
+            │     ├── 普通房间 rooms.media + mediaConfirm（8.5 基线，无 rooms.upload 回退）
             │     ├── E2EE 房间 rooms.media + mediaConfirm
             │     ├── 媒体下载 / 临时文件 / Base64 解码
             │     └── 加密房间远程媒体 fallback
@@ -228,7 +228,7 @@ Rocket.Chat 房间收到回复
 | 入站视频消息 | `files` / `file` 中视频附件 | `Video` 组件 | ✅ 已实现 | 基于 MIME / 文件名 / URL 严格识别 |
 | 房间订阅变更 | `stream-notify-user`（被加入新房间） | 动态订阅房间消息流 | ✅ 已实现 | 无需重启插件 |
 | 出站文本回复 | 普通:`chat.postMessage` / E2EE:`chat.sendMessage` | `event.send` / `send_by_session` | ✅ 已实现 | 支持线程 `tmid` 和 Markdown 原生引用 |
-| 出站图片回复 | 普通:`rooms.media + mediaConfirm` / E2EE:`rooms.media + mediaConfirm` | `Image` 组件发送 | ✅ 已实现 | 普通房间新接口优先，旧版服务端缺失时回退 `rooms.upload`；加密房间远程下载失败时降级为加密文本链接 |
+| 出站图片回复 | 普通:`rooms.media + mediaConfirm` / E2EE:`rooms.media + mediaConfirm` | `Image` 组件发送 | ✅ 已实现 | 以 Rocket.Chat 8.5 为基线；普通房间直接走官方媒体确认，不再回退 `rooms.upload`；加密房间远程下载失败时降级为加密文本链接 |
 | 出站普通文件 | 普通:`rooms.media + mediaConfirm` / E2EE:`rooms.media + mediaConfirm` | `File` 组件发送 | ✅ 已实现 | 本地文件上传；远端 URL 退化为文本链接 |
 | 出站语音回复 | 普通:`rooms.media + mediaConfirm` / E2EE:`rooms.media + mediaConfirm` | `Record` 组件发送 | ✅ 已实现 | 本地文件、HTTP(S)、Base64 均可上传；加密房间远程下载失败时降级为加密文本链接 |
 | 出站视频回复 | 普通:`rooms.media + mediaConfirm` / E2EE:`rooms.media + mediaConfirm` | `Video` 组件发送 | ✅ 已实现 | 本地文件、HTTP(S) 均可上传；加密房间远程下载失败时降级为加密文本链接 |

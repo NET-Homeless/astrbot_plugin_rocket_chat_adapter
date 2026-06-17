@@ -205,8 +205,23 @@ def install_astrbot_stubs() -> None:
         id: str
         support_streaming_message: bool = False
 
-    for cls in (AstrBotMessage, Group, MessageMember, MessageType, PlatformMetadata):
+    class Platform:
+        def __init__(self, platform_config: dict, event_queue: object) -> None:
+            self.platform_config = platform_config
+            self.event_queue = event_queue
+
+        async def send_by_session(self, session: str, message_chain: object) -> None:
+            return None
+
+    def register_platform_adapter(*args: object, **kwargs: object):
+        def decorator(cls: type) -> type:
+            return cls
+
+        return decorator
+
+    for cls in (AstrBotMessage, Group, MessageMember, MessageType, Platform, PlatformMetadata):
         setattr(platform_mod, cls.__name__, cls)
+    platform_mod.register_platform_adapter = register_platform_adapter
 
     sys.modules["astrbot"] = astrbot_mod
     sys.modules["astrbot.api"] = api_mod

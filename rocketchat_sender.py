@@ -301,6 +301,12 @@ class RocketChatSenderBridge:
 
             for comp in message_chain.chain:
                 if isinstance(comp, Plain):
+                    if pending_images:
+                        await self._flush_group_chain(
+                            room_id, text_parts, pending_images,
+                            text_before_image, tmid,
+                        )
+                        text_before_image = False
                     text_parts.append(comp.text)
 
                 elif isinstance(comp, Image):
@@ -361,6 +367,12 @@ class RocketChatSenderBridge:
                     pass
 
                 else:
+                    if pending_images:
+                        await self._flush_group_chain(
+                            room_id, text_parts, pending_images,
+                            text_before_image, tmid,
+                        )
+                        text_before_image = False
                     append_rendered_component(text_parts, comp)
 
             # 发送剩余内容
@@ -372,7 +384,7 @@ class RocketChatSenderBridge:
         self, comp: Image, room_id: str, tmid: Optional[str],
     ) -> None:
         """发送单张图片（保持顺序时使用）。"""
-        file_ref: str = comp.file or ""
+        file_ref: str = comp.file or getattr(comp, "url", None) or ""
         if not file_ref:
             return
         if file_ref.startswith("http"):
@@ -393,7 +405,7 @@ class RocketChatSenderBridge:
         """
         Flush 当前段的内容，保持原始顺序。
 
-        - 文本在前 + 图片在后 → 合并为一条消息
+        - 文本在前 + 图片在后 → 首张图片携带文本合并为官方媒体消息
         - 图片在前 → 图片单独发送以保持顺序，文本随后单独发送
         """
         text = "".join(text_parts).strip()
@@ -425,17 +437,18 @@ class RocketChatSenderBridge:
         将文本与图片合并为一条 Rocket.Chat 消息发送（send_by_session 路径）。
 
         逻辑与 rocketchat_event.py 的 _send_combined 一致：
-        文字放 msg，图片通过 rooms.media 上传后以 attachment 挂载。
+        首张图片通过 rooms.media + rooms.mediaConfirm(msg=...) 携带文本；
+        后续图片独立确认生成消息。
         """
         if not text and not images:
             return
 
-        attachments: list[dict[str, Any]] = []
         cleanups: list[Callable[[], None]] = []
+        sent_text_with_image = False
 
         try:
             for img in images:
-                file_ref: str = img.file or ""
+                file_ref: str = img.file or getattr(img, "url", None) or ""
                 if not file_ref:
                     continue
 
@@ -457,28 +470,19 @@ class RocketChatSenderBridge:
                     continue
 
                 resolved_name = os.path.basename(local_path) or "image.png"
-                info = await self.adapter._media.upload_file_for_attachment(
-                    room_id, local_path, resolved_name,
+                caption = text if not sent_text_with_image else ""
+                uploaded = await self.adapter._media.upload_local_file(
+                    room_id,
+                    local_path,
+                    resolved_name,
+                    description=caption,
+                    tmid=tmid,
                 )
-                if info:
-                    att: dict[str, Any] = {
-                        "image_url": info["file_url"],
-                        "image_type": info["content_type"],
-                        "image_size": info["file_size"],
-                        "title": info["file_name"],
-                    }
-                    attachments.append(att)
+                if uploaded:
+                    sent_text_with_image = sent_text_with_image or bool(caption)
         finally:
             for cleanup in cleanups:
                 cleanup()
 
-        if attachments:
-            logger.debug(
-                "[RocketChat][Sender] _send_combined_chain: text=%r attachments=%d room=%s",
-                (text or "")[:60], len(attachments), room_id,
-            )
-            await self.send_structured_message(
-                room_id, text=text, attachments=attachments, tmid=tmid,
-            )
-        elif text:
+        if text and not sent_text_with_image:
             await self.send_text(room_id, text, tmid)

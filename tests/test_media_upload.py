@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import tempfile
 import unittest
+from dataclasses import dataclass
 from typing import Any
 
 from tests._bootstrap import install_astrbot_stubs
@@ -14,16 +15,88 @@ from astrbot_plugin_rocket_chat_adapter.rocketchat_media import (  # noqa: E402
 )
 
 
+@dataclass
+class _DummyEncryptedUpload:
+    encrypted_name: str = "encrypted-name"
+    encrypted_bytes: bytes = b"encrypted-bytes"
+
+
+class _DummyE2EE:
+    def __init__(self) -> None:
+        self.upload = _DummyEncryptedUpload()
+        self.prepare_calls: list[dict[str, Any]] = []
+        self.confirm_calls: list[dict[str, Any]] = []
+
+    async def prepare_encrypted_upload(
+        self,
+        room_id: str,
+        *,
+        file_name: str,
+        mime_type: str,
+        file_bytes: bytes,
+    ) -> _DummyEncryptedUpload:
+        self.prepare_calls.append(
+            {
+                "room_id": room_id,
+                "file_name": file_name,
+                "mime_type": mime_type,
+                "file_bytes": file_bytes,
+            }
+        )
+        return self.upload
+
+    async def build_upload_file_content(
+        self,
+        room_id: str,
+        upload: _DummyEncryptedUpload,
+    ) -> dict[str, Any]:
+        return {"encrypted": {"algorithm": "rc.v2.aes-sha2", "ciphertext": "metadata"}}
+
+    async def build_media_confirm_payload(
+        self,
+        room_id: str,
+        *,
+        upload_id: str,
+        upload_url: str,
+        upload: _DummyEncryptedUpload,
+        text: str = "",
+        tmid: str | None = None,
+    ) -> dict[str, Any]:
+        self.confirm_calls.append(
+            {
+                "room_id": room_id,
+                "upload_id": upload_id,
+                "upload_url": upload_url,
+                "upload": upload,
+                "text": text,
+                "tmid": tmid,
+            }
+        )
+        return {
+            "t": "e2e",
+            "content": {"algorithm": "rc.v2.aes-sha2", "ciphertext": "message"},
+            "tmid": tmid,
+        }
+
+
 class _DummyAdapter:
     server_url = "https://chat.example.com"
     auth_token = "token"
     user_id = "user-id"
+
+    def __init__(self) -> None:
+        self._e2ee = _DummyE2EE()
+        self.posted_json: list[tuple[str, dict[str, Any]]] = []
 
     def _get_auth_headers(self) -> dict[str, str]:
         return {
             "X-Auth-Token": self.auth_token,
             "X-User-Id": self.user_id,
         }
+
+    async def _post_json_message(self, url: str, payload: dict[str, Any]) -> bool:
+        self.posted_json.append((url, payload))
+        return True
 
 
 class RocketChatPlainUploadTests(unittest.IsolatedAsyncioTestCase):
@@ -64,30 +137,22 @@ class RocketChatPlainUploadTests(unittest.IsolatedAsyncioTestCase):
             calls[1][1],
             "https://chat.example.com/api/v1/rooms.mediaConfirm/room-1/file-1",
         )
-        self.assertEqual(calls[1][2], {"description": "desc", "tmid": "thread-1"})
+        self.assertEqual(calls[1][2], {"msg": "desc", "tmid": "thread-1"})
 
-    async def test_plain_upload_falls_back_when_rooms_media_endpoint_is_missing(self) -> None:
+    async def test_plain_upload_does_not_fallback_when_rooms_media_endpoint_is_missing(self) -> None:
         bridge = RocketChatMediaBridge(_DummyAdapter())
-        fallback_calls: list[tuple[str, str, str, str, str | None]] = []
-        new_endpoint_calls = 0
+        calls = 0
 
         async def post_multipart_json_response(url: str, form: object) -> tuple[int, dict]:
-            nonlocal new_endpoint_calls
-            new_endpoint_calls += 1
+            nonlocal calls
+            calls += 1
             return 404, {"success": False, "errorType": "error-endpoint-not-found"}
 
-        async def upload_legacy_plain_file(
-            room_id: str,
-            file_path: str,
-            resolved_name: str,
-            description: str = "",
-            tmid: str | None = None,
-        ) -> bool:
-            fallback_calls.append((room_id, file_path, resolved_name, description, tmid))
-            return True
+        async def post_json_response(url: str, payload: dict[str, Any]) -> tuple[int, dict]:
+            raise AssertionError("mediaConfirm should not be called after upload failure")
 
         bridge.post_multipart_json_response = post_multipart_json_response  # type: ignore[method-assign]
-        bridge.upload_legacy_plain_file = upload_legacy_plain_file  # type: ignore[method-assign]
+        bridge.post_json_response = post_json_response  # type: ignore[method-assign]
 
         uploaded = await bridge.upload_plain_file(
             "room-1",
@@ -97,17 +162,8 @@ class RocketChatPlainUploadTests(unittest.IsolatedAsyncioTestCase):
             tmid="thread-1",
         )
 
-        self.assertTrue(uploaded)
-        self.assertEqual(
-            fallback_calls,
-            [("room-1", self.file_path, "test.txt", "desc", "thread-1")],
-        )
-        self.assertEqual(new_endpoint_calls, 1)
-
-        uploaded = await bridge.upload_plain_file("room-1", self.file_path, "test.txt")
-
-        self.assertTrue(uploaded)
-        self.assertEqual(new_endpoint_calls, 1)
+        self.assertFalse(uploaded)
+        self.assertEqual(calls, 1)
 
     async def test_plain_upload_does_not_fallback_on_validation_error(self) -> None:
         bridge = RocketChatMediaBridge(_DummyAdapter())
@@ -115,15 +171,72 @@ class RocketChatPlainUploadTests(unittest.IsolatedAsyncioTestCase):
         async def post_multipart_json_response(url: str, form: object) -> tuple[int, dict]:
             return 400, {"success": False, "errorType": "error-invalid-file-type"}
 
-        async def upload_legacy_plain_file(*args: object, **kwargs: object) -> bool:
-            raise AssertionError("legacy upload should not be called")
-
         bridge.post_multipart_json_response = post_multipart_json_response  # type: ignore[method-assign]
-        bridge.upload_legacy_plain_file = upload_legacy_plain_file  # type: ignore[method-assign]
 
         uploaded = await bridge.upload_plain_file("room-1", self.file_path, "test.txt")
 
         self.assertFalse(uploaded)
+
+    async def test_encrypted_upload_uses_rooms_media_then_confirm(self) -> None:
+        adapter = _DummyAdapter()
+        bridge = RocketChatMediaBridge(adapter)
+        calls: list[tuple[str, str, Any]] = []
+
+        async def post_multipart_json(url: str, form: object) -> dict[str, Any]:
+            calls.append(("multipart", url, form))
+            return {
+                "success": True,
+                "file": {"_id": "file-1", "url": "/file-upload/file-1/encrypted-name"},
+            }
+
+        bridge.post_multipart_json = post_multipart_json  # type: ignore[method-assign]
+
+        uploaded = await bridge.upload_encrypted_file(
+            "encrypted-room",
+            self.file_path,
+            "test.txt",
+            description="caption",
+            tmid="thread-1",
+        )
+
+        self.assertTrue(uploaded)
+        self.assertEqual(adapter._e2ee.prepare_calls[0]["room_id"], "encrypted-room")
+        self.assertEqual(adapter._e2ee.prepare_calls[0]["file_name"], "test.txt")
+        self.assertEqual(adapter._e2ee.prepare_calls[0]["file_bytes"], b"hello")
+        self.assertEqual(calls[0][0], "multipart")
+        self.assertEqual(
+            calls[0][1],
+            "https://chat.example.com/api/v1/rooms.media/encrypted-room",
+        )
+        self.assertEqual(
+            adapter._e2ee.confirm_calls,
+            [
+                {
+                    "room_id": "encrypted-room",
+                    "upload_id": "file-1",
+                    "upload_url": "/file-upload/file-1/encrypted-name",
+                    "upload": adapter._e2ee.upload,
+                    "text": "caption",
+                    "tmid": "thread-1",
+                }
+            ],
+        )
+        self.assertEqual(
+            adapter.posted_json,
+            [
+                (
+                    "https://chat.example.com/api/v1/rooms.mediaConfirm/encrypted-room/file-1",
+                    {
+                        "t": "e2e",
+                        "content": {
+                            "algorithm": "rc.v2.aes-sha2",
+                            "ciphertext": "message",
+                        },
+                        "tmid": "thread-1",
+                    },
+                )
+            ],
+        )
 
 
 if __name__ == "__main__":

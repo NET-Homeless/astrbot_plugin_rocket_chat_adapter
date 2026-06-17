@@ -226,9 +226,9 @@ class RocketChatAdapter(Platform):
             )
 
         if self.enable_e2ee and not self.e2ee_password:
-            raise ValueError(
-                "[RocketChat] 启用 E2EE (enable_e2ee=true) 时必须提供 'e2ee_password'。"
-                "E2EE 密码用于加密/解密私钥，请在 Rocket.Chat 网页端设置后填入配置。"
+            logger.warning(
+                "[RocketChat] 已启用 E2EE 但未配置 'e2ee_password'，加密房间支持会在初始化时禁用；"
+                "普通未加密房间仍会继续工作。"
             )
 
         if self.reconnect_delay < 0:

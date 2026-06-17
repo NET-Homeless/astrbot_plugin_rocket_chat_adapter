@@ -272,14 +272,14 @@ Rocket.Chat 没有 QQ 合并转发的原生消息类型。出站 `Nodes` / `Node
 
 优先扩 `rocketchat_media.py`，不要在 `event.py` 里复制一份上传分支。
 
-### 7.6 普通房间上传接口兼容
+### 7.6 普通房间上传接口基线
 
-Rocket.Chat 官方已将 `rooms.upload/:rid` 在 6.10.0 标为 deprecated，并在 8.0.0 移除。普通未加密房间上传也应优先使用：
+Rocket.Chat 官方已将 `rooms.upload/:rid` 在 6.10.0 标为 deprecated，并在 8.0.0 移除。本适配器以 Rocket.Chat 8.5 LTS 为基线，普通未加密房间上传固定使用：
 
 1. `POST /api/v1/rooms.media/{rid}` 上传文件，拿到 `file._id`
 2. `POST /api/v1/rooms.mediaConfirm/{rid}/{fileId}` 确认并生成消息
 
-7.13.3 已支持这套新接口；为兼容更老服务端，只在 `rooms.media` / `rooms.mediaConfirm` 明确不可用时回退旧 `rooms.upload/{rid}`，不要在普通错误（权限、文件类型、大小限制）时回退，避免掩盖真实失败原因。
+不要回退旧 `rooms.upload/{rid}`，也不要把已上传但未 `mediaConfirm` 的文件 URL 挂到 `chat.postMessage.attachments` 里。图文合并只允许通过 `rooms.mediaConfirm` 的 `msg` 字段完成；如果原始组件顺序是图片在前、文本在后，必须拆分为多条消息以保持 Rocket.Chat 的固定渲染顺序不会反转原消息。
 
 ---
 
@@ -368,7 +368,7 @@ AstrBot 没有独立的配置校验 hook。所有校验直接在 `Platform.__ini
 - Mattermost: `if not self.base_url: raise ValueError("Mattermost URL 是必需的")`
 - LINE: `if not channel_access_token or not channel_secret: raise ValueError(...)`
 
-本适配器的 `_validate_config()` 沿用同一模式。
+本适配器的 `_validate_config()` 仍会对必填登录项与数值边界采用同一模式；但 `enable_e2ee=true` 且未配置 `e2ee_password` 时只会告警并禁用加密房间支持，不会阻断普通房间启动。
 
 ### 12.2 初始化异常处理
 
