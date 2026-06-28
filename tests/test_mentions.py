@@ -140,6 +140,57 @@ class RocketChatMentionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(event.message_obj.type, MessageType.GROUP_MESSAGE)
         self.assertEqual(self.started_typing_events, [event])
 
+    async def test_text_fallback_mention_uses_username_boundary(self) -> None:
+        raw_msg = {
+            "_id": "msg-boundary",
+            "rid": "room-1",
+            "msg": "hello @botany",
+            "u": {"_id": "user-boundary", "username": "mallory", "name": "Mallory"},
+            "mentions": [],
+            "attachments": [],
+            "urls": [],
+        }
+
+        await self.bridge.process_incoming_message(raw_msg)
+
+        self.assertEqual(len(self.adapter._committed_events), 1)
+        event = self.adapter._committed_events[0]
+        self.assertFalse(event.is_at_or_wake_command)
+        self.assertEqual(self.started_typing_events, [])
+
+    async def test_parsed_url_query_string_quote_does_not_abort_message(self) -> None:
+        self.adapter._fetched_messages["quoted-msg"] = {
+            "_id": "quoted-msg",
+            "rid": "room-1",
+            "msg": "old text",
+            "u": {"_id": "bot-id", "username": "bot", "name": "Bot"},
+            "mentions": [],
+            "attachments": [],
+            "urls": [],
+        }
+        raw_msg = {
+            "_id": "msg-query-string",
+            "rid": "room-1",
+            "msg": "看这个",
+            "u": {"_id": "user-query", "username": "nick", "name": "Nick"},
+            "mentions": [],
+            "attachments": [],
+            "urls": [
+                {
+                    "url": "https://chat.example.com/group/general?msg=quoted-msg",
+                    "parsedUrl": {"query": "msg=quoted-msg"},
+                }
+            ],
+        }
+
+        await self.bridge.process_incoming_message(raw_msg)
+
+        self.assertEqual(len(self.adapter._committed_events), 1)
+        event = self.adapter._committed_events[0]
+        self.assertEqual(event.message_str, "看这个")
+        self.assertTrue(_would_astrbot_reply_wake(event))
+        self.assertEqual(self.started_typing_events, [event])
+
     async def test_quote_bot_image_and_mention_other_user_preserves_reply_wake(self) -> None:
         self.adapter._fetched_messages["bot-image"] = {
             "_id": "bot-image",

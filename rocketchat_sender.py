@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import os
 from typing import Any, Callable, Optional
 
 from astrbot.api import logger
@@ -8,6 +7,7 @@ from astrbot.api.event import MessageChain
 from astrbot.api.message_components import File, Image, Plain, Record, Reply, Video
 
 from .rocketchat_components import append_rendered_component, render_message_chain_text
+from .rocketchat_media import upload_combined_images
 
 
 class RocketChatSenderBridge:
@@ -40,7 +40,12 @@ class RocketChatSenderBridge:
         e2e_mentions: Optional[dict[str, Any]] = None,
     ) -> bool:
         room_info = await self.adapter._get_room_info(room_id)
-        is_e2ee_room = room_info.get("encrypted") and room_info.get("t") in {"d", "p"}
+        if self.adapter._is_unknown_room_info(room_info):
+            logger.warning(
+                f"[RocketChat][room] 房间信息未知，拒绝按明文发送消息 room_id={room_id!r}"
+            )
+            return False
+        is_e2ee_room = self.adapter._is_e2ee_room_info(room_info)
 
         if is_e2ee_room:
             encrypted_payload = await self.adapter._e2ee.build_send_message(
@@ -76,7 +81,12 @@ class RocketChatSenderBridge:
         mention_username: Optional[str],
     ) -> tuple[str | None, dict[str, Any] | None]:
         room_info = await self.adapter._get_room_info(room_id)
-        if not (mention_username and room_info.get("encrypted") and room_info.get("t") == "p"):
+        if not (
+            mention_username
+            and not self.adapter._is_unknown_room_info(room_info)
+            and room_info.get("encrypted")
+            and room_info.get("t") == "p"
+        ):
             return None, None
 
         normalized = mention_username.lstrip("@").strip()
@@ -93,7 +103,11 @@ class RocketChatSenderBridge:
 
     async def should_explicit_reply_mention(self, room_id: str) -> bool:
         room_info = await self.adapter._get_room_info(room_id)
-        return bool(room_info.get("encrypted") and room_info.get("t") == "p")
+        return bool(
+            not self.adapter._is_unknown_room_info(room_info)
+            and room_info.get("encrypted")
+            and room_info.get("t") == "p"
+        )
 
     async def send_text(
         self,
@@ -188,8 +202,10 @@ class RocketChatSenderBridge:
         image_url: str,
         text: str = "",
         tmid: Optional[str] = None,
-    ) -> None:
-        await self.adapter._media.send_image_url(room_id, image_url, text=text, tmid=tmid)
+    ) -> bool:
+        return await self.adapter._media.send_image_url(
+            room_id, image_url, text=text, tmid=tmid
+        )
 
     async def send_image_file(
         self,
@@ -197,8 +213,8 @@ class RocketChatSenderBridge:
         file_path: str,
         description: str = "",
         tmid: Optional[str] = None,
-    ) -> None:
-        await self.adapter._media.send_image_file(
+    ) -> bool:
+        return await self.adapter._media.send_image_file(
             room_id,
             file_path,
             description=description,
@@ -293,7 +309,7 @@ class RocketChatSenderBridge:
         if not reply_sent:
             # E2EE 房间保持现有逐条发送行为
             room_info = await self.adapter._get_room_info(room_id)
-            is_e2ee = bool(room_info.get("encrypted") and room_info.get("t") in {"d", "p"})
+            is_e2ee = self.adapter._is_e2ee_room_info(room_info)
 
             text_parts: list[str] = []
             pending_images: list[Image] = []
@@ -436,53 +452,15 @@ class RocketChatSenderBridge:
         """
         将文本与图片合并为一条 Rocket.Chat 消息发送（send_by_session 路径）。
 
-        逻辑与 rocketchat_event.py 的 _send_combined 一致：
-        首张图片通过 rooms.media + rooms.mediaConfirm(msg=...) 携带文本；
-        后续图片独立确认生成消息。
+        复用 rocketchat_media.upload_combined_images，与 event 路径共享同一套
+        下载 / base64 解码 / fallback / caption 归属逻辑。
         """
         if not text and not images:
             return
 
-        cleanups: list[Callable[[], None]] = []
-        sent_text_with_image = False
-
-        try:
-            for img in images:
-                file_ref: str = img.file or getattr(img, "url", None) or ""
-                if not file_ref:
-                    continue
-
-                local_path: str | None = None
-                cleanup: Callable[[], None] | None = None
-
-                if file_ref.startswith("http://") or file_ref.startswith("https://"):
-                    local_path, cleanup = await self.adapter._download_remote_media(
-                        file_ref, ".png"
-                    )
-                else:
-                    local_path = file_ref.replace("file:///", "").replace("file://", "")
-                    if local_path:
-                        pass  # already a local path
-
-                if cleanup:
-                    cleanups.append(cleanup)
-                if not local_path:
-                    continue
-
-                resolved_name = os.path.basename(local_path) or "image.png"
-                caption = text if not sent_text_with_image else ""
-                uploaded = await self.adapter._media.upload_local_file(
-                    room_id,
-                    local_path,
-                    resolved_name,
-                    description=caption,
-                    tmid=tmid,
-                )
-                if uploaded:
-                    sent_text_with_image = sent_text_with_image or bool(caption)
-        finally:
-            for cleanup in cleanups:
-                cleanup()
+        sent_text_with_image = await upload_combined_images(
+            self.adapter, room_id, text, images, tmid=tmid,
+        )
 
         if text and not sent_text_with_image:
             await self.send_text(room_id, text, tmid)

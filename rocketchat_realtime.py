@@ -28,6 +28,7 @@ class RocketChatRealtimeBridge:
         self.adapter._room_type_cache.clear()
         self.adapter._room_name_cache.clear()
         self.adapter._room_cache_locks.clear()
+        self.adapter._pending_room_subscriptions.clear()
 
         async with self.adapter._http_session.ws_connect(
             ws_url,
@@ -125,15 +126,7 @@ class RocketChatRealtimeBridge:
                     "e2eKeyId": sub.get("e2eKeyId"),
                 }
             )
-            await ws.send_json(
-                {
-                    "msg": "sub",
-                    "id": f"room-{room_id}",
-                    "name": "stream-room-messages",
-                    "params": [room_id, False],
-                }
-            )
-            self.adapter._subscribed_rooms.add(room_id)
+            await self._subscribe_room_messages(ws, room_id)
 
     async def ddp_subscribe_user_events(
         self,
@@ -201,24 +194,67 @@ class RocketChatRealtimeBridge:
         elif msg_type == "result":
             result_id = data.get("id", "")
             future = self.adapter._pending_ddp_results.pop(result_id, None)
+            method = self.adapter._pending_ddp_methods.pop(result_id, "")
             if future and not future.done():
                 future.set_result(data)
-            if result_id.startswith("typing-"):
+            if method:
                 error = data.get("error")
                 if error:
                     logger.warning(
-                        f"[RocketChat] typing method 调用被服务端拒绝: id={result_id} error={error}"
+                        f"[RocketChat] DDP method 调用被服务端拒绝: method={method} id={result_id} error={error}"
                     )
                 else:
                     logger.debug(
-                        f"[RocketChat] typing method 调用成功: id={result_id} result={data.get('result')}"
+                        f"[RocketChat] DDP method 调用成功: method={method} id={result_id} result={data.get('result')}"
                     )
 
         elif msg_type == "added":
             pass
 
         elif msg_type == "ready":
-            pass
+            self._handle_ready(data)
+
+        elif msg_type == "nosub":
+            self._handle_nosub(data)
+
+    async def _subscribe_room_messages(
+        self,
+        ws: aiohttp.ClientWebSocketResponse,
+        room_id: str,
+    ) -> None:
+        sub_id = f"room-{room_id}"
+        if room_id in self.adapter._subscribed_rooms:
+            return
+        if sub_id in self.adapter._pending_room_subscriptions:
+            return
+        await ws.send_json(
+            {
+                "msg": "sub",
+                "id": sub_id,
+                "name": "stream-room-messages",
+                "params": [room_id, False],
+            }
+        )
+        self.adapter._pending_room_subscriptions[sub_id] = room_id
+
+    def _handle_ready(self, data: dict[str, Any]) -> None:
+        for sub_id in data.get("subs", []) or []:
+            room_id = self.adapter._pending_room_subscriptions.pop(sub_id, None)
+            if not room_id:
+                continue
+            self.adapter._subscribed_rooms.add(room_id)
+            logger.debug(f"[RocketChat] 房间订阅已确认: room_id={room_id!r} sub_id={sub_id!r}")
+
+    def _handle_nosub(self, data: dict[str, Any]) -> None:
+        sub_id = data.get("id")
+        if not isinstance(sub_id, str):
+            return
+        room_id = self.adapter._pending_room_subscriptions.pop(sub_id, None)
+        if room_id:
+            self.adapter._subscribed_rooms.discard(room_id)
+            logger.warning(
+                f"[RocketChat] 房间订阅失败: room_id={room_id!r} sub_id={sub_id!r} error={data.get('error')}"
+            )
 
     async def handle_user_notification(
         self,
@@ -255,15 +291,7 @@ class RocketChatRealtimeBridge:
                 )
 
         if event_type == "inserted" and room_id and room_id not in self.adapter._subscribed_rooms:
-            await ws.send_json(
-                {
-                    "msg": "sub",
-                    "id": f"room-{room_id}",
-                    "name": "stream-room-messages",
-                    "params": [room_id, False],
-                }
-            )
-            self.adapter._subscribed_rooms.add(room_id)
+            await self._subscribe_room_messages(ws, room_id)
             logger.info(f"[RocketChat] 动态订阅新房间: {room_id}")
 
     async def ddp_call(
@@ -279,6 +307,7 @@ class RocketChatRealtimeBridge:
         call_id = f"ddp-{self.adapter._ddp_call_id}"
         future = asyncio.get_running_loop().create_future()
         self.adapter._pending_ddp_results[call_id] = future
+        self.adapter._pending_ddp_methods[call_id] = method
         try:
             await self.adapter._ws.send_json(
                 {
@@ -294,3 +323,4 @@ class RocketChatRealtimeBridge:
             return data.get("result")
         finally:
             self.adapter._pending_ddp_results.pop(call_id, None)
+            self.adapter._pending_ddp_methods.pop(call_id, None)

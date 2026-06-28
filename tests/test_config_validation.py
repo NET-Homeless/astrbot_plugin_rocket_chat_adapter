@@ -44,6 +44,20 @@ class RocketChatConfigValidationTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(ValueError):
             RocketChatAdapter(config, {}, asyncio.Queue())
 
+    async def test_server_url_without_http_scheme_fails_fast(self) -> None:
+        config = _base_config()
+        config["server_url"] = "chat.example.com"
+
+        with self.assertRaises(ValueError):
+            RocketChatAdapter(config, {}, asyncio.Queue())
+
+    async def test_server_url_with_unsupported_scheme_fails_fast(self) -> None:
+        config = _base_config()
+        config["server_url"] = "ftp://chat.example.com"
+
+        with self.assertRaises(ValueError):
+            RocketChatAdapter(config, {}, asyncio.Queue())
+
 
 if __name__ == "__main__":
     unittest.main()

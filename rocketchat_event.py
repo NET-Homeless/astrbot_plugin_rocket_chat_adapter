@@ -20,6 +20,7 @@ from astrbot.api.message_components import (
 from astrbot.api.platform import AstrBotMessage, PlatformMetadata
 
 from .rocketchat_components import append_rendered_component
+from .rocketchat_media import upload_combined_images
 
 if TYPE_CHECKING:
     from .rocketchat_adapter import RocketChatAdapter
@@ -348,55 +349,13 @@ class RocketChatMessageEvent(AstrMessageEvent):
         if mention_username and final_text:
             final_text = f"@{mention_username} {final_text}"
 
-        cleanups: list[Callable[[], None]] = []
-        sent_text_with_image = False
-
-        try:
-            for img in images:
-                file_ref: str = img.file or getattr(img, "url", None) or ""
-                if not file_ref:
-                    continue
-
-                local_path: str | None = None
-                cleanup: Callable[[], None] | None = None
-
-                if file_ref.startswith("http://") or file_ref.startswith("https://"):
-                    local_path, cleanup = await self.adapter._download_remote_media(
-                        file_ref, ".png"
-                    )
-                else:
-                    local_path, cleanup = await self._resolve_uploadable_path(
-                        file_ref, default_suffix=".png"
-                    )
-
-                if cleanup:
-                    cleanups.append(cleanup)
-                if not local_path:
-                    continue
-
-                resolved_name = self._guess_filename(file_ref, local_path, "image.png")
-                caption = final_text if not sent_text_with_image else ""
-                uploaded = await self.adapter._media.upload_local_file(
-                    self.room_id,
-                    local_path,
-                    resolved_name,
-                    description=caption,
-                    tmid=self.thread_id,
-                )
-                if uploaded:
-                    sent_text_with_image = sent_text_with_image or bool(caption)
-                    logger.debug(
-                        "[RocketChat][Event] _send_combined: uploaded image %s room=%s caption=%s",
-                        resolved_name, self.room_id, bool(caption),
-                    )
-                else:
-                    logger.warning(
-                        "[RocketChat][Event] _send_combined: upload failed for %s",
-                        resolved_name,
-                    )
-        finally:
-            for cleanup in cleanups:
-                cleanup()
+        sent_text_with_image = await upload_combined_images(
+            self.adapter,
+            self.room_id,
+            final_text,
+            images,
+            tmid=self.thread_id,
+        )
 
         if final_text and not sent_text_with_image:
             await self.adapter.send_text(

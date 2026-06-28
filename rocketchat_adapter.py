@@ -172,10 +172,14 @@ class RocketChatAdapter(Platform):
         self._room_cache_locks: Dict[str, asyncio.Lock] = {}
         # 已订阅房间集合，防止重复订阅导致消息被多次处理
         self._subscribed_rooms: set = set()
+        # 已发出但尚未收到 DDP ready 的房间订阅，key 为 sub id，value 为 room id
+        self._pending_room_subscriptions: Dict[str, str] = {}
         # DDP method 调用 ID 计数器，确保每次调用 ID 唯一
         self._ddp_call_id: int = 0
         # 等待 DDP result 的 Future 映射
         self._pending_ddp_results: Dict[str, asyncio.Future] = {}
+        # DDP method 调用 ID 与 method 名称映射，用于 result/error 日志关联
+        self._pending_ddp_methods: Dict[str, str] = {}
         # 后台任务强引用集合，防止 Python 3.12+ GC 回收未完成的 task
         self._background_tasks: set[asyncio.Task] = set()
         # 并发处理控制，防止瞬间过多消息导致处理积压
@@ -211,6 +215,12 @@ class RocketChatAdapter(Platform):
             raise ValueError(
                 "[RocketChat] 配置项 'server_url' 不能为空。"
                 "请在 AstrBot 配置中设置 Rocket.Chat 服务器地址（如 http://localhost:3000）。"
+            )
+        parsed_server_url = urlparse(self.server_url)
+        if parsed_server_url.scheme not in {"http", "https"} or not parsed_server_url.netloc:
+            raise ValueError(
+                "[RocketChat] 配置项 'server_url' 必须包含 http:// 或 https:// 协议和主机名，"
+                f"当前值: {self.server_url!r}"
             )
 
         if not self.username:
@@ -337,6 +347,8 @@ class RocketChatAdapter(Platform):
             if not future.done():
                 future.cancel()
         self._pending_ddp_results.clear()
+        self._pending_ddp_methods.clear()
+        self._pending_room_subscriptions.clear()
 
         # 统一取消并等待后台任务完成，避免生命周期外泄漏
         if self._background_tasks:
@@ -450,9 +462,20 @@ class RocketChatAdapter(Platform):
         except Exception as exc:
             logger.warning(f"[RocketChat] 获取房间信息失败 room_id={room_id}: {exc}")
 
-        fallback = self._room_info_cache.get(room_id, {"_id": room_id, "t": "c", "encrypted": False})
-        await self._cache_room_info(fallback)
-        return fallback
+        fallback = self._room_info_cache.get(room_id)
+        if fallback:
+            return fallback
+
+        logger.warning(
+            f"[RocketChat][room] 无法确认房间信息，已标记为 unknown，发送侧将 fail-closed room_id={room_id!r}"
+        )
+        return {"_id": room_id, "t": None, "encrypted": None, "_unknown": True}
+
+    def _is_unknown_room_info(self, room_info: dict[str, Any]) -> bool:
+        return bool(room_info.get("_unknown"))
+
+    def _is_e2ee_room_info(self, room_info: dict[str, Any]) -> bool:
+        return bool(room_info.get("encrypted") and room_info.get("t") in {"d", "p"})
 
     async def _get_room_type(self, room_id: str) -> str:
         """
@@ -464,7 +487,7 @@ class RocketChatAdapter(Platform):
           "d"  → 私信（direct message）
         """
         room = await self._get_room_info(room_id)
-        room_type = room.get("t", "c")
+        room_type = room.get("t") or "c"
         logger.debug(
             f"[RocketChat][room] resolved room_id={room_id!r} type={room_type!r}"
         )
@@ -720,8 +743,8 @@ class RocketChatAdapter(Platform):
         image_url: str,
         text: str = "",
         tmid: Optional[str] = None,
-    ) -> None:
-        await self._sender.send_image_url(room_id, image_url, text=text, tmid=tmid)
+    ) -> bool:
+        return await self._sender.send_image_url(room_id, image_url, text=text, tmid=tmid)
 
     async def send_image_file(
         self,
@@ -729,8 +752,10 @@ class RocketChatAdapter(Platform):
         file_path: str,
         description: str = "",
         tmid: Optional[str] = None,
-    ) -> None:
-        await self._sender.send_image_file(room_id, file_path, description=description, tmid=tmid)
+    ) -> bool:
+        return await self._sender.send_image_file(
+            room_id, file_path, description=description, tmid=tmid
+        )
 
     async def send_file(
         self,

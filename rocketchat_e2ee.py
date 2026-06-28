@@ -430,7 +430,13 @@ class RocketChatE2EEManager:
         if not await self.should_encrypt_room(room_info):
             return None
 
-        session_key = await self._ensure_room_key(room_id, room_info=room_info)
+        try:
+            session_key = await self._ensure_room_key(room_id, room_info=room_info)
+        except Exception as exc:
+            logger.warning(
+                f"[RocketChat][E2EE] 获取房间密钥失败，已跳过本次加密处理 room_id={room_id!r}: {exc!r}"
+            )
+            return None
         if not session_key:
             return None
 
@@ -602,41 +608,47 @@ class RocketChatE2EEManager:
         if not await self.should_encrypt_room(room_info):
             return None
 
-        lock = self._room_locks.setdefault(room_id, asyncio.Lock())
-        async with lock:
-            key_store = self._room_keys.setdefault(room_id, RoomKeyStore())
-            if key_store.current and key_store.current.key_id == room_info.get("e2eKeyId"):
-                await self._maybe_share_room_key(room_id, key_store.current)
-                return key_store.current
+        try:
+            lock = self._room_locks.setdefault(room_id, asyncio.Lock())
+            async with lock:
+                key_store = self._room_keys.setdefault(room_id, RoomKeyStore())
+                if key_store.current and key_store.current.key_id == room_info.get("e2eKeyId"):
+                    await self._maybe_share_room_key(room_id, key_store.current)
+                    return key_store.current
 
-            subscription = await self._get_subscription(room_id, refresh=True)
-            imported = await self._load_room_key_from_subscription(
-                room_id,
-                key_store,
-                subscription,
-            )
-            if imported:
-                return imported
+                subscription = await self._get_subscription(room_id, refresh=True)
+                imported = await self._load_room_key_from_subscription(
+                    room_id,
+                    key_store,
+                    subscription,
+                )
+                if imported:
+                    return imported
 
-            if not room_info.get("e2eKeyId"):
-                created = await self._create_room_key(room_id)
-                key_store.current = created
-                return created
+                if not room_info.get("e2eKeyId"):
+                    created = await self._create_room_key(room_id)
+                    key_store.current = created
+                    return created
 
-            await self._request_subscription_keys_once(
-                reason="room-key",
-                room_id=room_id,
-                room_info=room_info,
-            )
-            imported = await self._retry_room_key_from_subscription(
-                room_id,
-                key_store,
-            )
-            if imported:
-                return imported
+                await self._request_subscription_keys_once(
+                    reason="room-key",
+                    room_id=room_id,
+                    room_info=room_info,
+                )
+                imported = await self._retry_room_key_from_subscription(
+                    room_id,
+                    key_store,
+                )
+                if imported:
+                    return imported
 
+                logger.warning(
+                    f"[RocketChat][E2EE] room key retry exhausted{self._room_key_log_suffix(room_id, room_info)}"
+                )
+                return None
+        except Exception as exc:
             logger.warning(
-                f"[RocketChat][E2EE] room key retry exhausted{self._room_key_log_suffix(room_id, room_info)}"
+                f"[RocketChat][E2EE] room key handling failed{self._room_key_log_suffix(room_id, room_info)}: {exc!r}"
             )
             return None
 

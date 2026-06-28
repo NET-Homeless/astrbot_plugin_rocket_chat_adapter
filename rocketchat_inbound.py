@@ -21,6 +21,9 @@ class RocketChatInboundBridge:
         self._processed_message_cache_limit = 4096
         # 消息去重锁，防止并发处理导致重复消息
         self._dedup_lock: Optional[asyncio.Lock] = None
+        # bot @提及匹配正则缓存，避免每条消息重复编译（bot_username 在登录后才确定）
+        self._mention_pattern: Optional[re.Pattern[str]] = None
+        self._mention_pattern_username: Optional[str] = None
 
     def extract_mentions_for_wake(self, raw_msg: dict) -> list[Any]:
         mentions = raw_msg.get("mentions")
@@ -129,6 +132,36 @@ class RocketChatInboundBridge:
 
         return bot_mentioned, has_other_user_mentions
 
+    def _text_contains_bot_mention(self, text: str) -> bool:
+        bot_username = self.adapter.bot_username
+        if not bot_username:
+            return False
+        if self._mention_pattern_username != bot_username:
+            self._mention_pattern = re.compile(
+                rf"(?<![A-Za-z0-9_.-])@{re.escape(bot_username)}(?![A-Za-z0-9_.-])"
+            )
+            self._mention_pattern_username = bot_username
+        return bool(self._mention_pattern.search(text))
+
+    def _extract_msg_id_from_parsed_url(self, url_obj: dict) -> Optional[str]:
+        parsed_url = url_obj.get("parsedUrl")
+        if isinstance(parsed_url, dict):
+            query = parsed_url.get("query")
+            if isinstance(query, dict):
+                value = query.get("msg")
+                if isinstance(value, list):
+                    return str(value[0]) if value else None
+                return str(value) if value else None
+            if isinstance(query, str):
+                values = parse_qs(query).get("msg")
+                return values[0] if values else None
+
+        url = url_obj.get("url")
+        if isinstance(url, str) and "msg=" in url:
+            values = parse_qs(urlparse(url).query).get("msg")
+            return values[0] if values else None
+        return None
+
     async def _claim_incoming_message(self, raw_msg: dict) -> bool:
         """
         检查并标记消息为已处理，防止重复处理。
@@ -207,23 +240,15 @@ class RocketChatInboundBridge:
         quote_ids = []
 
         for url_obj in current_payload.get("urls", []):
+            if not isinstance(url_obj, dict):
+                continue
             u_str = url_obj.get("url") or ""
-            p_url = url_obj.get("parsedUrl", {})
-            if p_url and "query" in p_url and "msg" in p_url["query"]:
-                q_id = p_url["query"]["msg"]
-                if q_id and q_id not in quote_ids:
-                    quote_ids.append(q_id)
-                    logger.debug(f"[RocketChat][IN] 从urls.parsedUrl识别引用: msg_id={q_id}")
-            elif "msg=" in u_str:
-                parsed = urlparse(u_str)
-                qs = parse_qs(parsed.query)
-                if "msg" in qs:
-                    q_id = qs["msg"][0]
-                    if q_id and q_id not in quote_ids:
-                        quote_ids.append(q_id)
-                        logger.debug(
-                            f"[RocketChat][IN] 从urls手动parse识别引用: msg_id={q_id} url={u_str[:80]}"
-                        )
+            q_id = self._extract_msg_id_from_parsed_url(url_obj)
+            if q_id and q_id not in quote_ids:
+                quote_ids.append(q_id)
+                logger.debug(
+                    f"[RocketChat][IN] 从urls识别引用: msg_id={q_id} url={u_str[:80]}"
+                )
 
         att_raw = current_payload.get("attachments", [])
         direct_atts = [att_raw] if isinstance(att_raw, dict) else [a for a in att_raw if isinstance(a, dict)]
@@ -393,7 +418,7 @@ class RocketChatInboundBridge:
             reply_to_self = self._has_reply_to_self(components)
 
             if not bot_mentioned and self.adapter.bot_username:
-                bot_mentioned = f"@{self.adapter.bot_username}" in (abm.message_str or "")
+                bot_mentioned = self._text_contains_bot_mention(abm.message_str or "")
                 has_other_user_mentions = bool(has_other_user_mentions or "@" in (abm.message_str or ""))
 
             if bot_mentioned:

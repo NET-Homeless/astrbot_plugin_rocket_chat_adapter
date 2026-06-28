@@ -113,6 +113,12 @@ DDP 正常工作至少要走完这几步：
 
 只在启动时拉一次 `subscriptions.get` 不够。机器人后续被拉进新房间时，必须监听 `stream-notify-user` 并增量订阅新房间，否则新房间里 bot 看起来“在线但没反应”。
 
+订阅状态必须区分“已发出 sub 请求”和“服务端已确认 ready”：
+
+- `stream-room-messages` 成功响应是 `msg: "ready"`，并在 `subs` 中带回 subscription id
+- 收到 `ready.subs` 后才能把房间放进已订阅集合
+- 收到 `nosub` 时要清理 pending 状态，不能把失败的房间永久当作已订阅，否则后续 `rooms-changed` 事件无法重试
+
 ### 4.3 DDP 调试要看 method result
 
 像 typing 这种 `msg=method` 的调用，不能只看“我发出去了”，还要看服务端返回的 `result/error`。  
@@ -216,6 +222,7 @@ E2EE 下文本和媒体必须分开看：
 - E2EE 初始化失败时，未加密房间必须继续可用
 - 某个加密房间拿不到 key，不应拖垮其他房间
 - 某条加密消息解不开，只跳过那一条
+- 如果无法确认房间信息，发送侧不能把未知房间合成为未加密公开频道；未知状态应 fail-closed，避免实际加密房间误走明文发送
 
 不要把 E2EE 错误冒泡成全局断线或平台不可用。
 
@@ -243,6 +250,10 @@ E2EE 下文本和媒体必须分开看：
 `远程媒体下载失败，原文件链接：<url>`
 
 这样至少还能保住可点击链接，不会让用户误以为 bot 没回。
+
+普通房间里“文本 + 远端图片”的合并发送路径也必须复用媒体桥接层的 fallback。不能因为图片前面有文本就绕过 `send_image_url()`，否则下载失败时会只发文本而丢失图片链接。
+
+event 回复路径（`rocketchat_event._send_combined`）和 send_by_session 路径（`rocketchat_sender._send_combined_chain`）的“文本+图片合并发送”必须共用同一实现，即 `rocketchat_media.upload_combined_images()`。两边各自维护一份循环会漂移：历史上 sender 路径只处理 `file://`、漏了 `base64://`，导致 AstrBot 以 `Image.fromBytes` 生成的内存图片在 send_by_session 路径被当成字面文件名上传失败。统一入口后，http 下载、base64 解码、file 解析、下载失败 fallback、caption 归属只在一处维护。
 
 ### 7.3 File 组件保持简单退化
 

@@ -14,6 +14,89 @@ from astrbot.api import logger
 from astrbot.api.message_components import File, Image, Record, Video
 
 
+def _is_http_url(file_ref: str) -> bool:
+    return file_ref.startswith("http://") or file_ref.startswith("https://")
+
+
+async def _resolve_image_upload_path(
+    adapter: Any,
+    file_ref: str,
+) -> tuple[str | None, Callable[[], None] | None]:
+    """将图片引用解析为可上传的本地路径，统一处理 http / base64 / file 三类。"""
+    if _is_http_url(file_ref):
+        return await adapter._download_remote_media(file_ref, ".png")
+    if file_ref.startswith("base64://"):
+        return adapter._decode_base64_media(file_ref, ".png")
+    local_path = file_ref.replace("file:///", "").replace("file://", "")
+    return (local_path or None, None)
+
+
+def _guess_upload_filename(
+    file_ref: str,
+    local_path: str,
+    fallback: str = "image.png",
+) -> str:
+    if file_ref.startswith("base64://"):
+        return fallback
+    candidate = os.path.basename(urlparse(file_ref).path)
+    if candidate:
+        return candidate
+    return os.path.basename(local_path) or fallback
+
+
+async def upload_combined_images(
+    adapter: Any,
+    room_id: str,
+    text: str,
+    images: List[Image],
+    tmid: Optional[str] = None,
+) -> bool:
+    """
+    将文本与一组图片合并为 Rocket.Chat 媒体消息发送。
+
+    首张图片通过 rooms.media + rooms.mediaConfirm(msg=...) 携带 text 作为 caption，
+    后续图片独立确认生成消息。远端图片优先下载到本地再上传（规避防盗链）；下载失败时
+    降级为 URL 引用发送，避免丢图。base64:// / file:// 引用均解析为本地文件后上传。
+
+    返回 text 是否已随某张图片一起发出；调用方据此决定是否再单独补发文本。
+    """
+    sent_text_with_image = False
+    cleanups: list[Callable[[], None]] = []
+    try:
+        for img in images:
+            file_ref: str = img.file or getattr(img, "url", None) or ""
+            if not file_ref:
+                continue
+
+            local_path, cleanup = await _resolve_image_upload_path(adapter, file_ref)
+            if cleanup:
+                cleanups.append(cleanup)
+
+            if not local_path:
+                if _is_http_url(file_ref):
+                    caption = text if not sent_text_with_image else ""
+                    if await adapter._media.send_image_url(
+                        room_id, file_ref, text=caption, tmid=tmid,
+                    ):
+                        sent_text_with_image = sent_text_with_image or bool(caption)
+                continue
+
+            caption = text if not sent_text_with_image else ""
+            uploaded = await adapter._media.upload_local_file(
+                room_id,
+                local_path,
+                _guess_upload_filename(file_ref, local_path),
+                description=caption,
+                tmid=tmid,
+            )
+            if uploaded:
+                sent_text_with_image = sent_text_with_image or bool(caption)
+    finally:
+        for cleanup in cleanups:
+            cleanup()
+    return sent_text_with_image
+
+
 class RocketChatMediaBridge:
     """Rocket.Chat media send/receive helpers, including E2EE file flows."""
 
@@ -653,6 +736,11 @@ class RocketChatMediaBridge:
         tmid: Optional[str] = None,
     ) -> bool:
         room_info = await self.adapter._get_room_info(room_id)
+        if self.adapter._is_unknown_room_info(room_info):
+            logger.warning(
+                f"[RocketChat][room] 房间信息未知，拒绝上传媒体以避免误走明文 room_id={room_id!r}"
+            )
+            return False
         if self._is_e2ee_room_info(room_info):
             return await self.upload_encrypted_file(
                 room_id,
@@ -670,10 +758,12 @@ class RocketChatMediaBridge:
         )
 
     def _is_e2ee_room_info(self, room_info: dict[str, Any]) -> bool:
-        return bool(room_info.get("encrypted") and room_info.get("t") in {"d", "p"})
+        return self.adapter._is_e2ee_room_info(room_info)
 
     async def is_encrypted_room(self, room_id: str) -> bool:
         room_info = await self.adapter._get_room_info(room_id)
+        if self.adapter._is_unknown_room_info(room_info):
+            return False
         return self._is_e2ee_room_info(room_info)
 
     async def send_remote_media_fallback(
@@ -703,7 +793,7 @@ class RocketChatMediaBridge:
         image_url: str,
         text: str = "",
         tmid: Optional[str] = None,
-    ) -> None:
+    ) -> bool:
         # 统一：先下载远程图片到本地，再通过文件上传发送
         # 避免外部 URL 防盗链（Referer 检查）导致图片在 Rocket.Chat 中无法显示
         local_path, cleanup = await self.download_remote_media(image_url, ".png")
@@ -719,16 +809,16 @@ class RocketChatMediaBridge:
                 logger.warning(
                     f"[RocketChat] 远程图片下载失败，降级为 URL 引用发送 url={image_url[:80]!r}"
                 )
-                await self.adapter._send_structured_message(
+                return await self.adapter._send_structured_message(
                     room_id,
                     text,
                     attachments=[{"image_url": image_url}],
                     tmid=tmid,
                 )
-            return
+            return True
 
         try:
-            await self.send_image_file(
+            return await self.send_image_file(
                 room_id,
                 local_path,
                 description=text,
@@ -744,10 +834,10 @@ class RocketChatMediaBridge:
         file_path: str,
         description: str = "",
         tmid: Optional[str] = None,
-    ) -> None:
+    ) -> bool:
         try:
             filename = os.path.basename(file_path) or "image.png"
-            await self.upload_local_file(
+            return await self.upload_local_file(
                 room_id,
                 file_path,
                 filename,
@@ -758,6 +848,7 @@ class RocketChatMediaBridge:
             logger.error(f"[RocketChat] 图片文件不存在: {file_path}")
         except Exception as exc:
             logger.error(f"[RocketChat] 上传图片异常: {exc!r}")
+        return False
 
     async def send_file(
         self,

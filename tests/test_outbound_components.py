@@ -32,9 +32,11 @@ class _DummyEventAdapter:
         self.sent_quotes: list[tuple[str, str, dict, str | None, str | None]] = []
         self.typing_calls: list[tuple[str, bool, str | None]] = []
         self.media_uploads: list[tuple[str, str, str, str, str | None]] = []
+        self.sent_image_urls: list[tuple[str, str, str, str | None]] = []
         self.events: list[tuple[str, str]] = []
         self._media = self
         self.upload_results: list[bool] = []
+        self.download_results: list[tuple[str | None, None]] = []
 
     async def _get_room_info(self, room_id: str) -> dict:
         return {"_id": room_id, "t": "c", "encrypted": False}
@@ -85,16 +87,37 @@ class _DummyEventAdapter:
         file_path: str,
         description: str = "",
         tmid: str | None = None,
-    ) -> None:
+    ) -> bool:
         self.media_uploads.append((room_id, file_path, "image.png", description, tmid))
         self.events.append(("media", description))
+        return True
+
+    async def send_image_url(
+        self,
+        room_id: str,
+        image_url: str,
+        text: str = "",
+        tmid: str | None = None,
+    ) -> bool:
+        self.sent_image_urls.append((room_id, image_url, text, tmid))
+        self.events.append(("image-url", text))
+        return True
 
     async def _download_remote_media(
         self,
         url: str,
         default_suffix: str,
-    ) -> tuple[str, None]:
+    ) -> tuple[str | None, None]:
+        if self.download_results:
+            return self.download_results.pop(0)
         return "/tmp/downloaded.png", None
+
+    def _decode_base64_media(
+        self,
+        file_ref: str,
+        default_suffix: str,
+    ) -> tuple[str | None, None]:
+        return "/tmp/decoded.png", None
 
 
 class _DummySenderAdapter:
@@ -102,13 +125,21 @@ class _DummySenderAdapter:
         self.sent_texts: list[tuple[str, str, str | None]] = []
         self.sent_quotes: list[tuple[str, str, dict, str | None]] = []
         self.media_uploads: list[tuple[str, str, str, str, str | None]] = []
+        self.sent_image_urls: list[tuple[str, str, str, str | None]] = []
         self.events: list[tuple[str, str]] = []
         self.messages_by_id: dict[str, dict] = {}
         self._media = self
         self.upload_results: list[bool] = []
+        self.download_results: list[tuple[str | None, None]] = []
 
     async def _get_room_info(self, room_id: str) -> dict:
         return {"_id": room_id, "t": "c", "encrypted": False}
+
+    def _is_unknown_room_info(self, room_info: dict) -> bool:
+        return bool(room_info.get("_unknown"))
+
+    def _is_e2ee_room_info(self, room_info: dict) -> bool:
+        return bool(room_info.get("encrypted") and room_info.get("t") in {"d", "p"})
 
     async def _fetch_message_by_id(self, msg_id: str) -> dict | None:
         return self.messages_by_id.get(msg_id)
@@ -136,16 +167,37 @@ class _DummySenderAdapter:
         file_path: str,
         description: str = "",
         tmid: str | None = None,
-    ) -> None:
+    ) -> bool:
         self.media_uploads.append((room_id, file_path, "image.png", description, tmid))
         self.events.append(("media", description))
+        return True
+
+    async def send_image_url(
+        self,
+        room_id: str,
+        image_url: str,
+        text: str = "",
+        tmid: str | None = None,
+    ) -> bool:
+        self.sent_image_urls.append((room_id, image_url, text, tmid))
+        self.events.append(("image-url", text))
+        return True
 
     async def _download_remote_media(
         self,
         url: str,
         default_suffix: str,
-    ) -> tuple[str, None]:
+    ) -> tuple[str | None, None]:
+        if self.download_results:
+            return self.download_results.pop(0)
         return "/tmp/downloaded.png", None
+
+    def _decode_base64_media(
+        self,
+        file_ref: str,
+        default_suffix: str,
+    ) -> tuple[str | None, None]:
+        return "/tmp/decoded.png", None
 
 
 class _DummyE2EE:
@@ -326,6 +378,34 @@ class RocketChatOutboundComponentTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(adapter.events, [("media", "远端图文")])
 
+    async def test_event_send_combined_remote_image_download_failure_keeps_image_fallback(self) -> None:
+        adapter = _DummyEventAdapter()
+        adapter.download_results = [(None, None)]
+        event = RocketChatMessageEvent(
+            message_str="",
+            message_obj=_DummyMessage(),
+            platform_meta=PlatformMetadata(
+                name="rocket_chat",
+                description="Rocket.Chat",
+                id="rocket_chat",
+            ),
+            session_id="room-1",
+            room_id="room-1",
+            thread_id="thread-1",
+            adapter=adapter,
+        )
+        chain = MessageChain()
+        chain.chain.extend([Plain(text="远端图文"), Image.fromURL("https://example.com/a.png")])
+
+        await event.send(chain)
+
+        self.assertEqual(adapter.media_uploads, [])
+        self.assertEqual(
+            adapter.sent_image_urls,
+            [("room-1", "https://example.com/a.png", "远端图文", "thread-1")],
+        )
+        self.assertEqual(adapter.sent_texts, [])
+
     async def test_event_send_keeps_text_when_first_combined_image_upload_fails(self) -> None:
         adapter = _DummyEventAdapter()
         adapter.upload_results = [False, True]
@@ -385,6 +465,46 @@ class RocketChatOutboundComponentTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(adapter.sent_texts, [("room-1", "后续文字", "thread-1")])
         self.assertEqual(adapter.events, [("media", "图文测试"), ("text", "后续文字")])
+
+    async def test_sender_bridge_combined_remote_image_download_failure_keeps_image_fallback(self) -> None:
+        adapter = _DummySenderAdapter()
+        adapter.download_results = [(None, None)]
+        sender = RocketChatSenderBridge(adapter)
+
+        async def send_text(room_id: str, text: str, tmid: str | None = None) -> None:
+            adapter.sent_texts.append((room_id, text, tmid))
+            adapter.events.append(("text", text))
+
+        sender.send_text = send_text  # type: ignore[method-assign]
+
+        chain = MessageChain()
+        chain.chain.extend([Plain(text="远端图文"), Image.fromURL("https://example.com/a.png")])
+
+        await sender.send_message_chain("room-1", chain, tmid="thread-1")
+
+        self.assertEqual(adapter.media_uploads, [])
+        self.assertEqual(
+            adapter.sent_image_urls,
+            [("room-1", "https://example.com/a.png", "远端图文", "thread-1")],
+        )
+        self.assertEqual(adapter.sent_texts, [])
+
+    async def test_sender_bridge_unknown_room_info_does_not_send_plaintext(self) -> None:
+        class _UnknownRoomAdapter(_DummySenderAdapter):
+            async def _get_room_info(self, room_id: str) -> dict:
+                return {"_id": room_id, "_unknown": True, "encrypted": None, "t": None}
+
+        adapter = _UnknownRoomAdapter()
+        sender = RocketChatSenderBridge(adapter)
+
+        async def post_json_message(url: str, payload: dict) -> bool:
+            raise AssertionError("unknown room must not be sent as plaintext")
+
+        sender.post_json_message = post_json_message  # type: ignore[method-assign]
+
+        sent = await sender.send_structured_message("room-1", "hello")
+
+        self.assertFalse(sent)
 
     async def test_sender_bridge_splits_image_before_plain_to_preserve_order(self) -> None:
         adapter = _DummySenderAdapter()
@@ -579,6 +699,53 @@ class RocketChatOutboundComponentTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("type=", text)
         self.assertEqual(adapter.posted_json[0][0], "https://chat.example.com/api/v1/chat.sendMessage")
         self.assertEqual(adapter.posted_json[0][1]["message"]["t"], "e2e")
+
+    async def test_sender_bridge_combined_base64_image_is_decoded_and_uploaded(self) -> None:
+        adapter = _DummySenderAdapter()
+        sender = RocketChatSenderBridge(adapter)
+
+        async def send_text(room_id: str, text: str, tmid: str | None = None) -> None:
+            adapter.sent_texts.append((room_id, text, tmid))
+
+        sender.send_text = send_text  # type: ignore[method-assign]
+
+        chain = MessageChain()
+        chain.chain.extend([Plain(text="内存图"), Image(file="base64://AAAA")])
+
+        await sender.send_message_chain("room-1", chain, tmid="thread-1")
+
+        self.assertEqual(
+            adapter.media_uploads,
+            [("room-1", "/tmp/decoded.png", "image.png", "内存图", "thread-1")],
+        )
+        self.assertEqual(adapter.sent_image_urls, [])
+        self.assertEqual(adapter.sent_texts, [])
+
+    async def test_event_send_combined_base64_image_is_decoded_and_uploaded(self) -> None:
+        adapter = _DummyEventAdapter()
+        event = RocketChatMessageEvent(
+            message_str="",
+            message_obj=_DummyMessage(),
+            platform_meta=PlatformMetadata(
+                name="rocket_chat",
+                description="Rocket.Chat",
+                id="rocket_chat",
+            ),
+            session_id="room-1",
+            room_id="room-1",
+            thread_id=None,
+            adapter=adapter,
+        )
+        chain = MessageChain()
+        chain.chain.extend([Plain(text="内存图"), Image(file="base64://AAAA")])
+
+        await event.send(chain)
+
+        self.assertEqual(
+            adapter.media_uploads,
+            [("room-1", "/tmp/decoded.png", "image.png", "内存图", None)],
+        )
+        self.assertEqual(adapter.sent_texts, [])
 
 
 if __name__ == "__main__":

@@ -94,9 +94,23 @@ class _DummyAdapter:
             "X-User-Id": self.user_id,
         }
 
+    def _is_unknown_room_info(self, room_info: dict[str, Any]) -> bool:
+        return bool(room_info.get("_unknown"))
+
+    def _is_e2ee_room_info(self, room_info: dict[str, Any]) -> bool:
+        return bool(room_info.get("encrypted") and room_info.get("t") in {"d", "p"})
+
+    async def _get_room_info(self, room_id: str) -> dict[str, Any]:
+        return {"_id": room_id, "t": "c", "encrypted": False}
+
     async def _post_json_message(self, url: str, payload: dict[str, Any]) -> bool:
         self.posted_json.append((url, payload))
         return True
+
+
+class _UnknownRoomAdapter(_DummyAdapter):
+    async def _get_room_info(self, room_id: str) -> dict[str, Any]:
+        return {"_id": room_id, "t": None, "encrypted": None, "_unknown": True}
 
 
 class RocketChatPlainUploadTests(unittest.IsolatedAsyncioTestCase):
@@ -174,6 +188,22 @@ class RocketChatPlainUploadTests(unittest.IsolatedAsyncioTestCase):
         bridge.post_multipart_json_response = post_multipart_json_response  # type: ignore[method-assign]
 
         uploaded = await bridge.upload_plain_file("room-1", self.file_path, "test.txt")
+
+        self.assertFalse(uploaded)
+
+    async def test_upload_local_file_refuses_unknown_room_info(self) -> None:
+        bridge = RocketChatMediaBridge(_UnknownRoomAdapter())
+
+        async def upload_plain_file(*args: Any, **kwargs: Any) -> bool:
+            raise AssertionError("unknown room must not use plaintext upload")
+
+        async def upload_encrypted_file(*args: Any, **kwargs: Any) -> bool:
+            raise AssertionError("unknown room must not use encrypted upload")
+
+        bridge.upload_plain_file = upload_plain_file  # type: ignore[method-assign]
+        bridge.upload_encrypted_file = upload_encrypted_file  # type: ignore[method-assign]
+
+        uploaded = await bridge.upload_local_file("room-1", self.file_path, "test.txt")
 
         self.assertFalse(uploaded)
 
