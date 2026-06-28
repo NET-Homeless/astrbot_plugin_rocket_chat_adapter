@@ -64,6 +64,27 @@ class RocketChatRealtimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(adapter._pending_room_subscriptions, {})
         self.assertIn("room-1", adapter._subscribed_rooms)
 
+    async def test_subscribe_rooms_issues_subs_without_recaching(self) -> None:
+        adapter = _DummyAdapter()
+        bridge = RocketChatRealtimeBridge(adapter)
+        ws = _DummyWs()
+        subscriptions = [
+            {"rid": "room-a", "t": "c", "name": "general"},
+            {"rid": "room-b", "t": "p", "fname": "私密 组"},
+            {"_id": "no-rid"},
+        ]
+
+        await bridge.ddp_subscribe_rooms(ws, subscriptions)
+
+        # 每个有 rid 的房间发出一次 sub，缺 rid 的被跳过
+        self.assertEqual(len(ws.sent), 2)
+        self.assertEqual(
+            adapter._pending_room_subscriptions,
+            {"room-room-a": "room-a", "room-room-b": "room-b"},
+        )
+        # 缓存由 _get_subscriptions 负责，这里不应再写
+        self.assertEqual(adapter.cached_rooms, [])
+
 
 if __name__ == "__main__":
     unittest.main()

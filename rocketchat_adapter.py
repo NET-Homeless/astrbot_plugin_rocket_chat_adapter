@@ -13,7 +13,7 @@ from __future__ import annotations
 import asyncio
 from asyncio import Queue
 from typing import Any, Callable, Dict, List, Optional
-from urllib.parse import urlparse
+from urllib.parse import quote, urlparse
 
 import aiohttp
 from astrbot.api import logger
@@ -500,9 +500,9 @@ class RocketChatAdapter(Platform):
         
         # 补全链接路径
         if room_type == "c":
-            path = f"channel/{room_name}" if room_name else f"channel/{room_id}"
+            path = f"channel/{quote(room_name, safe='')}" if room_name else f"channel/{room_id}"
         elif room_type == "p":
-            path = f"group/{room_name}" if room_name else f"group/{room_id}"
+            path = f"group/{quote(room_name, safe='')}" if room_name else f"group/{room_id}"
         elif room_type == "d":
             path = f"direct/{room_id}"
         else:

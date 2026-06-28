@@ -106,26 +106,12 @@ class RocketChatRealtimeBridge:
         ws: aiohttp.ClientWebSocketResponse,
         subscriptions: List[dict],
     ) -> None:
+        # 房间信息已由 _get_subscriptions() 缓存（run() 在本方法之前调用），
+        # 这里只负责发起 stream-room-messages 订阅，不重复写缓存。
         for sub in subscriptions:
             room_id = sub.get("rid")
             if not room_id:
                 continue
-            room_type = sub.get("t")
-            if room_type:
-                self.adapter._room_type_cache[room_id] = room_type
-            room_name = sub.get("name") or sub.get("fname")
-            if room_name:
-                self.adapter._room_name_cache[room_id] = room_name
-            await self.adapter._cache_room_info(
-                {
-                    "_id": room_id,
-                    "t": room_type or "c",
-                    "name": sub.get("name"),
-                    "fname": sub.get("fname"),
-                    "encrypted": bool(sub.get("encrypted", False)),
-                    "e2eKeyId": sub.get("e2eKeyId"),
-                }
-            )
             await self._subscribe_room_messages(ws, room_id)
 
     async def ddp_subscribe_user_events(
