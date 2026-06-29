@@ -8,6 +8,14 @@ from astrbot.api.message_components import File, Image, Plain, Record, Reply, Vi
 
 from .rocketchat_components import append_rendered_component, render_message_chain_text
 from .rocketchat_media import upload_combined_images
+from .rocketchat_segments import (
+    ImageGroup,
+    MediaItem,
+    SegmentSender,
+    TextSegment,
+    dispatch_segments,
+    iter_segments,
+)
 
 
 class RocketChatSenderBridge:
@@ -308,156 +316,106 @@ class RocketChatSenderBridge:
             room_info = await self.adapter._get_room_info(room_id)
             is_e2ee = self.adapter._is_e2ee_room_info(room_info)
 
-            text_parts: list[str] = []
-            pending_images: list[Image] = []
-            text_before_image = False
-
-            for comp in message_chain.chain:
-                if isinstance(comp, Plain):
-                    if pending_images:
-                        await self._flush_group_chain(
-                            room_id, text_parts, pending_images,
-                            text_before_image, tmid,
-                        )
-                        text_before_image = False
-                    text_parts.append(comp.text)
-
-                elif isinstance(comp, Image):
-                    if is_e2ee:
-                        # E2EE: 先发文本，再单独发图片
-                        await self._flush_group_chain(
-                            room_id, text_parts, pending_images,
-                            text_before_image, tmid,
-                        )
-                        text_before_image = False
-                        await self._send_single_image(comp, room_id, tmid)
-                    else:
-                        # 首次遇到图片时，检查前面是否有文本
-                        if not pending_images and not text_parts:
-                            pass  # 空段
-                        elif not pending_images:
-                            text_before_image = bool("".join(text_parts).strip())
-                        pending_images.append(comp)
-
-                elif isinstance(comp, (File, Record, Video)):
-                    # 非图片媒体：先 flush 当前段，再单独发送
-                    await self._flush_group_chain(
-                        room_id, text_parts, pending_images,
-                        text_before_image, tmid,
-                    )
-                    text_before_image = False
-
-                    if isinstance(comp, File):
-                        file_ref = comp.file or getattr(comp, "url", None) or ""
-                        if file_ref.startswith("http://") or file_ref.startswith("https://"):
-                            await self.send_text(
-                                room_id,
-                                f"{comp.name}: {file_ref}" if getattr(comp, "name", None) else file_ref,
-                                tmid,
-                            )
-                        else:
-                            local_path = file_ref.replace("file:///", "").replace("file://", "")
-                            if local_path:
-                                await self.send_file(
-                                    room_id,
-                                    local_path,
-                                    filename=getattr(comp, "name", None),
-                                    tmid=tmid,
-                                )
-
-                    elif isinstance(comp, (Record, Video)):
-                        file_ref = comp.file or getattr(comp, "url", None) or ""
-                        suffix = ".mp4" if isinstance(comp, Video) else ".ogg"
-                        media_path, cleanup = await self.resolve_outbound_media_path(file_ref, suffix)
-                        if media_path:
-                            try:
-                                await self.send_file(room_id, media_path, tmid=tmid)
-                            finally:
-                                if cleanup:
-                                    cleanup()
-
-                elif isinstance(comp, Reply):
-                    pass
-
-                else:
-                    if pending_images:
-                        await self._flush_group_chain(
-                            room_id, text_parts, pending_images,
-                            text_before_image, tmid,
-                        )
-                        text_before_image = False
-                    append_rendered_component(text_parts, comp)
-
-            # 发送剩余内容
-            await self._flush_group_chain(
-                room_id, text_parts, pending_images, text_before_image, tmid,
+            # 使用统一的保序切分 + 分发
+            sender_adapter = _SenderSegmentSender(self, room_id, tmid)
+            segments = iter_segments(
+                message_chain.chain,
+                is_e2ee=is_e2ee,
+                render_at=False,
+                render_other=lambda parts, comp: append_rendered_component(parts, comp),
             )
+            await dispatch_segments(segments, sender_adapter)
 
-    async def _send_single_image(
-        self, comp: Image, room_id: str, tmid: Optional[str],
+
+# ============================================================================
+# 保序发送：SegmentSender 适配器（Sender 路径）
+# ============================================================================
+
+
+class _SenderSegmentSender:
+    """RocketChatSenderBridge 的 SegmentSender 适配器。"""
+
+    def __init__(
+        self,
+        bridge: "RocketChatSenderBridge",
+        room_id: str,
+        tmid: Optional[str],
     ) -> None:
-        """发送单张图片（保持顺序时使用）。"""
+        self.bridge = bridge
+        self.room_id = room_id
+        self.tmid = tmid
+
+    async def send_text(self, text: str) -> None:
+        await self.bridge.send_text(self.room_id, text, self.tmid)
+
+    async def send_image_group(self, group: ImageGroup) -> None:
+        await self._send_image_group(group)
+
+    async def send_media(self, item: MediaItem) -> None:
+        comp = item.component
+        if isinstance(comp, File):
+            file_ref = comp.file or getattr(comp, "url", None) or ""
+            if file_ref.startswith("http://") or file_ref.startswith("https://"):
+                await self.bridge.send_text(
+                    self.room_id,
+                    f"{comp.name}: {file_ref}" if getattr(comp, "name", None) else file_ref,
+                    self.tmid,
+                )
+            else:
+                local_path = file_ref.replace("file:///", "").replace("file://", "")
+                if local_path:
+                    await self.bridge.send_file(
+                        self.room_id,
+                        local_path,
+                        filename=getattr(comp, "name", None),
+                        tmid=self.tmid,
+                    )
+        elif isinstance(comp, (Record, Video)):
+            file_ref = comp.file or getattr(comp, "url", None) or ""
+            suffix = ".mp4" if isinstance(comp, Video) else ".ogg"
+            media_path, cleanup = await self.bridge.resolve_outbound_media_path(file_ref, suffix)
+            if media_path:
+                try:
+                    await self.bridge.send_file(self.room_id, media_path, tmid=self.tmid)
+                finally:
+                    if cleanup:
+                        cleanup()
+
+    async def _send_image_group(self, group: ImageGroup) -> None:
+        """发送图片组。
+
+        仅当 caption 非空时才尝试合并发送。
+        否则逐个独立发送。
+        """
+        if not group.images:
+            return
+
+        images = list(group.images)
+        text = group.caption
+
+        if not text:
+            # 无 caption：逐个发送
+            for img in images:
+                await self._send_single_image(img)
+            return
+
+        # 有 caption：尝试合并
+        sent_text_with_image = await upload_combined_images(
+            self.bridge.adapter, self.room_id, text, images, tmid=self.tmid,
+        )
+
+        if text and not sent_text_with_image:
+            await self.bridge.send_text(self.room_id, text, self.tmid)
+
+    async def _send_single_image(self, comp: Image) -> None:
+        """发送单张图片。"""
         file_ref: str = comp.file or getattr(comp, "url", None) or ""
         if not file_ref:
             return
         if file_ref.startswith("http"):
-            await self.send_image_url(room_id, file_ref, tmid=tmid)
+            await self.bridge.send_image_url(self.room_id, file_ref, tmid=self.tmid)
         else:
             local_path = file_ref.replace("file:///", "").replace("file://", "")
             if local_path:
-                await self.send_image_file(room_id, local_path, tmid=tmid)
+                await self.bridge.send_image_file(self.room_id, local_path, tmid=self.tmid)
 
-    async def _flush_group_chain(
-        self,
-        room_id: str,
-        text_parts: list[str],
-        pending_images: list[Image],
-        text_before_image: bool,
-        tmid: Optional[str],
-    ) -> None:
-        """
-        Flush 当前段的内容，保持原始顺序。
-
-        - 文本在前 + 图片在后 → 首张图片携带文本合并为官方媒体消息
-        - 图片在前 → 图片单独发送以保持顺序，文本随后单独发送
-        """
-        text = "".join(text_parts).strip()
-
-        if pending_images:
-            if text_before_image and text:
-                await self._send_combined_chain(
-                    room_id, text, list(pending_images), tmid,
-                )
-            else:
-                for img in pending_images:
-                    await self._send_single_image(img, room_id, tmid)
-                if text:
-                    await self.send_text(room_id, text, tmid)
-        elif text:
-            await self.send_text(room_id, text, tmid)
-
-        text_parts.clear()
-        pending_images.clear()
-
-    async def _send_combined_chain(
-        self,
-        room_id: str,
-        text: str,
-        images: list[Image],
-        tmid: Optional[str],
-    ) -> None:
-        """
-        将文本与图片合并为一条 Rocket.Chat 消息发送（send_by_session 路径）。
-
-        复用 rocketchat_media.upload_combined_images，与 event 路径共享同一套
-        下载 / base64 解码 / fallback / caption 归属逻辑。
-        """
-        if not text and not images:
-            return
-
-        sent_text_with_image = await upload_combined_images(
-            self.adapter, room_id, text, images, tmid=tmid,
-        )
-
-        if text and not sent_text_with_image:
-            await self.send_text(room_id, text, tmid)
