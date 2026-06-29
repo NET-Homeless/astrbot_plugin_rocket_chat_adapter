@@ -59,4 +59,5 @@ exclude = [
     ".pytest_cache",
     "build",
     "dist",
+    "tests/**",   # 测试使用 _bootstrap 动态 mock，pyright 无法解析导入，属于预期噪音
 ]
