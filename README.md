@@ -29,8 +29,9 @@
 |------|----------|
 | Python | >= 3.10 |
 | AstrBot | >= 4.0 |
-| aiohttp | >= 3.9 |
 | Rocket.Chat Server | >= 8.5 LTS（当前实现以 8.5 官方行为为基线）|
+
+> 运行时依赖 `aiohttp`、`cryptography` 均由 AstrBot 本体提供，插件无需单独安装。如需脱离 AstrBot 单独运行 `tests/`，请执行 `pip install -r requirements-dev.txt`。
 
 ---
 
@@ -313,7 +314,8 @@ astrbot_plugin_rocket_chat_adapter/
 ├── rocketchat_e2ee.py           # Rocket.Chat E2EE 协议与密钥管理
 ├── rocketchat_event.py          # AstrMessageEvent 实现（回复链路）
 ├── metadata.yaml                # 插件元数据
-├── requirements.txt             # Python 依赖
+├── requirements.txt             # 运行时依赖说明（由 AstrBot 本体提供）
+├── requirements-dev.txt         # 开发/测试依赖（脱离 AstrBot 跑测试时安装）
 ├── docs/
 │   └── DEVELOPMENT_KNOWLEDGE_BASE.md
 └── README.md                    # 本文档
