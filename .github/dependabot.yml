@@ -12,6 +12,13 @@ updates:
     commit-message:
       prefix: "deps"
       include: "scope"
+    # dev 依赖（requirements-dev.txt）镜像 AstrBot 本体，忽略 major 升级，
+    # 仅跟进 patch/minor，避免测试版本过度领先本体运行版本
+    ignore:
+      - dependency-name: "aiohttp"
+        update-types: ["version-update:semver-major"]
+      - dependency-name: "cryptography"
+        update-types: ["version-update:semver-major"]
 
   # GitHub Actions（.github/workflows/）
   - package-ecosystem: "github-actions"
