@@ -12,8 +12,26 @@ permissions:
   contents: write
 
 jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dev dependencies
+        run: pip install -r requirements-dev.txt
+
+      - name: Run unit tests
+        run: python -m unittest discover -s tests -p "test_*.py" -v
+
   release:
     runs-on: ubuntu-latest
+    needs: test
     steps:
       - name: Checkout code
         uses: actions/checkout@v7
@@ -26,17 +44,17 @@ jobs:
           # 从 metadata.yaml 中提取 version 字段（去掉两端可能的引号和空格）
           VERSION=$(grep '^version:' metadata.yaml | sed 's/^version:[[:space:]]*//' | tr -d '"'\''')
           echo "Parsed version: $VERSION"
-          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
 
       - name: Check if tag already exists
         id: check_tag
         run: |
           # 检查对应版本的 tag 是否已经存在，避免重复发布报错
           if git rev-parse "refs/tags/${{ steps.get_version.outputs.version }}" >/dev/null 2>&1; then
-            echo "exists=true" >> $GITHUB_OUTPUT
+            echo "exists=true" >> "$GITHUB_OUTPUT"
             echo "Tag ${{ steps.get_version.outputs.version }} 已经存在，跳过发布。"
           else
-            echo "exists=false" >> $GITHUB_OUTPUT
+            echo "exists=false" >> "$GITHUB_OUTPUT"
           fi
 
       - name: Create Release and Changelog
