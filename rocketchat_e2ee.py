@@ -2,16 +2,18 @@ from __future__ import annotations
 
 import asyncio
 import base64
+from dataclasses import dataclass, field
 import hashlib
 import json
 import os
+from typing import Any
 import uuid
-from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Set
 
 from astrbot.api import logger
-from cryptography.hazmat.primitives import hashes, padding as sym_padding
-from cryptography.hazmat.primitives.asymmetric import padding as asym_padding, rsa
+from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives import padding as sym_padding
+from cryptography.hazmat.primitives.asymmetric import padding as asym_padding
+from cryptography.hazmat.primitives.asymmetric import rsa
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
@@ -208,7 +210,7 @@ class SessionKey:
     raw_jwk: dict[str, Any]
 
     @classmethod
-    def generate(cls, key_id: str) -> "SessionKey":
+    def generate(cls, key_id: str) -> SessionKey:
         key_bytes = os.urandom(32)
         jwk = {
             "kty": "oct",
@@ -220,7 +222,7 @@ class SessionKey:
         return cls(key_id=key_id, alg="A256GCM", key_bytes=key_bytes, raw_jwk=jwk)
 
     @classmethod
-    def from_jwk_json(cls, key_id: str, jwk_json: str) -> "SessionKey":
+    def from_jwk_json(cls, key_id: str, jwk_json: str) -> SessionKey:
         jwk = json.loads(jwk_json)
         return cls(
             key_id=key_id,
@@ -257,10 +259,10 @@ class SessionKey:
 
 @dataclass
 class RoomKeyStore:
-    current: Optional[SessionKey] = None
+    current: SessionKey | None = None
     old_keys: dict[str, SessionKey] = field(default_factory=dict)
 
-    def find(self, key_id: str) -> Optional[SessionKey]:
+    def find(self, key_id: str) -> SessionKey | None:
         return self.old_keys.get(key_id) or self.current
 
 
@@ -291,19 +293,21 @@ class RocketChatE2EEManager:
         self.enabled = enabled
         self.password = password or ""
         self.ready = False
-        self.public_key_json: Optional[str] = None
-        self.private_key: Optional[rsa.RSAPrivateKey] = None
+        self.public_key_json: str | None = None
+        self.private_key: rsa.RSAPrivateKey | None = None
         self._room_keys: dict[str, RoomKeyStore] = {}
         self._room_locks: dict[str, asyncio.Lock] = {}
         self._subscriptions_by_room: dict[str, dict[str, Any]] = {}
         self._subscriptions_cache_ts: float = 0.0
-        self._request_subscription_keys_task: Optional[asyncio.Task[Any]] = None
+        self._request_subscription_keys_task: asyncio.Task[Any] | None = None
 
     async def initialize(self) -> None:
         if not self.enabled:
             return
         if not self.password:
-            logger.warning("[RocketChat][E2EE] 已启用 E2EE，但未配置 e2ee_password，已跳过加密支持")
+            logger.warning(
+                "[RocketChat][E2EE] 已启用 E2EE，但未配置 e2ee_password，已跳过加密支持"
+            )
             self.enabled = False
             return
 
@@ -321,7 +325,9 @@ class RocketChatE2EEManager:
                 self.public_key_json = public_key
                 self.private_key = _import_private_jwk(private_key_json)
             else:
-                private_key_obj = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+                private_key_obj = rsa.generate_private_key(
+                    public_exponent=65537, key_size=2048
+                )
                 public_key_obj = private_key_obj.public_key()
                 public_key_json = _json_dumps(_export_public_jwk(public_key_obj))
                 private_key_json = _json_dumps(_export_private_jwk(private_key_obj))
@@ -345,7 +351,9 @@ class RocketChatE2EEManager:
             logger.info("[RocketChat][E2EE] 客户端密钥已就绪")
         except Exception as exc:
             self.ready = False
-            logger.warning(f"[RocketChat][E2EE] 初始化失败，将保持普通房间链路不受影响: {exc!r}")
+            logger.warning(
+                f"[RocketChat][E2EE] 初始化失败，将保持普通房间链路不受影响: {exc!r}"
+            )
 
     async def on_ws_ready(self) -> None:
         if not self.ready:
@@ -358,7 +366,9 @@ class RocketChatE2EEManager:
         ):
             self._ensure_request_subscription_keys_task(expected_ws)
 
-    async def should_encrypt_room(self, room_info: dict) -> bool:
+    async def should_encrypt_room(self, room_info: dict | None) -> bool:
+        if not room_info:
+            return False
         return bool(
             self.enabled
             and self.ready
@@ -366,7 +376,7 @@ class RocketChatE2EEManager:
             and room_info.get("t") in {"d", "p"}
         )
 
-    async def maybe_decrypt_message(self, raw_msg: dict) -> Optional[dict]:
+    async def maybe_decrypt_message(self, raw_msg: dict) -> dict | None:
         if raw_msg.get("t") != "e2e":
             return raw_msg
         if not self.ready:
@@ -395,10 +405,10 @@ class RocketChatE2EEManager:
         self,
         room_id: str,
         text: str = "",
-        attachments: Optional[List[Dict[str, Any]]] = None,
-        tmid: Optional[str] = None,
-        e2e_mentions: Optional[Dict[str, Any]] = None,
-    ) -> Optional[Dict[str, Any]]:
+        attachments: list[dict[str, Any]] | None = None,
+        tmid: str | None = None,
+        e2e_mentions: dict[str, Any] | None = None,
+    ) -> dict[str, Any] | None:
         content_to_encrypt: dict[str, Any] = {}
         if text:
             content_to_encrypt["msg"] = text
@@ -424,8 +434,8 @@ class RocketChatE2EEManager:
     async def encrypt_message_content(
         self,
         room_id: str,
-        content_to_encrypt: Dict[str, Any],
-    ) -> Optional[Dict[str, str]]:
+        content_to_encrypt: dict[str, Any],
+    ) -> dict[str, str] | None:
         room_info = await self.adapter._get_room_info(room_id)
         if not await self.should_encrypt_room(room_info):
             return None
@@ -455,7 +465,7 @@ class RocketChatE2EEManager:
         file_name: str,
         mime_type: str,
         file_bytes: bytes,
-    ) -> Optional[EncryptedMediaUpload]:
+    ) -> EncryptedMediaUpload | None:
         room_info = await self.adapter._get_room_info(room_id)
         if not await self.should_encrypt_room(room_info):
             return None
@@ -490,10 +500,12 @@ class RocketChatE2EEManager:
         self,
         room_id: str,
         upload: EncryptedMediaUpload,
-    ) -> Optional[dict[str, Any]]:
+    ) -> dict[str, Any] | None:
         raw = {
             "type": upload.mime_type,
-            "typeGroup": (upload.mime_type.split("/", 1)[0] if "/" in upload.mime_type else "file"),
+            "typeGroup": (
+                upload.mime_type.split("/", 1)[0] if "/" in upload.mime_type else "file"
+            ),
             "name": upload.original_name,
             "encryption": {
                 "key": upload.key_jwk,
@@ -516,13 +528,15 @@ class RocketChatE2EEManager:
         upload_url: str,
         upload: EncryptedMediaUpload,
         text: str = "",
-        tmid: Optional[str] = None,
-    ) -> Optional[dict[str, Any]]:
+        tmid: str | None = None,
+    ) -> dict[str, Any] | None:
         file_content = await self.build_upload_file_content(room_id, upload)
         if not file_content:
             return None
 
-        mime_group = upload.mime_type.split("/", 1)[0] if "/" in upload.mime_type else "file"
+        mime_group = (
+            upload.mime_type.split("/", 1)[0] if "/" in upload.mime_type else "file"
+        )
         attachment: dict[str, Any] = {
             "title": upload.original_name,
             "type": "file",
@@ -551,7 +565,11 @@ class RocketChatE2EEManager:
             attachment["video_size"] = upload.size
         else:
             attachment["size"] = upload.size
-            extension = upload.original_name.rsplit(".", 1)[-1].upper() if "." in upload.original_name else "file"
+            extension = (
+                upload.original_name.rsplit(".", 1)[-1].upper()
+                if "." in upload.original_name
+                else "file"
+            )
             attachment["format"] = extension or "file"
 
         file_meta = {
@@ -602,17 +620,19 @@ class RocketChatE2EEManager:
         self,
         room_id: str,
         *,
-        room_info: Optional[dict] = None,
-    ) -> Optional[SessionKey]:
+        room_info: dict | None = None,
+    ) -> SessionKey | None:
         room_info = room_info or await self.adapter._get_room_info(room_id)
-        if not await self.should_encrypt_room(room_info):
+        if not room_info or not await self.should_encrypt_room(room_info):
             return None
 
         try:
             lock = self._room_locks.setdefault(room_id, asyncio.Lock())
             async with lock:
                 key_store = self._room_keys.setdefault(room_id, RoomKeyStore())
-                if key_store.current and key_store.current.key_id == room_info.get("e2eKeyId"):
+                if key_store.current and key_store.current.key_id == room_info.get(
+                    "e2eKeyId"
+                ):
                     await self._maybe_share_room_key(room_id, key_store.current)
                     return key_store.current
 
@@ -654,8 +674,8 @@ class RocketChatE2EEManager:
 
     def _room_key_log_suffix(
         self,
-        room_id: Optional[str],
-        room_info: Optional[dict[str, Any]] = None,
+        room_id: str | None,
+        room_info: dict[str, Any] | None = None,
     ) -> str:
         if room_info is None:
             has_e2e_key_id: str | bool = "n/a"
@@ -707,8 +727,8 @@ class RocketChatE2EEManager:
         self,
         *,
         reason: str,
-        room_id: Optional[str] = None,
-        room_info: Optional[dict[str, Any]] = None,
+        room_id: str | None = None,
+        room_info: dict[str, Any] | None = None,
         expected_ws: Any = None,
     ) -> bool:
         if not self.ready:
@@ -728,28 +748,30 @@ class RocketChatE2EEManager:
         self,
         room_id: str,
         key_store: RoomKeyStore,
-        subscription: Optional[dict[str, Any]],
-    ) -> Optional[SessionKey]:
+        subscription: dict[str, Any] | None,
+    ) -> SessionKey | None:
         if not subscription:
             return None
 
         key_store.old_keys = await self._load_old_keys(subscription)
-        for field in ("E2ESuggestedKey", "E2EKey"):
-            encrypted_key = subscription.get(field)
+        for key_name in ("E2ESuggestedKey", "E2EKey"):
+            encrypted_key = subscription.get(key_name)
             if not encrypted_key:
                 continue
             imported = self._import_group_key(encrypted_key)
             if not imported:
                 continue
             key_store.current = imported
-            if field == "E2ESuggestedKey":
+            if key_name == "E2ESuggestedKey":
                 try:
                     await self._rest_post(
                         "/api/v1/e2e.acceptSuggestedGroupKey",
                         {"rid": room_id},
                     )
                 except Exception as exc:
-                    logger.debug(f"[RocketChat][E2EE] acceptSuggestedGroupKey 失败: {exc!r}")
+                    logger.debug(
+                        f"[RocketChat][E2EE] acceptSuggestedGroupKey 失败: {exc!r}"
+                    )
             await self._maybe_share_room_key(room_id, imported)
             return imported
         return None
@@ -758,7 +780,7 @@ class RocketChatE2EEManager:
         self,
         room_id: str,
         key_store: RoomKeyStore,
-    ) -> Optional[SessionKey]:
+    ) -> SessionKey | None:
         for attempt, delay in enumerate((0.5, 1.0, 1.0, 2.0, 2.0), start=1):
             await asyncio.sleep(delay)
             room_info = await self.adapter._get_room_info(room_id, refresh=True)
@@ -798,10 +820,14 @@ class RocketChatE2EEManager:
         await self._maybe_share_room_key(room_id, session_key)
         room_info = await self.adapter._get_room_info(room_id, refresh=True)
         await self.adapter._cache_room_info(room_info)
-        logger.info(f"[RocketChat][E2EE] 已创建房间密钥 room_id={room_id!r} key_id={key_id}")
+        logger.info(
+            f"[RocketChat][E2EE] 已创建房间密钥 room_id={room_id!r} key_id={key_id}"
+        )
         return session_key
 
-    async def _maybe_share_room_key(self, room_id: str, session_key: SessionKey) -> None:
+    async def _maybe_share_room_key(
+        self, room_id: str, session_key: SessionKey
+    ) -> None:
         try:
             users = (
                 await self._rest_get(
@@ -821,7 +847,9 @@ class RocketChatE2EEManager:
                 encrypted_users.append(
                     {
                         "_id": user_id,
-                        "key": self._encrypt_group_key_for_participant(session_key, public_key),
+                        "key": self._encrypt_group_key_for_participant(
+                            session_key, public_key
+                        ),
                     }
                 )
 
@@ -833,12 +861,16 @@ class RocketChatE2EEManager:
                 {"usersSuggestedGroupKeys": {room_id: encrypted_users}},
             )
         except Exception as exc:
-            logger.debug(f"[RocketChat][E2EE] 分发房间密钥失败 room_id={room_id!r}: {exc!r}")
+            logger.debug(
+                f"[RocketChat][E2EE] 分发房间密钥失败 room_id={room_id!r}: {exc!r}"
+            )
 
-    async def _load_old_keys(self, subscription: dict[str, Any]) -> dict[str, SessionKey]:
+    async def _load_old_keys(
+        self, subscription: dict[str, Any]
+    ) -> dict[str, SessionKey]:
         old_keys: dict[str, SessionKey] = {}
-        for field in ("oldRoomKeys", "suggestedOldRoomKeys"):
-            for key_payload in subscription.get(field, []) or []:
+        for key_name in ("oldRoomKeys", "suggestedOldRoomKeys"):
+            for key_payload in subscription.get(key_name, []) or []:
                 encrypted_key = key_payload.get("E2EKey")
                 key_id = key_payload.get("e2eKeyId")
                 if not encrypted_key or not key_id:
@@ -848,7 +880,7 @@ class RocketChatE2EEManager:
                     old_keys[key_id] = session_key
         return old_keys
 
-    def _import_group_key(self, encrypted_key: str) -> Optional[SessionKey]:
+    def _import_group_key(self, encrypted_key: str) -> SessionKey | None:
         if not self.private_key:
             return None
 
@@ -887,7 +919,7 @@ class RocketChatE2EEManager:
         self,
         raw_msg: dict[str, Any],
         key_store: RoomKeyStore,
-    ) -> Optional[dict[str, Any]]:
+    ) -> dict[str, Any] | None:
         try:
             payload = raw_msg.get("content")
             if payload:
@@ -897,12 +929,18 @@ class RocketChatE2EEManager:
                     iv = _b64_decode(iv_str)
                     ciphertext = _b64_decode(payload["ciphertext"])
                 else:
-                    logger.debug(f"[RocketChat][E2EE] 收到缺少 kid/iv 的 content: {payload}")
+                    logger.debug(
+                        f"[RocketChat][E2EE] 收到缺少 kid/iv 的 content: {payload}"
+                    )
                     cipher_str = payload.get("ciphertext", "")
                     if cipher_str.startswith("{"):
-                        logger.debug(f"[RocketChat][E2EE] ciphertext 似乎是 JSON? {cipher_str}")
-                    elif len(cipher_str) > 28: # At least 12 char kid + b64(16 byte iv)
-                        logger.debug(f"[RocketChat][E2EE] 尝试用 v1 提取法处理 content.ciphertext...")
+                        logger.debug(
+                            f"[RocketChat][E2EE] ciphertext 似乎是 JSON? {cipher_str}"
+                        )
+                    elif len(cipher_str) > 28:  # At least 12 char kid + b64(16 byte iv)
+                        logger.debug(
+                            "[RocketChat][E2EE] 尝试用 v1 提取法处理 content.ciphertext..."
+                        )
                         key_id = cipher_str[:12]
                         try:
                             decoded = _b64_decode(cipher_str[12:])
@@ -929,7 +967,11 @@ class RocketChatE2EEManager:
             if not isinstance(decoded, dict):
                 return None
 
-            if "text" in decoded and "msg" not in decoded and isinstance(decoded["text"], str):
+            if (
+                "text" in decoded
+                and "msg" not in decoded
+                and isinstance(decoded["text"], str)
+            ):
                 decoded["msg"] = decoded.pop("text")
             return decoded
         except Exception as exc:
@@ -943,7 +985,7 @@ class RocketChatE2EEManager:
         room_id: str,
         *,
         refresh: bool = False,
-    ) -> Optional[dict[str, Any]]:
+    ) -> dict[str, Any] | None:
         await self._refresh_subscriptions(force=refresh)
         return self._subscriptions_by_room.get(room_id)
 
@@ -951,11 +993,13 @@ class RocketChatE2EEManager:
         now = asyncio.get_running_loop().time()
         if not force and (now - self._subscriptions_cache_ts) < 1.0:
             return
-        subscriptions = (
-            await self._rest_get("/api/v1/subscriptions.get")
-        ).get("update", [])
+        subscriptions = (await self._rest_get("/api/v1/subscriptions.get")).get(
+            "update", []
+        )
         self._subscriptions_by_room = {
-            sub["rid"]: sub for sub in subscriptions if isinstance(sub, dict) and sub.get("rid")
+            sub["rid"]: sub
+            for sub in subscriptions
+            if isinstance(sub, dict) and sub.get("rid")
         }
         self._subscriptions_cache_ts = now
 
@@ -963,7 +1007,7 @@ class RocketChatE2EEManager:
         self,
         path: str,
         *,
-        params: Optional[dict[str, Any]] = None,
+        params: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         url = f"{self.adapter.server_url}{path}"
         async with self.adapter._http_session.get(

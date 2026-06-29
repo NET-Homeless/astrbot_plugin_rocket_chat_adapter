@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
-from typing import Any, List, Optional
+from typing import Any
 
 import aiohttp
 from astrbot.api import logger
@@ -10,9 +10,9 @@ from astrbot.api import logger
 # 导入常量
 try:
     from .rocketchat_adapter import (
+        DDP_CALL_DEFAULT_TIMEOUT,
         WEBSOCKET_HEARTBEAT_INTERVAL,
         WEBSOCKET_MAX_MSG_SIZE,
-        DDP_CALL_DEFAULT_TIMEOUT,
     )
 except ImportError:
     WEBSOCKET_HEARTBEAT_INTERVAL = 30.0
@@ -116,7 +116,7 @@ class RocketChatRealtimeBridge:
     async def ddp_subscribe_rooms(
         self,
         ws: aiohttp.ClientWebSocketResponse,
-        subscriptions: List[dict],
+        subscriptions: list[dict],
     ) -> None:
         # 房间信息已由 _get_subscriptions() 缓存（run() 在本方法之前调用），
         # 这里只负责发起 stream-room-messages 订阅，不重复写缓存。
@@ -151,7 +151,9 @@ class RocketChatRealtimeBridge:
                 except json.JSONDecodeError:
                     logger.warning(f"[RocketChat] 收到非 JSON 帧: {raw.data[:200]}")
                 except Exception as exc:
-                    logger.error(f"[RocketChat] 处理 DDP 消息时出错: {exc!r}", exc_info=True)
+                    logger.error(
+                        f"[RocketChat] 处理 DDP 消息时出错: {exc!r}", exc_info=True
+                    )
 
             elif raw.type in (
                 aiohttp.WSMsgType.CLOSE,
@@ -175,7 +177,7 @@ class RocketChatRealtimeBridge:
 
         elif msg_type == "changed":
             if collection == "stream-room-messages":
-                args: List[dict] = data.get("fields", {}).get("args", [])
+                args: list[dict] = data.get("fields", {}).get("args", [])
                 for raw_msg in args:
 
                     async def process(msg: dict) -> None:
@@ -240,7 +242,9 @@ class RocketChatRealtimeBridge:
             if not room_id:
                 continue
             self.adapter._subscribed_rooms.add(room_id)
-            logger.debug(f"[RocketChat] 房间订阅已确认: room_id={room_id!r} sub_id={sub_id!r}")
+            logger.debug(
+                f"[RocketChat] 房间订阅已确认: room_id={room_id!r} sub_id={sub_id!r}"
+            )
 
     def _handle_nosub(self, data: dict[str, Any]) -> None:
         sub_id = data.get("id")
@@ -270,7 +274,7 @@ class RocketChatRealtimeBridge:
         if room_payload:
             room_id = room_payload.get("_id") or room_payload.get("rid") or ""
 
-        if room_id and event_name.endswith("/rooms-changed"):
+        if room_id and event_name.endswith("/rooms-changed") and room_payload:
             room_type = room_payload.get("t")
             if isinstance(room_type, str) and room_type:
                 await self.adapter._cache_room_info(
@@ -287,14 +291,18 @@ class RocketChatRealtimeBridge:
                     f"[RocketChat][room] cached from notify room_id={room_id!r} type={room_type!r} event={event_type!r}"
                 )
 
-        if event_type == "inserted" and room_id and room_id not in self.adapter._subscribed_rooms:
+        if (
+            event_type == "inserted"
+            and room_id
+            and room_id not in self.adapter._subscribed_rooms
+        ):
             await self._subscribe_room_messages(ws, room_id)
             logger.info(f"[RocketChat] 动态订阅新房间: {room_id}")
 
     async def ddp_call(
         self,
         method: str,
-        params: Optional[List[Any]] = None,
+        params: list[Any] | None = None,
         timeout: float = DDP_CALL_DEFAULT_TIMEOUT,
     ) -> Any:
         if not self.adapter._ws or self.adapter._ws.closed:

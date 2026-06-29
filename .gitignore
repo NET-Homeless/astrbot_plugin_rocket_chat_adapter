@@ -212,3 +212,7 @@ __marimo__/
 .claude/
 .alma-snapshots
 .DS_Store
+
+# Claude persistent memory (project-specific, not for repo)
+MEMORY.md
+memory/

@@ -12,12 +12,12 @@ from __future__ import annotations
 
 import asyncio
 from asyncio import Queue
-from typing import Any, Callable, Dict, List, Optional, Set
+import contextlib
+from typing import TYPE_CHECKING, Any
 from urllib.parse import quote, urlparse
 
 import aiohttp
 from astrbot.api import logger
-from astrbot.api.event import MessageChain
 from astrbot.api.platform import (
     Platform,
     PlatformMetadata,
@@ -30,6 +30,11 @@ from .rocketchat_media import RocketChatMediaBridge
 from .rocketchat_realtime import RocketChatRealtimeBridge
 from .rocketchat_sender import RocketChatSenderBridge
 
+if TYPE_CHECKING:
+    from collections.abc import Callable
+
+    from astrbot.api.event import MessageChain
+    from astrbot.api.message_components import File, Image, Record, Video
 
 # ============================================================================
 # 配置常量
@@ -177,44 +182,44 @@ class RocketChatAdapter(Platform):
         self._validate_config()
 
         # 运行时状态
-        self.auth_token: Optional[str] = None
-        self.user_id: Optional[str] = None
-        self.bot_username: Optional[str] = None
+        self.auth_token: str | None = None
+        self.user_id: str | None = None
+        self.bot_username: str | None = None
 
-        self._http_session: Optional[aiohttp.ClientSession] = None
-        self._ws: Optional[aiohttp.ClientWebSocketResponse] = None
+        self._http_session: aiohttp.ClientSession | None = None
+        self._ws: aiohttp.ClientWebSocketResponse | None = None
         self._running: bool = False
         # 停止信号：terminate() 调用时 set，用于立即打断重连 sleep
-        self._stop_event: Optional[asyncio.Event] = None
+        self._stop_event: asyncio.Event | None = None
 
         # 房间类型缓存（避免重复 API 请求）
         # key: room_id, value: "c"（频道）| "p"（私有群组）| "d"（私信）
-        self._room_type_cache: Dict[str, str] = {}
+        self._room_type_cache: dict[str, str] = {}
         # 房间名称缓存，用于构造 message_link
-        self._room_name_cache: Dict[str, str] = {}
+        self._room_name_cache: dict[str, str] = {}
         # 房间完整信息缓存（类型/名称/加密状态/e2eKeyId）
-        self._room_info_cache: Dict[str, dict] = {}
+        self._room_info_cache: dict[str, dict] = {}
         # 房间信息缓存锁，防止并发更新导致数据覆盖丢失
-        self._room_cache_locks: Dict[str, asyncio.Lock] = {}
+        self._room_cache_locks: dict[str, asyncio.Lock] = {}
         # 房间信息缓存时间戳，用于 TTL 失效
-        self._room_cache_timestamps: Dict[str, float] = {}
+        self._room_cache_timestamps: dict[str, float] = {}
         # 已订阅房间集合，防止重复订阅导致消息被多次处理
-        self._subscribed_rooms: Set[str] = set()
+        self._subscribed_rooms: set[str] = set()
         # 已发出但尚未收到 DDP ready 的房间订阅，key 为 sub id，value 为 room id
-        self._pending_room_subscriptions: Dict[str, str] = {}
+        self._pending_room_subscriptions: dict[str, str] = {}
         # DDP method 调用 ID 计数器，确保每次调用 ID 唯一
         self._ddp_call_id: int = 0
         # 等待 DDP result 的 Future 映射
-        self._pending_ddp_results: Dict[str, asyncio.Future[Dict[str, Any]]] = {}
+        self._pending_ddp_results: dict[str, asyncio.Future[dict[str, Any]]] = {}
         # DDP method 调用 ID 与 method 名称映射，用于 result/error 日志关联
-        self._pending_ddp_methods: Dict[str, str] = {}
+        self._pending_ddp_methods: dict[str, str] = {}
         # 后台任务强引用集合，防止 Python 3.12+ GC 回收未完成的 task
-        self._background_tasks: Set[asyncio.Task[Any]] = set()
+        self._background_tasks: set[asyncio.Task[Any]] = set()
         # 并发处理控制，防止瞬间过多消息导致处理积压
         self._message_semaphore = asyncio.Semaphore(MESSAGE_CONCURRENCY_LIMIT)
         # 已处理入站消息 ID 缓存，防止 Rocket.Chat message updated / link preview
         # 等重复 DDP 推送导致同一条消息触发多次回复。
-        self._processed_message_ids: Dict[str, float] = {}
+        self._processed_message_ids: dict[str, float] = {}
 
         self._meta = PlatformMetadata(
             name="rocket_chat",
@@ -245,7 +250,10 @@ class RocketChatAdapter(Platform):
                 "请在 AstrBot 配置中设置 Rocket.Chat 服务器地址（如 http://localhost:3000）。"
             )
         parsed_server_url = urlparse(self.server_url)
-        if parsed_server_url.scheme not in {"http", "https"} or not parsed_server_url.netloc:
+        if (
+            parsed_server_url.scheme not in {"http", "https"}
+            or not parsed_server_url.netloc
+        ):
             raise ValueError(
                 "[RocketChat] 配置项 'server_url' 必须包含 http:// 或 https:// 协议和主机名，"
                 f"当前值: {self.server_url!r}"
@@ -319,12 +327,10 @@ class RocketChatAdapter(Platform):
                         f"{self.reconnect_delay:.1f}s 后重连..."
                     )
                     # 用 Event 等待，terminate() 可立即打断而不必等满 reconnect_delay
-                    try:
+                    with contextlib.suppress(TimeoutError):
                         await asyncio.wait_for(
                             self._stop_event.wait(), timeout=self.reconnect_delay
                         )
-                    except asyncio.TimeoutError:
-                        pass
         finally:
             await self._cleanup()
 
@@ -361,15 +367,11 @@ class RocketChatAdapter(Platform):
     async def _cleanup(self) -> None:
         """关闭 WebSocket 和 HTTP Session。"""
         if self._ws and not self._ws.closed:
-            try:
+            with contextlib.suppress(Exception):
                 await self._ws.close()
-            except Exception:
-                pass
         if self._http_session and not self._http_session.closed:
-            try:
+            with contextlib.suppress(Exception):
                 await self._http_session.close()
-            except Exception:
-                pass
 
         for future in list(self._pending_ddp_results.values()):
             if not future.done():
@@ -383,11 +385,15 @@ class RocketChatAdapter(Platform):
             for task in list(self._background_tasks):
                 if not task.done():
                     task.cancel()
-            try:
+            with contextlib.suppress(Exception):
                 await asyncio.gather(*self._background_tasks, return_exceptions=True)
-            except Exception:
-                pass
             self._background_tasks.clear()
+
+    def _get_http_session(self) -> aiohttp.ClientSession:
+        """返回可用的 HTTP session，若未初始化或已关闭则报错。"""
+        if self._http_session is None or self._http_session.closed:
+            raise RuntimeError("[RocketChat] HTTP session 未初始化或已关闭")
+        return self._http_session
 
     # ------------------------------------------------------------------ #
     #  REST API                                                            #
@@ -396,7 +402,7 @@ class RocketChatAdapter(Platform):
     async def _rest_login(self) -> None:
         """通过 REST API 登录，获取 authToken 和 userId。"""
         url = f"{self.server_url}/api/v1/login"
-        async with self._http_session.post(
+        async with self._get_http_session().post(
             url,
             json={"user": self.username, "password": self.password},
         ) as resp:
@@ -414,10 +420,12 @@ class RocketChatAdapter(Platform):
             f"[RocketChat] 登录成功 | 用户: {self.bot_username} | userId: {self.user_id}"
         )
 
-    async def _get_subscriptions(self) -> List[Dict[str, Any]]:
+    async def _get_subscriptions(self) -> list[dict[str, Any]]:
         """获取机器人所有订阅的房间列表。"""
         url = f"{self.server_url}/api/v1/subscriptions.get"
-        async with self._http_session.get(url, headers=self._get_auth_headers()) as resp:
+        async with self._get_http_session().get(
+            url, headers=self._get_auth_headers()
+        ) as resp:
             data = await resp.json()
         subscriptions = data.get("update", []) if data.get("success") else []
         for sub in subscriptions:
@@ -468,7 +476,9 @@ class RocketChatAdapter(Platform):
             if room_name:
                 self._room_name_cache[room_id] = room_name
 
-    async def _get_room_info(self, room_id: str, refresh: bool = False) -> Dict[str, Any]:
+    async def _get_room_info(
+        self, room_id: str, refresh: bool = False
+    ) -> dict[str, Any]:
         if not refresh and room_id in self._room_info_cache:
             # 检查 TTL
             ts = self._room_cache_timestamps.get(room_id, 0)
@@ -476,7 +486,11 @@ class RocketChatAdapter(Platform):
 
             # 未知房间使用较短 TTL
             is_unknown = self._is_unknown_room_info(self._room_info_cache[room_id])
-            ttl = UNKNOWN_ROOM_CACHE_TTL_SECONDS if is_unknown else ROOM_INFO_CACHE_TTL_SECONDS
+            ttl = (
+                UNKNOWN_ROOM_CACHE_TTL_SECONDS
+                if is_unknown
+                else ROOM_INFO_CACHE_TTL_SECONDS
+            )
 
             if now - ts < ttl:
                 return self._room_info_cache[room_id]
@@ -487,7 +501,7 @@ class RocketChatAdapter(Platform):
             f"[RocketChat][room] fetching room info room_id={room_id!r} url={url}"
         )
         try:
-            async with self._http_session.get(
+            async with self._get_http_session().get(
                 url, headers=self._get_auth_headers()
             ) as resp:
                 data = await resp.json()
@@ -515,7 +529,7 @@ class RocketChatAdapter(Platform):
     def _is_unknown_room_info(self, room_info: dict[str, Any]) -> bool:
         return bool(room_info.get("_unknown"))
 
-    def _is_e2ee_room_info(self, room_info: Dict[str, Any]) -> bool:
+    def _is_e2ee_room_info(self, room_info: dict[str, Any]) -> bool:
         return bool(room_info.get("encrypted") and room_info.get("t") in {"d", "p"})
 
     async def _get_room_type(self, room_id: str) -> str:
@@ -538,37 +552,53 @@ class RocketChatAdapter(Platform):
         """构造指向原始消息的 Rocket.Chat 深链接（用于引用附件）。"""
         room_type = self._room_type_cache.get(room_id, "c")
         room_name = self._room_name_cache.get(room_id, "")
-        
+
         # 补全链接路径
         if room_type == "c":
-            path = f"channel/{quote(room_name, safe='')}" if room_name else f"channel/{room_id}"
+            path = (
+                f"channel/{quote(room_name, safe='')}"
+                if room_name
+                else f"channel/{room_id}"
+            )
         elif room_type == "p":
-            path = f"group/{quote(room_name, safe='')}" if room_name else f"group/{room_id}"
+            path = (
+                f"group/{quote(room_name, safe='')}"
+                if room_name
+                else f"group/{room_id}"
+            )
         elif room_type == "d":
             path = f"direct/{room_id}"
         else:
             path = f"channel/{room_id}"
-            
+
         return f"{self.server_url}/{path}?msg={message_id}"
 
-    async def _fetch_message_by_id(self, msg_id: str) -> Optional[dict]:
+    async def _fetch_message_by_id(self, msg_id: str) -> dict | None:
         """通过 API 获取指定消息详情。"""
         url = f"{self.server_url}/api/v1/chat.getMessage?msgId={msg_id}"
         try:
-            async with self._http_session.get(url, headers=self._get_auth_headers()) as resp:
+            async with self._get_http_session().get(
+                url, headers=self._get_auth_headers()
+            ) as resp:
                 data = await resp.json()
                 if data.get("success"):
                     message = data.get("message")
                     return await self._maybe_decrypt_incoming_message(message)
                 else:
-                    logger.debug(f"[RocketChat] 获取消息详情失败: msgId={msg_id} response={data}")
-        except asyncio.TimeoutError:
+                    logger.debug(
+                        f"[RocketChat] 获取消息详情失败: msgId={msg_id} response={data}"
+                    )
+        except TimeoutError:
             logger.debug(f"[RocketChat] 获取消息详情超时: msgId={msg_id}")
         except Exception as exc:
-            logger.debug(f"[RocketChat] 无法拉取被引用的消息明细 msgId={msg_id}: {exc!r}")
+            logger.debug(
+                f"[RocketChat] 无法拉取被引用的消息明细 msgId={msg_id}: {exc!r}"
+            )
         return None
 
-    async def _maybe_decrypt_incoming_message(self, raw_msg: Optional[dict]) -> Optional[dict]:
+    async def _maybe_decrypt_incoming_message(
+        self, raw_msg: dict | None
+    ) -> dict | None:
         if not isinstance(raw_msg, dict):
             return raw_msg
         if raw_msg.get("t") != "e2e":
@@ -585,7 +615,7 @@ class RocketChatAdapter(Platform):
     async def _ddp_call(
         self,
         method: str,
-        params: Optional[List[Any]] = None,
+        params: list[Any] | None = None,
         timeout: float = DDP_CALL_DEFAULT_TIMEOUT,
     ) -> Any:
         return await self._realtime.ddp_call(method, params=params, timeout=timeout)
@@ -607,11 +637,15 @@ class RocketChatAdapter(Platform):
                 url = f"{self.server_url}/{url}"
 
         # 仅对指向自身服务器的链接附加认证 query 参数
-        if self.user_id and self.auth_token and self._is_own_server_url(url):
-            # 避免重复附加
-            if "rc_uid=" not in url and "rc_token=" not in url:
-                delimiter = "&" if "?" in url else "?"
-                url = f"{url}{delimiter}rc_uid={self.user_id}&rc_token={self.auth_token}"
+        if (
+            self.user_id
+            and self.auth_token
+            and self._is_own_server_url(url)
+            and "rc_uid=" not in url
+            and "rc_token=" not in url
+        ):
+            delimiter = "&" if "?" in url else "?"
+            url = f"{url}{delimiter}rc_uid={self.user_id}&rc_token={self.auth_token}"
 
         return url
 
@@ -631,10 +665,7 @@ class RocketChatAdapter(Platform):
         """
         own = urlparse(self.server_url)
         target = urlparse(url)
-        return (
-            own.scheme == target.scheme
-            and own.netloc == target.netloc
-        )
+        return own.scheme == target.scheme and own.netloc == target.netloc
 
     def _get_auth_headers(self) -> dict:
         """
@@ -655,19 +686,19 @@ class RocketChatAdapter(Platform):
     def _classify_file_kind(self, file_obj: dict) -> str:
         return self._media.classify_file_kind(file_obj)
 
-    def _get_all_attachments_recursive(self, payload: dict) -> List[dict]:
+    def _get_all_attachments_recursive(self, payload: dict) -> list[dict]:
         return self._media.get_all_attachments_recursive(payload)
 
-    async def _extract_image_components(self, raw_msg: dict) -> List[Image]:
+    async def _extract_image_components(self, raw_msg: dict) -> list[Image]:
         return await self._media.extract_image_components(raw_msg)
 
-    async def _extract_file_components(self, raw_msg: dict) -> List[File]:
+    async def _extract_file_components(self, raw_msg: dict) -> list[File]:
         return await self._media.extract_file_components(raw_msg)
 
-    async def _extract_record_components(self, raw_msg: dict) -> List[Record]:
+    async def _extract_record_components(self, raw_msg: dict) -> list[Record]:
         return await self._media.extract_record_components(raw_msg)
 
-    async def _extract_video_components(self, raw_msg: dict) -> List[Video]:
+    async def _extract_video_components(self, raw_msg: dict) -> list[Video]:
         return await self._media.extract_video_components(raw_msg)
 
     def _extract_mentions_for_wake(self, raw_msg: dict) -> list[Any]:
@@ -688,9 +719,9 @@ class RocketChatAdapter(Platform):
         room_id: str,
         text: str = "",
         *,
-        attachments: Optional[list[dict[str, Any]]] = None,
-        tmid: Optional[str] = None,
-        e2e_mentions: Optional[dict[str, Any]] = None,
+        attachments: list[dict[str, Any]] | None = None,
+        tmid: str | None = None,
+        e2e_mentions: dict[str, Any] | None = None,
     ) -> bool:
         return await self._sender.send_structured_message(
             room_id,
@@ -703,9 +734,11 @@ class RocketChatAdapter(Platform):
     async def _build_explicit_reply_mention(
         self,
         room_id: str,
-        mention_username: Optional[str],
+        mention_username: str | None,
     ) -> tuple[str | None, dict[str, Any] | None]:
-        return await self._sender.build_explicit_reply_mention(room_id, mention_username)
+        return await self._sender.build_explicit_reply_mention(
+            room_id, mention_username
+        )
 
     async def _should_explicit_reply_mention(self, room_id: str) -> bool:
         return await self._sender.should_explicit_reply_mention(room_id)
@@ -714,16 +747,18 @@ class RocketChatAdapter(Platform):
         self,
         room_id: str,
         text: str,
-        tmid: Optional[str] = None,
-        mention_username: Optional[str] = None,
+        tmid: str | None = None,
+        mention_username: str | None = None,
     ) -> None:
-        await self._sender.send_text(room_id, text, tmid=tmid, mention_username=mention_username)
+        await self._sender.send_text(
+            room_id, text, tmid=tmid, mention_username=mention_username
+        )
 
     async def send_typing(
         self,
         room_id: str,
         flag: bool,
-        tmid: Optional[str] = None,
+        tmid: str | None = None,
     ) -> None:
         await self._sender.send_typing(room_id, flag, tmid=tmid)
 
@@ -732,8 +767,8 @@ class RocketChatAdapter(Platform):
         room_id: str,
         text: str,
         original_msg: dict,
-        tmid: Optional[str] = None,
-        mention_username: Optional[str] = None,
+        tmid: str | None = None,
+        mention_username: str | None = None,
     ) -> None:
         await self._sender.send_with_quote(
             room_id,
@@ -748,16 +783,18 @@ class RocketChatAdapter(Platform):
         room_id: str,
         image_url: str,
         text: str = "",
-        tmid: Optional[str] = None,
+        tmid: str | None = None,
     ) -> bool:
-        return await self._sender.send_image_url(room_id, image_url, text=text, tmid=tmid)
+        return await self._sender.send_image_url(
+            room_id, image_url, text=text, tmid=tmid
+        )
 
     async def send_image_file(
         self,
         room_id: str,
         file_path: str,
         description: str = "",
-        tmid: Optional[str] = None,
+        tmid: str | None = None,
     ) -> bool:
         return await self._sender.send_image_file(
             room_id, file_path, description=description, tmid=tmid
@@ -769,7 +806,7 @@ class RocketChatAdapter(Platform):
         file_path: str,
         filename: str | None = None,
         description: str = "",
-        tmid: Optional[str] = None,
+        tmid: str | None = None,
     ) -> None:
         await self._sender.send_file(
             room_id,
@@ -786,7 +823,7 @@ class RocketChatAdapter(Platform):
         *,
         media_kind: str,
         text: str = "",
-        tmid: Optional[str] = None,
+        tmid: str | None = None,
     ) -> bool:
         return await self._sender.send_remote_media_fallback(
             room_id,
@@ -818,6 +855,6 @@ class RocketChatAdapter(Platform):
         return self._sender.decode_base64_media(file_ref, default_suffix)
 
     async def _send_message_chain(
-        self, room_id: str, message_chain: MessageChain, tmid: Optional[str] = None
+        self, room_id: str, message_chain: MessageChain, tmid: str | None = None
     ) -> None:
         await self._sender.send_message_chain(room_id, message_chain, tmid=tmid)
