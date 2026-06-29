@@ -4,5 +4,5 @@
 # 此处声明仅用于脱离 AstrBot 单独运行 tests/ 下的单元测试。
 # 版本约束对齐 AstrBot 本体（master，约 v4.26.x）的核心依赖。
 
-aiohttp>=3.11.18
+aiohttp>=3.14.1
 cryptography>=49.0.0
