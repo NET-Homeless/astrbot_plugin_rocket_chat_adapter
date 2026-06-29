@@ -158,10 +158,7 @@ class RocketChatSenderBridge:
                 params,
                 timeout=10.0,
             )
-            logger.debug(
-                f"[RocketChat] typing method 调用成功 room_id={room_id!r} "
-                f"tmid={tmid!r} flag={flag} result={result}"
-            )
+            # 仅在异常时记录，正常续期不打 debug 日志避免噪音
         except Exception as exc:
             logger.warning(
                 f"[RocketChat] 发送 typing 状态失败 room_id={room_id!r} "

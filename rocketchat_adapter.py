@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import asyncio
 from asyncio import Queue
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Set
 from urllib.parse import quote, urlparse
 
 import aiohttp
@@ -29,6 +29,32 @@ from .rocketchat_inbound import RocketChatInboundBridge
 from .rocketchat_media import RocketChatMediaBridge
 from .rocketchat_realtime import RocketChatRealtimeBridge
 from .rocketchat_sender import RocketChatSenderBridge
+
+
+# ============================================================================
+# 配置常量
+# ============================================================================
+
+# 消息去重缓存配置
+PROCESSED_MESSAGE_TTL_SECONDS = 10 * 60  # 10分钟
+PROCESSED_MESSAGE_CACHE_LIMIT = 4096
+
+# 并发控制
+MESSAGE_CONCURRENCY_LIMIT = 100  # 同时处理的消息上限
+
+# DDP 调用超时
+DDP_CALL_DEFAULT_TIMEOUT = 10.0  # 秒
+
+# WebSocket 配置
+WEBSOCKET_HEARTBEAT_INTERVAL = 30.0  # 秒
+WEBSOCKET_MAX_MSG_SIZE = 8 * 1024 * 1024  # 8MB
+
+# HTTP 超时
+HTTP_SESSION_TOTAL_TIMEOUT = 45.0  # 秒
+
+# 房间信息缓存配置
+ROOM_INFO_CACHE_TTL_SECONDS = 300  # 5分钟
+UNKNOWN_ROOM_CACHE_TTL_SECONDS = 30  # 未知房间 30 秒 TTL，避免永久 fail-closed
 
 
 def _coerce_bool(value: Any) -> bool:
@@ -170,20 +196,22 @@ class RocketChatAdapter(Platform):
         self._room_info_cache: Dict[str, dict] = {}
         # 房间信息缓存锁，防止并发更新导致数据覆盖丢失
         self._room_cache_locks: Dict[str, asyncio.Lock] = {}
+        # 房间信息缓存时间戳，用于 TTL 失效
+        self._room_cache_timestamps: Dict[str, float] = {}
         # 已订阅房间集合，防止重复订阅导致消息被多次处理
-        self._subscribed_rooms: set = set()
+        self._subscribed_rooms: Set[str] = set()
         # 已发出但尚未收到 DDP ready 的房间订阅，key 为 sub id，value 为 room id
         self._pending_room_subscriptions: Dict[str, str] = {}
         # DDP method 调用 ID 计数器，确保每次调用 ID 唯一
         self._ddp_call_id: int = 0
         # 等待 DDP result 的 Future 映射
-        self._pending_ddp_results: Dict[str, asyncio.Future] = {}
+        self._pending_ddp_results: Dict[str, asyncio.Future[Dict[str, Any]]] = {}
         # DDP method 调用 ID 与 method 名称映射，用于 result/error 日志关联
         self._pending_ddp_methods: Dict[str, str] = {}
         # 后台任务强引用集合，防止 Python 3.12+ GC 回收未完成的 task
-        self._background_tasks: set[asyncio.Task] = set()
+        self._background_tasks: Set[asyncio.Task[Any]] = set()
         # 并发处理控制，防止瞬间过多消息导致处理积压
-        self._message_semaphore = asyncio.Semaphore(100)
+        self._message_semaphore = asyncio.Semaphore(MESSAGE_CONCURRENCY_LIMIT)
         # 已处理入站消息 ID 缓存，防止 Rocket.Chat message updated / link preview
         # 等重复 DDP 推送导致同一条消息触发多次回复。
         self._processed_message_ids: Dict[str, float] = {}
@@ -268,7 +296,7 @@ class RocketChatAdapter(Platform):
         self._running = True
         self._stop_event = asyncio.Event()
         self._http_session = aiohttp.ClientSession(
-            timeout=aiohttp.ClientTimeout(total=45.0)
+            timeout=aiohttp.ClientTimeout(total=HTTP_SESSION_TOTAL_TIMEOUT)
         )
 
         try:
@@ -279,7 +307,7 @@ class RocketChatAdapter(Platform):
             # 第二步：外层重连循环
             while self._running:
                 try:
-                    await self._ws_connect_and_listen()
+                    await self._realtime.ws_connect_and_listen()
                 except asyncio.CancelledError:
                     # CancelledError 不能吞掉，必须重新抛出
                     raise
@@ -386,7 +414,7 @@ class RocketChatAdapter(Platform):
             f"[RocketChat] 登录成功 | 用户: {self.bot_username} | userId: {self.user_id}"
         )
 
-    async def _get_subscriptions(self) -> List[dict]:
+    async def _get_subscriptions(self) -> List[Dict[str, Any]]:
         """获取机器人所有订阅的房间列表。"""
         url = f"{self.server_url}/api/v1/subscriptions.get"
         async with self._http_session.get(url, headers=self._get_auth_headers()) as resp:
@@ -431,6 +459,7 @@ class RocketChatAdapter(Platform):
             cached = dict(self._room_info_cache.get(room_id, {}))
             cached.update(room)
             self._room_info_cache[room_id] = cached
+            self._room_cache_timestamps[room_id] = asyncio.get_running_loop().time()
 
             room_type = cached.get("t")
             if room_type:
@@ -439,9 +468,19 @@ class RocketChatAdapter(Platform):
             if room_name:
                 self._room_name_cache[room_id] = room_name
 
-    async def _get_room_info(self, room_id: str, refresh: bool = False) -> dict:
+    async def _get_room_info(self, room_id: str, refresh: bool = False) -> Dict[str, Any]:
         if not refresh and room_id in self._room_info_cache:
-            return self._room_info_cache[room_id]
+            # 检查 TTL
+            ts = self._room_cache_timestamps.get(room_id, 0)
+            now = asyncio.get_running_loop().time()
+
+            # 未知房间使用较短 TTL
+            is_unknown = self._is_unknown_room_info(self._room_info_cache[room_id])
+            ttl = UNKNOWN_ROOM_CACHE_TTL_SECONDS if is_unknown else ROOM_INFO_CACHE_TTL_SECONDS
+
+            if now - ts < ttl:
+                return self._room_info_cache[room_id]
+            # TTL 过期，继续刷新
 
         url = f"{self.server_url}/api/v1/rooms.info?roomId={room_id}"
         logger.debug(
@@ -469,12 +508,14 @@ class RocketChatAdapter(Platform):
         logger.warning(
             f"[RocketChat][room] 无法确认房间信息，已标记为 unknown，发送侧将 fail-closed room_id={room_id!r}"
         )
-        return {"_id": room_id, "t": None, "encrypted": None, "_unknown": True}
+        unknown_room = {"_id": room_id, "t": None, "encrypted": None, "_unknown": True}
+        await self._cache_room_info(unknown_room)
+        return unknown_room
 
     def _is_unknown_room_info(self, room_info: dict[str, Any]) -> bool:
         return bool(room_info.get("_unknown"))
 
-    def _is_e2ee_room_info(self, room_info: dict[str, Any]) -> bool:
+    def _is_e2ee_room_info(self, room_info: Dict[str, Any]) -> bool:
         return bool(room_info.get("encrypted") and room_info.get("t") in {"d", "p"})
 
     async def _get_room_type(self, room_id: str) -> str:
@@ -538,49 +579,14 @@ class RocketChatAdapter(Platform):
     #  WebSocket / DDP 协议                                                #
     # ------------------------------------------------------------------ #
 
-    async def _ws_connect_and_listen(self) -> None:
-        await self._realtime.ws_connect_and_listen()
-
-    async def _ddp_connect(self, ws: aiohttp.ClientWebSocketResponse) -> None:
-        await self._realtime.ddp_connect(ws)
-
-    async def _ddp_login(self, ws: aiohttp.ClientWebSocketResponse) -> None:
-        await self._realtime.ddp_login(ws)
-
-    async def _ddp_subscribe_rooms(
-        self,
-        ws: aiohttp.ClientWebSocketResponse,
-        subscriptions: List[dict],
-    ) -> None:
-        await self._realtime.ddp_subscribe_rooms(ws, subscriptions)
-
-    async def _ddp_subscribe_user_events(
-        self, ws: aiohttp.ClientWebSocketResponse
-    ) -> None:
-        await self._realtime.ddp_subscribe_user_events(ws)
-
-    async def _ws_listen_loop(self, ws: aiohttp.ClientWebSocketResponse) -> None:
-        await self._realtime.ws_listen_loop(ws)
-
-    async def _dispatch_ddp(
-        self,
-        data: dict,
-        ws: aiohttp.ClientWebSocketResponse,
-    ) -> None:
-        await self._realtime.dispatch_ddp(data, ws)
-
-    async def _handle_user_notification(
-        self,
-        data: dict,
-        ws: aiohttp.ClientWebSocketResponse,
-    ) -> None:
-        await self._realtime.handle_user_notification(data, ws)
+    # 注意：大部分 DDP/WS 操作已委托给 _realtime 桥接层
+    # 仅保留 _ddp_call 供 E2EE 模块使用
 
     async def _ddp_call(
         self,
         method: str,
-        params: Optional[list[Any]] = None,
-        timeout: float = 10.0,
+        params: Optional[List[Any]] = None,
+        timeout: float = DDP_CALL_DEFAULT_TIMEOUT,
     ) -> Any:
         return await self._realtime.ddp_call(method, params=params, timeout=timeout)
 

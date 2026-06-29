@@ -365,9 +365,9 @@ class RocketChatMessageEvent(AstrMessageEvent):
     async def _flush_text(self, text: str) -> None:
         """发送一段文本，自动选择引用回复或普通发送。"""
         logger.debug(
-            "[RocketChat][Event] _flush_text() quote_original=%s text=%r",
+            "[RocketChat][Event] _flush_text() quote_original=%s text_len=%d",
             self.quote_original,
-            text[:80],
+            len(text),
         )
         mention_username = await self._consume_reply_mention_username()
         if self.quote_original:

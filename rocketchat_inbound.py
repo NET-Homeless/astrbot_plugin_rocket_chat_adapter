@@ -4,7 +4,7 @@ import asyncio
 import json
 import re
 import time
-from typing import Any, Optional
+from typing import Any, Dict, List, Optional, Set, Tuple
 from urllib.parse import parse_qs, urlparse
 
 from astrbot.api import logger
@@ -13,12 +13,22 @@ from astrbot.api.platform import AstrBotMessage, Group, MessageMember, MessageTy
 
 from .rocketchat_event import RocketChatMessageEvent
 
+# 导入常量（从 adapter 模块）
+try:
+    from .rocketchat_adapter import (
+        PROCESSED_MESSAGE_TTL_SECONDS,
+        PROCESSED_MESSAGE_CACHE_LIMIT,
+    )
+except ImportError:
+    PROCESSED_MESSAGE_TTL_SECONDS = 10 * 60
+    PROCESSED_MESSAGE_CACHE_LIMIT = 4096
+
 
 class RocketChatInboundBridge:
     def __init__(self, adapter: Any) -> None:
         self.adapter = adapter
-        self._processed_message_ttl_seconds = 10 * 60
-        self._processed_message_cache_limit = 4096
+        self._processed_message_ttl_seconds = PROCESSED_MESSAGE_TTL_SECONDS
+        self._processed_message_cache_limit = PROCESSED_MESSAGE_CACHE_LIMIT
         # 消息去重锁，防止并发处理导致重复消息
         self._dedup_lock: Optional[asyncio.Lock] = None
         # bot @提及匹配正则缓存，避免每条消息重复编译（bot_username 在登录后才确定）
@@ -192,13 +202,18 @@ class RocketChatInboundBridge:
             now = time.time()
             expires_before = now - self._processed_message_ttl_seconds
 
-            # 清理过期条目（仅在超过限制时）
-            if len(seen) > self._processed_message_cache_limit:
-                for cached_id, timestamp in list(seen.items()):
-                    if timestamp < expires_before:
-                        seen.pop(cached_id, None)
-                while len(seen) > self._processed_message_cache_limit:
-                    seen.pop(next(iter(seen)), None)
+            # 清理过期条目（每次都清理，防止缓存无限增长）
+            # 仅在超过限制时才做强制淘汰
+            expired_keys = [
+                cached_id for cached_id, timestamp in seen.items()
+                if timestamp < expires_before
+            ]
+            for cached_id in expired_keys:
+                seen.pop(cached_id, None)
+
+            # 如果清理后仍超过限制，强制淘汰最旧的条目
+            while len(seen) > self._processed_message_cache_limit:
+                seen.pop(next(iter(seen)), None)
 
             # 检查是否已处理
             if message_id in seen:
@@ -360,7 +375,8 @@ class RocketChatInboundBridge:
                 f"is_thread={bool(raw_msg.get('tmid'))} "
                 f"is_system={bool(raw_msg.get('t') and raw_msg.get('t') != 'e2e')}"
             )
-            logger.debug(f"[RocketChat][IN-FULL] {json.dumps(raw_msg, ensure_ascii=False, default=str)}")
+            # 仅在显式调试时输出完整消息体，避免日志膨胀
+            # logger.debug(f"[RocketChat][IN-FULL] {json.dumps(raw_msg, ensure_ascii=False, default=str)}")
 
             raw_msg = await self.adapter._maybe_decrypt_incoming_message(raw_msg)
             if not raw_msg:

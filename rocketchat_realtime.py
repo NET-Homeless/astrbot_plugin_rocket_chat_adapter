@@ -7,6 +7,18 @@ from typing import Any, List, Optional
 import aiohttp
 from astrbot.api import logger
 
+# 导入常量
+try:
+    from .rocketchat_adapter import (
+        WEBSOCKET_HEARTBEAT_INTERVAL,
+        WEBSOCKET_MAX_MSG_SIZE,
+        DDP_CALL_DEFAULT_TIMEOUT,
+    )
+except ImportError:
+    WEBSOCKET_HEARTBEAT_INTERVAL = 30.0
+    WEBSOCKET_MAX_MSG_SIZE = 8 * 1024 * 1024
+    DDP_CALL_DEFAULT_TIMEOUT = 10.0
+
 
 class RocketChatRealtimeBridge:
     def __init__(self, adapter: Any) -> None:
@@ -32,8 +44,8 @@ class RocketChatRealtimeBridge:
 
         async with self.adapter._http_session.ws_connect(
             ws_url,
-            heartbeat=30.0,
-            max_msg_size=8 * 1024 * 1024,
+            heartbeat=WEBSOCKET_HEARTBEAT_INTERVAL,
+            max_msg_size=WEBSOCKET_MAX_MSG_SIZE,
         ) as ws:
             self.adapter._ws = ws
             try:
@@ -190,9 +202,8 @@ class RocketChatRealtimeBridge:
                         f"[RocketChat] DDP method 调用被服务端拒绝: method={method} id={result_id} error={error}"
                     )
                 else:
-                    logger.debug(
-                        f"[RocketChat] DDP method 调用成功: method={method} id={result_id} result={data.get('result')}"
-                    )
+                    # 成功调用仅在 trace 级别记录，避免日志噪音
+                    pass
 
         elif msg_type == "added":
             pass
@@ -283,8 +294,8 @@ class RocketChatRealtimeBridge:
     async def ddp_call(
         self,
         method: str,
-        params: Optional[list[Any]] = None,
-        timeout: float = 10.0,
+        params: Optional[List[Any]] = None,
+        timeout: float = DDP_CALL_DEFAULT_TIMEOUT,
     ) -> Any:
         if not self.adapter._ws or self.adapter._ws.closed:
             raise RuntimeError("ddp websocket not ready")

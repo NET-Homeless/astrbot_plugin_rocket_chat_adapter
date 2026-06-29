@@ -7,7 +7,7 @@ import json
 import os
 import uuid
 from dataclasses import dataclass, field
-from typing import Any, Optional
+from typing import Any, Dict, List, Optional, Set
 
 from astrbot.api import logger
 from cryptography.hazmat.primitives import hashes, padding as sym_padding
@@ -395,10 +395,10 @@ class RocketChatE2EEManager:
         self,
         room_id: str,
         text: str = "",
-        attachments: Optional[list[dict[str, Any]]] = None,
+        attachments: Optional[List[Dict[str, Any]]] = None,
         tmid: Optional[str] = None,
-        e2e_mentions: Optional[dict[str, Any]] = None,
-    ) -> Optional[dict[str, Any]]:
+        e2e_mentions: Optional[Dict[str, Any]] = None,
+    ) -> Optional[Dict[str, Any]]:
         content_to_encrypt: dict[str, Any] = {}
         if text:
             content_to_encrypt["msg"] = text
@@ -424,8 +424,8 @@ class RocketChatE2EEManager:
     async def encrypt_message_content(
         self,
         room_id: str,
-        content_to_encrypt: dict[str, Any],
-    ) -> Optional[dict[str, str]]:
+        content_to_encrypt: Dict[str, Any],
+    ) -> Optional[Dict[str, str]]:
         room_info = await self.adapter._get_room_info(room_id)
         if not await self.should_encrypt_room(room_info):
             return None

@@ -6,12 +6,20 @@ import json
 import mimetypes
 import os
 import tempfile
-from typing import Any, Callable, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 from urllib.parse import urlparse
 
 import aiohttp
 from astrbot.api import logger
 from astrbot.api.message_components import File, Image, Record, Video
+
+
+# ============================================================================
+# 媒体下载配置常量
+# ============================================================================
+
+MEDIA_DOWNLOAD_TOTAL_TIMEOUT = 30  # 秒
+MEDIA_DOWNLOAD_CONNECT_TIMEOUT = 10  # 秒
 
 
 def _is_http_url(file_ref: str) -> bool:
@@ -204,7 +212,10 @@ class RocketChatMediaBridge:
             async with self.adapter._http_session.get(
                 url,
                 headers=headers,
-                timeout=aiohttp.ClientTimeout(total=30, connect=10),
+                timeout=aiohttp.ClientTimeout(
+                    total=MEDIA_DOWNLOAD_TOTAL_TIMEOUT,
+                    connect=MEDIA_DOWNLOAD_CONNECT_TIMEOUT,
+                ),
                 allow_redirects=True,
                 max_redirects=3,
             ) as resp:
