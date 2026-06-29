@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-import unittest
 from typing import Any
+import unittest
 
 from tests._bootstrap import install_astrbot_stubs
 
@@ -25,7 +25,9 @@ class _DummyAdapter:
 
 
 class RocketChatE2EETests(unittest.IsolatedAsyncioTestCase):
-    async def test_room_key_refresh_failure_skips_e2ee_message_without_raising(self) -> None:
+    async def test_room_key_refresh_failure_skips_e2ee_message_without_raising(
+        self,
+    ) -> None:
         manager = RocketChatE2EEManager(
             adapter=_DummyAdapter(),
             enabled=True,
@@ -33,7 +35,9 @@ class RocketChatE2EETests(unittest.IsolatedAsyncioTestCase):
         )
         manager.ready = True
 
-        async def get_subscription(room_id: str, *, refresh: bool = False) -> dict[str, Any]:
+        async def get_subscription(
+            room_id: str, *, refresh: bool = False
+        ) -> dict[str, Any]:
             raise RuntimeError("temporary subscription failure")
 
         manager._get_subscription = get_subscription  # type: ignore[method-assign]

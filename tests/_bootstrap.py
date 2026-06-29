@@ -1,10 +1,10 @@
 from __future__ import annotations
 
+from dataclasses import dataclass, field
 import enum
+from pathlib import Path
 import sys
 import types
-from dataclasses import dataclass, field
-from pathlib import Path
 
 
 def install_astrbot_stubs() -> None:
@@ -48,11 +48,11 @@ def install_astrbot_stubs() -> None:
         url: str | None = None
 
         @classmethod
-        def fromFileSystem(cls, path: str) -> "Image":
+        def fromFileSystem(cls, path: str) -> Image:
             return cls(file=path)
 
         @classmethod
-        def fromURL(cls, url: str) -> "Image":
+        def fromURL(cls, url: str) -> Image:
             return cls(url=url)
 
         async def convert_to_file_path(self) -> str:
@@ -64,11 +64,11 @@ def install_astrbot_stubs() -> None:
         url: str | None = None
 
         @classmethod
-        def fromFileSystem(cls, path: str) -> "Record":
+        def fromFileSystem(cls, path: str) -> Record:
             return cls(file=path)
 
         @classmethod
-        def fromURL(cls, url: str) -> "Record":
+        def fromURL(cls, url: str) -> Record:
             return cls(url=url)
 
         async def convert_to_file_path(self) -> str:
@@ -80,11 +80,11 @@ def install_astrbot_stubs() -> None:
         url: str | None = None
 
         @classmethod
-        def fromFileSystem(cls, path: str) -> "Video":
+        def fromFileSystem(cls, path: str) -> Video:
             return cls(file=path)
 
         @classmethod
-        def fromURL(cls, url: str) -> "Video":
+        def fromURL(cls, url: str) -> Video:
             return cls(url=url)
 
         async def convert_to_file_path(self) -> str:
@@ -128,7 +128,19 @@ def install_astrbot_stubs() -> None:
         nodes: list = field(default_factory=list)
         type: str = field(init=False, default="Nodes")
 
-    for cls in (Plain, At, AtAll, Image, Record, Video, File, Reply, Forward, Node, Nodes):
+    for cls in (
+        Plain,
+        At,
+        AtAll,
+        Image,
+        Record,
+        Video,
+        File,
+        Reply,
+        Forward,
+        Node,
+        Nodes,
+    ):
         setattr(message_components_mod, cls.__name__, cls)
 
     event_mod = types.ModuleType("astrbot.api.event")
@@ -137,7 +149,7 @@ def install_astrbot_stubs() -> None:
         def __init__(self) -> None:
             self.chain: list = []
 
-        def message(self, text: str) -> "MessageChain":
+        def message(self, text: str) -> MessageChain:
             self.chain.append(Plain(text=text))
             return self
 
@@ -219,7 +231,14 @@ def install_astrbot_stubs() -> None:
 
         return decorator
 
-    for cls in (AstrBotMessage, Group, MessageMember, MessageType, Platform, PlatformMetadata):
+    for cls in (
+        AstrBotMessage,
+        Group,
+        MessageMember,
+        MessageType,
+        Platform,
+        PlatformMetadata,
+    ):
         setattr(platform_mod, cls.__name__, cls)
     platform_mod.register_platform_adapter = register_platform_adapter
 

@@ -19,7 +19,9 @@ class _DummyRealtime:
     def __init__(self) -> None:
         self.calls: list[tuple[str, list, float]] = []
 
-    async def ddp_call(self, method: str, params: list, timeout: float = 10.0) -> object:
+    async def ddp_call(
+        self, method: str, params: list, timeout: float = 10.0
+    ) -> object:
         self.calls.append((method, params, timeout))
         return None
 

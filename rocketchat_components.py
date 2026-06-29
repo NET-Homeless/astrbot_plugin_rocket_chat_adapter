@@ -1,9 +1,8 @@
 from __future__ import annotations
 
-import json
 from collections.abc import Iterable
+import json
 from typing import Any
-
 
 _BLOCK_COMPONENT_TYPES = {"forward", "node", "nodes"}
 

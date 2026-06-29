@@ -1,36 +1,34 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import os
-from typing import Callable, TYPE_CHECKING
+from typing import TYPE_CHECKING
 from urllib.parse import urlparse
 
 from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent, MessageChain
 from astrbot.api.message_components import (
-    At,
-    AtAll,
     File,
     Image,
-    Plain,
     Record,
-    Reply,
     Video,
 )
-from astrbot.api.platform import AstrBotMessage, PlatformMetadata
 
 from .rocketchat_components import append_rendered_component
 from .rocketchat_media import upload_combined_images
 from .rocketchat_segments import (
     ImageGroup,
     MediaItem,
-    SegmentSender,
-    TextSegment,
     dispatch_segments,
     iter_segments,
 )
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
+    from astrbot.api.platform import AstrBotMessage, PlatformMetadata
+
     from .rocketchat_adapter import RocketChatAdapter
 
 
@@ -51,7 +49,7 @@ class RocketChatMessageEvent(AstrMessageEvent):
         session_id: str,
         room_id: str,
         thread_id: str | None,
-        adapter: "RocketChatAdapter",
+        adapter: RocketChatAdapter,
         quote_original: bool = False,
     ) -> None:
         """
@@ -69,7 +67,7 @@ class RocketChatMessageEvent(AstrMessageEvent):
         self.room_id: str = room_id
         self.thread_id: str | None = thread_id
         self.quote_original: bool = quote_original
-        self.adapter: "RocketChatAdapter" = adapter
+        self.adapter: RocketChatAdapter = adapter
         self._typing_task: asyncio.Task | None = None
         self._typing_started: bool = False
         self._typing_keepalive_interval: float = 5.0
@@ -90,7 +88,9 @@ class RocketChatMessageEvent(AstrMessageEvent):
         """
         if self._typing_task is not None and not self._typing_task.done():
             return
-        logger.debug(f"[RocketChat][Event] start_typing_indicator room={self.room_id!r}")
+        logger.debug(
+            f"[RocketChat][Event] start_typing_indicator room={self.room_id!r}"
+        )
         self._typing_task = asyncio.create_task(self._typing_indicator_worker())
 
     async def stop_typing_indicator(self) -> None:
@@ -100,10 +100,8 @@ class RocketChatMessageEvent(AstrMessageEvent):
 
         if task and not task.done():
             task.cancel()
-            try:
+            with contextlib.suppress(asyncio.CancelledError):
                 await task
-            except asyncio.CancelledError:
-                pass
 
         if self._typing_started:
             self._typing_started = False
@@ -161,7 +159,9 @@ class RocketChatMessageEvent(AstrMessageEvent):
                 )
 
         except asyncio.CancelledError:
-            logger.debug(f"[RocketChat][Event] typing worker cancelled room={self.room_id!r}")
+            logger.debug(
+                f"[RocketChat][Event] typing worker cancelled room={self.room_id!r}"
+            )
             raise
         except Exception as exc:
             logger.warning(f"[RocketChat][Event] typing worker failed: {exc!r}")
@@ -169,9 +169,13 @@ class RocketChatMessageEvent(AstrMessageEvent):
             if self._typing_started:
                 self._typing_started = False
                 try:
-                    await self.adapter.send_typing(self.room_id, False, tmid=self.thread_id)
+                    await self.adapter.send_typing(
+                        self.room_id, False, tmid=self.thread_id
+                    )
                 except Exception as exc:
-                    logger.warning(f"[RocketChat][Event] typing worker stop failed: {exc!r}")
+                    logger.warning(
+                        f"[RocketChat][Event] typing worker stop failed: {exc!r}"
+                    )
             if self._typing_task is asyncio.current_task():
                 self._typing_task = None
 
@@ -226,7 +230,6 @@ class RocketChatMessageEvent(AstrMessageEvent):
         finally:
             await self.stop_typing_indicator()
 
-
     async def _flush_text(self, text: str) -> None:
         """发送一段文本，自动选择引用回复或普通发送。"""
         logger.debug(
@@ -241,10 +244,15 @@ class RocketChatMessageEvent(AstrMessageEvent):
             )
             # 频道 @mention 场景：仅用 attachments 显示引用框，不创建线程
             # 如果是线程消息，thread_id 已在初始化时设置，后续普通发送会用到它
+            raw_message: dict = (
+                self.message_obj.raw_message
+                if isinstance(self.message_obj.raw_message, dict)
+                else {}
+            )
             await self.adapter.send_with_quote(
                 self.room_id,
                 text,
-                self.message_obj.raw_message,
+                raw_message,
                 tmid=self.thread_id,  # 仅当原消息本身是线程消息时才传 thread_id
                 mention_username=mention_username,
             )
@@ -441,7 +449,9 @@ class RocketChatMessageEvent(AstrMessageEvent):
 
         if final_text and not sent_text_with_image:
             await self.adapter.send_text(
-                self.room_id, final_text, tmid=self.thread_id,
+                self.room_id,
+                final_text,
+                tmid=self.thread_id,
             )
 
     async def _send_image_component(self, img: Image) -> None:
@@ -488,7 +498,7 @@ class _EventSegmentSender:
     封装 quote_original、mention、线程等 Event 特有的发送语义。
     """
 
-    def __init__(self, event: "RocketChatMessageEvent") -> None:
+    def __init__(self, event: RocketChatMessageEvent) -> None:
         self.event = event
 
     async def send_text(self, text: str) -> None:

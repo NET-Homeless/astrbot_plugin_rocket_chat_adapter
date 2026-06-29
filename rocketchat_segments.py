@@ -8,14 +8,11 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Callable, Iterator, Protocol
+from typing import Protocol
 
 from astrbot.api.message_components import File, Image, Record, Video
-
-if TYPE_CHECKING:
-    from astrbot.api.message_components import At, AtAll, Plain, Reply
-
 
 # ============================================================================
 # Segment 类型定义

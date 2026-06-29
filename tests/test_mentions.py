@@ -8,6 +8,7 @@ install_astrbot_stubs()
 
 from astrbot.api.message_components import At, Image, Reply  # noqa: E402
 from astrbot.api.platform import MessageType, PlatformMetadata  # noqa: E402
+
 from astrbot_plugin_rocket_chat_adapter import rocketchat_event  # noqa: E402
 from astrbot_plugin_rocket_chat_adapter.rocketchat_inbound import (  # noqa: E402
     RocketChatInboundBridge,
@@ -90,7 +91,9 @@ class RocketChatMentionTests(unittest.IsolatedAsyncioTestCase):
         def record_typing_start(event: object) -> None:
             self.started_typing_events.append(event)
 
-        rocketchat_event.RocketChatMessageEvent.start_typing_indicator = record_typing_start
+        rocketchat_event.RocketChatMessageEvent.start_typing_indicator = (
+            record_typing_start
+        )
         self.adapter = _DummyAdapter()
         self.bridge = RocketChatInboundBridge(self.adapter)
 
@@ -117,7 +120,9 @@ class RocketChatMentionTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(all(isinstance(comp, At) for comp in event.message_obj.message))
         self.assertEqual(self.started_typing_events, [])
 
-    async def test_multi_mention_with_real_text_keeps_wake_and_strips_mentions(self) -> None:
+    async def test_multi_mention_with_real_text_keeps_wake_and_strips_mentions(
+        self,
+    ) -> None:
         raw_msg = {
             "_id": "msg-2",
             "rid": "room-1",
@@ -191,7 +196,9 @@ class RocketChatMentionTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(_would_astrbot_reply_wake(event))
         self.assertEqual(self.started_typing_events, [event])
 
-    async def test_quote_bot_image_and_mention_other_user_preserves_reply_wake(self) -> None:
+    async def test_quote_bot_image_and_mention_other_user_preserves_reply_wake(
+        self,
+    ) -> None:
         self.adapter._fetched_messages["bot-image"] = {
             "_id": "bot-image",
             "rid": "room-1",
@@ -232,7 +239,9 @@ class RocketChatMentionTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(self.started_typing_events, [event])
 
-    async def test_quote_bot_image_and_mention_other_user_with_text_preserves_reply_wake(self) -> None:
+    async def test_quote_bot_image_and_mention_other_user_with_text_preserves_reply_wake(
+        self,
+    ) -> None:
         self.adapter._fetched_messages["bot-image"] = {
             "_id": "bot-image",
             "rid": "room-1",
@@ -272,7 +281,9 @@ class RocketChatMentionTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(self.started_typing_events, [event])
 
-    async def test_quote_bot_image_without_bot_mention_preserves_reply_wake(self) -> None:
+    async def test_quote_bot_image_without_bot_mention_preserves_reply_wake(
+        self,
+    ) -> None:
         self.adapter._fetched_messages["bot-image"] = {
             "_id": "bot-image",
             "rid": "room-1",

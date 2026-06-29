@@ -105,3 +105,31 @@ Before claiming a change is done:
 - Run `python -m py_compile rocketchat_adapter.py rocketchat_realtime.py rocketchat_inbound.py rocketchat_sender.py rocketchat_e2ee.py rocketchat_event.py rocketchat_media.py main.py`
 - If touching DDP behavior, verify method payload shape and result/error logging
 - If touching E2EE, check that plaintext rooms are unaffected by failure paths
+
+## Pre-commit Quality Gate
+
+This repository uses lefthook to enforce code quality before every commit.
+
+After cloning or pulling changes:
+
+```bash
+# Install lefthook (one-time)
+brew install lefthook        # macOS
+# or
+curl -sSfL https://raw.githubusercontent.com/evilmartians/lefthook/master/install.sh | sh
+
+# Activate hooks in this repo
+lefthook install
+
+# Ensure dev tools are available
+pip install -r requirements-dev.txt
+```
+
+On `git commit`, lefthook will automatically run:
+- `ruff check --fix` (lint + auto-fix, re-stages fixed files)
+- `ruff format` (formatting, re-stages)
+- `pyright` (type checking on staged files)
+
+If any step fails, the commit is blocked.
+
+CI (`.github/workflows/release.yml`) runs the same checks plus full test suite as the final gate.

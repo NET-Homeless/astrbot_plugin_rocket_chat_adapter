@@ -27,6 +27,15 @@ jobs:
       - name: Install dev dependencies
         run: pip install -r requirements-dev.txt
 
+      - name: Ruff lint
+        run: ruff check .
+
+      - name: Ruff format check
+        run: ruff format --check .
+
+      - name: Pyright type check
+        run: pyright .
+
       - name: Run unit tests
         run: python -m unittest discover -s tests -p "test_*.py" -v
 

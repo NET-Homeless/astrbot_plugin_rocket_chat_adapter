@@ -27,7 +27,9 @@ def _base_config() -> dict:
 
 
 class RocketChatConfigValidationTests(unittest.IsolatedAsyncioTestCase):
-    async def test_e2ee_without_password_does_not_block_adapter_initialization(self) -> None:
+    async def test_e2ee_without_password_does_not_block_adapter_initialization(
+        self,
+    ) -> None:
         config = _base_config()
         config["enable_e2ee"] = True
 

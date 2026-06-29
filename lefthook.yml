@@ -1,0 +1,39 @@
+# Lefthook Git Hooks Configuration
+# 用于在 git commit 前自动运行代码格式化和质量检查
+# 类似 cargo clippy 的 pre-commit gate
+#
+# 安装方法:
+#   macOS: brew install lefthook
+#   或: curl -sSfL https://raw.githubusercontent.com/evilmartians/lefthook/master/install.sh | sh
+#   然后在本仓库根目录运行: lefthook install
+#
+# 卸载 hooks: lefthook uninstall
+
+pre-commit:
+  parallel: false
+  commands:
+    # Ruff 代码检查 + 自动修复（仅检查暂存文件，速度快）
+    # 自动修复的问题会重新暂存
+    ruff-check:
+      glob: "*.py"
+      run: ruff check --fix {staged_files}
+      stage_fixed: true
+      fail_text: "Ruff lint 检查失败。请修复上述问题后再提交。"
+
+    # Ruff 格式化（仅格式化暂存文件）
+    ruff-format:
+      glob: "*.py"
+      run: ruff format {staged_files}
+      stage_fixed: true
+      fail_text: "Ruff format 格式化失败。"
+
+    # Pyright 类型检查（对整个项目运行，保证上下文完整性）
+    # 比仅检查暂存文件更准确（例如跨文件签名变更）
+    # 项目体积小，速度可接受；CI 中也会完整运行
+    pyright:
+      run: pyright .
+      fail_text: "Pyright 类型检查失败。请修复类型错误后再提交。"
+
+  # 可选：如果需要跳过某些文件或目录，可以在这里配置
+  # exclude:
+  #   - "tests/**"

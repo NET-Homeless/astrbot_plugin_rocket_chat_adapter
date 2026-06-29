@@ -1,0 +1,62 @@
+[tool.ruff]
+# Ruff 配置：高性能 Python linter & formatter
+# 类似 cargo clippy 的体验：一个工具覆盖 lint + format + import 排序 + 自动修复
+
+target-version = "py311"
+line-length = 88
+
+[tool.ruff.lint]
+# 启用的规则集
+select = [
+    "E",      # pycodestyle errors
+    "W",      # pycodestyle warnings
+    "F",      # Pyflakes
+    "I",      # isort（导入排序）
+    "UP",     # pyupgrade（语法升级）
+    "B",      # flake8-bugbear（常见 bug 和设计问题）
+    "C4",     # flake8-comprehensions（推导式优化）
+    "SIM",    # flake8-simplify（简化代码）
+    "TCH",    # flake8-type-checking（类型检查导入优化）
+    "RUF",    # Ruff 特有规则
+]
+
+# 忽略的规则（按需调整）
+ignore = [
+    "E501",   # line too long（由 formatter 统一处理）
+    "B008",   # do not perform function calls in argument defaults（AstrBot 常见模式）
+    "B904",   # raise ... from err（部分场景需要保留原始异常链）
+    "RUF001", # 字符串中的全角标点（中文消息/日志大量使用，忽略）
+    "RUF002", # 全角标点（中文文档常用，忽略以保持可读性）
+    "RUF003", # 全角标点（中文注释常用，忽略）
+]
+
+# isort 配置
+[tool.ruff.lint.isort]
+known-first-party = ["astrbot_plugin_rocket_chat_adapter"]
+force-sort-within-sections = true
+
+[tool.ruff.format]
+# 格式化配置（类似 black）
+quote-style = "double"
+indent-style = "space"
+skip-magic-trailing-comma = false
+line-ending = "auto"
+
+[tool.pyright]
+# 类型检查配置
+pythonVersion = "3.11"
+typeCheckingMode = "basic"          # 可改为 "strict" 逐步收紧
+reportMissingImports = true
+reportMissingTypeStubs = false
+reportPrivateUsage = false          # 允许访问 _ 开头的内部成员（适配器常见模式）
+reportUnusedImport = "warning"
+reportUnusedVariable = "warning"
+
+# 排除不需要检查的目录
+exclude = [
+    "**/__pycache__",
+    ".git",
+    ".pytest_cache",
+    "build",
+    "dist",
+]

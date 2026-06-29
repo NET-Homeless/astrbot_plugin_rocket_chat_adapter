@@ -6,13 +6,15 @@ import json
 import mimetypes
 import os
 import tempfile
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any
 from urllib.parse import urlparse
 
 import aiohttp
 from astrbot.api import logger
 from astrbot.api.message_components import File, Image, Record, Video
 
+if TYPE_CHECKING:
+    from collections.abc import Callable
 
 # ============================================================================
 # 媒体下载配置常量
@@ -56,8 +58,8 @@ async def upload_combined_images(
     adapter: Any,
     room_id: str,
     text: str,
-    images: List[Image],
-    tmid: Optional[str] = None,
+    images: list[Image],
+    tmid: str | None = None,
 ) -> bool:
     """
     将文本与一组图片合并为 Rocket.Chat 媒体消息发送。
@@ -84,7 +86,10 @@ async def upload_combined_images(
                 if _is_http_url(file_ref):
                     caption = text if not sent_text_with_image else ""
                     if await adapter._media.send_image_url(
-                        room_id, file_ref, text=caption, tmid=tmid,
+                        room_id,
+                        file_ref,
+                        text=caption,
+                        tmid=tmid,
                     ):
                         sent_text_with_image = sent_text_with_image or bool(caption)
                 continue
@@ -112,7 +117,7 @@ class RocketChatMediaBridge:
         self.adapter = adapter
 
     def classify_file_kind(self, file_obj: dict) -> str:
-        candidates: List[str] = []
+        candidates: list[str] = []
 
         for key in (
             "type",
@@ -163,10 +168,14 @@ class RocketChatMediaBridge:
         payload: dict,
         *,
         skip_quote_attachments: bool = False,
-    ) -> List[dict]:
+    ) -> list[dict]:
         res = []
         att_raw = payload.get("attachments", [])
-        atts = [att_raw] if isinstance(att_raw, dict) else [a for a in att_raw if isinstance(a, dict)]
+        atts = (
+            [att_raw]
+            if isinstance(att_raw, dict)
+            else [a for a in att_raw if isinstance(a, dict)]
+        )
         for att in atts:
             if skip_quote_attachments and att.get("message_link"):
                 continue
@@ -188,7 +197,7 @@ class RocketChatMediaBridge:
             and bool(encryption.get("iv"))
         )
 
-    async def download_remote_bytes(self, url: str) -> Optional[bytes]:
+    async def download_remote_bytes(self, url: str) -> bytes | None:
         """
         下载远程媒体字节数据。
 
@@ -206,7 +215,11 @@ class RocketChatMediaBridge:
             return None
 
         # 指向本服务器的媒体需要带上认证 Header；外部链接不带
-        headers = self.adapter._get_auth_headers() if self.adapter._is_own_server_url(url) else {}
+        headers = (
+            self.adapter._get_auth_headers()
+            if self.adapter._is_own_server_url(url)
+            else {}
+        )
 
         try:
             async with self.adapter._http_session.get(
@@ -282,21 +295,15 @@ class RocketChatMediaBridge:
         return default_suffix
 
     def _write_temp_media_file(self, raw: bytes, suffix: str) -> str:
-        tmp = tempfile.NamedTemporaryFile(suffix=suffix, delete=False)
-        try:
+        with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
             tmp.write(raw)
-            tmp.close()
             return tmp.name
-        except Exception:
-            tmp.close()
-            os.unlink(tmp.name)
-            raise
 
     async def _select_media_url(
         self,
         file_obj: dict,
         target_kind: str,
-    ) -> Optional[str]:
+    ) -> str | None:
         key_candidates: dict[str, tuple[str, ...]] = {
             "image": (
                 "image_url",
@@ -349,7 +356,7 @@ class RocketChatMediaBridge:
         self,
         file_obj: dict,
         target_kind: str,
-    ) -> Optional[dict[str, str]]:
+    ) -> dict[str, str] | None:
         media_url = await self._select_media_url(file_obj, target_kind)
         if not media_url:
             return None
@@ -400,13 +407,15 @@ class RocketChatMediaBridge:
         self,
         raw_msg: dict,
         target_kind: str,
-    ) -> List[dict[str, str]]:
-        results: List[dict[str, str]] = []
+    ) -> list[dict[str, str]]:
+        results: list[dict[str, str]] = []
 
         async def add_candidate(file_obj: dict) -> None:
             if self.classify_file_kind(file_obj) != target_kind:
                 return
-            materialized = await self._materialize_media_reference(file_obj, target_kind)
+            materialized = await self._materialize_media_reference(
+                file_obj, target_kind
+            )
             if materialized:
                 results.append(materialized)
 
@@ -418,7 +427,7 @@ class RocketChatMediaBridge:
             skip_quote_attachments=True,
         )
 
-        for context in [raw_msg] + all_attachments:
+        for context in [raw_msg, *all_attachments]:
             files_raw = context.get("files", [])
             if isinstance(files_raw, dict):
                 iterable = [files_raw]
@@ -437,8 +446,8 @@ class RocketChatMediaBridge:
 
         return results
 
-    async def extract_image_components(self, raw_msg: dict) -> List[Image]:
-        components: List[Image] = []
+    async def extract_image_components(self, raw_msg: dict) -> list[Image]:
+        components: list[Image] = []
         seen: set[str] = set()
 
         for media in await self._extract_media_payloads(raw_msg, "image"):
@@ -454,8 +463,10 @@ class RocketChatMediaBridge:
         for url_obj in raw_msg.get("urls", []):
             if not isinstance(url_obj, dict):
                 continue
-            meta = url_obj.get("meta") if isinstance(url_obj.get("meta"), dict) else {}
-            headers = url_obj.get("headers") if isinstance(url_obj.get("headers"), dict) else {}
+            raw_meta = url_obj.get("meta")
+            meta = raw_meta if isinstance(raw_meta, dict) else {}
+            raw_headers = url_obj.get("headers")
+            headers = raw_headers if isinstance(raw_headers, dict) else {}
             content_type = (
                 meta.get("contentType")
                 or headers.get("contentType")
@@ -475,9 +486,9 @@ class RocketChatMediaBridge:
 
         return components
 
-    async def extract_file_components(self, raw_msg: dict) -> List[File]:
+    async def extract_file_components(self, raw_msg: dict) -> list[File]:
         candidates = await self._extract_media_payloads(raw_msg, "file")
-        deduped: List[File] = []
+        deduped: list[File] = []
         seen: set[tuple[str, str]] = set()
         for media in candidates:
             name = media.get("name") or "attachment"
@@ -492,9 +503,9 @@ class RocketChatMediaBridge:
                 deduped.append(File(name=name, url=media["url"]))
         return deduped
 
-    async def extract_record_components(self, raw_msg: dict) -> List[Record]:
+    async def extract_record_components(self, raw_msg: dict) -> list[Record]:
         candidates = await self._extract_media_payloads(raw_msg, "audio")
-        deduped: List[Record] = []
+        deduped: list[Record] = []
         seen: set[str] = set()
         for media in candidates:
             ref = media.get("path") or media.get("url") or ""
@@ -507,9 +518,9 @@ class RocketChatMediaBridge:
                 deduped.append(Record.fromURL(media["url"]))
         return deduped
 
-    async def extract_video_components(self, raw_msg: dict) -> List[Video]:
+    async def extract_video_components(self, raw_msg: dict) -> list[Video]:
         candidates = await self._extract_media_payloads(raw_msg, "video")
-        deduped: List[Video] = []
+        deduped: list[Video] = []
         seen: set[str] = set()
         for media in candidates:
             ref = media.get("path") or media.get("url") or ""
@@ -554,7 +565,7 @@ class RocketChatMediaBridge:
         self,
         url: str,
         form: aiohttp.FormData,
-    ) -> Optional[dict[str, Any]]:
+    ) -> dict[str, Any] | None:
         status, data = await self.post_multipart_json_response(url, form)
         if data and data.get("success", bool(status is not None and status < 400)):
             return data
@@ -564,17 +575,21 @@ class RocketChatMediaBridge:
         self,
         url: str,
         form: aiohttp.FormData,
-    ) -> tuple[int | None, Optional[dict[str, Any]]]:
+    ) -> tuple[int | None, dict[str, Any] | None]:
         headers = self.adapter._get_auth_headers()
         try:
-            async with self.adapter._http_session.post(url, data=form, headers=headers) as resp:
+            async with self.adapter._http_session.post(
+                url, data=form, headers=headers
+            ) as resp:
                 try:
                     data = await resp.json(content_type=None)
                 except Exception:
                     text = await resp.text()
                     data = {"success": False, "error": text}
                 if resp.status >= 400 or not data.get("success", resp.status < 400):
-                    logger.error(f"[RocketChat] 上传请求失败: status={resp.status} data={data}")
+                    logger.error(
+                        f"[RocketChat] 上传请求失败: status={resp.status} data={data}"
+                    )
                     return resp.status, None if data is None else data
                 return resp.status, data
         except Exception as exc:
@@ -585,7 +600,7 @@ class RocketChatMediaBridge:
         self,
         url: str,
         payload: dict[str, Any],
-    ) -> tuple[int | None, Optional[dict[str, Any]]]:
+    ) -> tuple[int | None, dict[str, Any] | None]:
         try:
             async with self.adapter._http_session.post(
                 url,
@@ -598,7 +613,9 @@ class RocketChatMediaBridge:
                     text = await resp.text()
                     data = {"success": False, "error": text}
                 if resp.status >= 400 or not data.get("success", resp.status < 400):
-                    logger.error(f"[RocketChat] JSON 请求失败: status={resp.status} data={data}")
+                    logger.error(
+                        f"[RocketChat] JSON 请求失败: status={resp.status} data={data}"
+                    )
                     return resp.status, data
                 return resp.status, data
         except Exception as exc:
@@ -611,20 +628,26 @@ class RocketChatMediaBridge:
         file_path: str,
         resolved_name: str,
         description: str = "",
-        tmid: Optional[str] = None,
+        tmid: str | None = None,
     ) -> bool:
         media_url = f"{self.adapter.server_url}/api/v1/rooms.media/{room_id}"
         with open(file_path, "rb") as fp:
             form = aiohttp.FormData()
             content_type = self.infer_upload_content_type(file_path, resolved_name)
-            form.add_field("file", fp, filename=resolved_name, content_type=content_type)
-            upload_status, upload_resp = await self.post_multipart_json_response(media_url, form)
+            form.add_field(
+                "file", fp, filename=resolved_name, content_type=content_type
+            )
+            upload_status, upload_resp = await self.post_multipart_json_response(
+                media_url, form
+            )
 
         upload_ok = bool(
             upload_resp
-            and upload_resp.get("success", bool(upload_status is not None and upload_status < 400))
+            and upload_resp.get(
+                "success", bool(upload_status is not None and upload_status < 400)
+            )
         )
-        if not upload_ok:
+        if not upload_ok or not upload_resp:
             logger.error(
                 "[RocketChat] rooms.media 上传失败: status=%s data=%s",
                 upload_status,
@@ -649,7 +672,9 @@ class RocketChatMediaBridge:
         )
         confirm_ok = bool(
             confirm_resp
-            and confirm_resp.get("success", bool(confirm_status is not None and confirm_status < 400))
+            and confirm_resp.get(
+                "success", bool(confirm_status is not None and confirm_status < 400)
+            )
         )
         if confirm_ok:
             return True
@@ -667,7 +692,7 @@ class RocketChatMediaBridge:
         file_path: str,
         resolved_name: str,
         description: str = "",
-        tmid: Optional[str] = None,
+        tmid: str | None = None,
     ) -> bool:
         try:
             with open(file_path, "rb") as fp:
@@ -689,7 +714,9 @@ class RocketChatMediaBridge:
             )
             return False
 
-        file_content = await self.adapter._e2ee.build_upload_file_content(room_id, upload)
+        file_content = await self.adapter._e2ee.build_upload_file_content(
+            room_id, upload
+        )
         if not file_content:
             logger.warning(
                 f"[RocketChat][E2EE] 未能生成加密文件元数据，已跳过 room_id={room_id!r}"
@@ -703,7 +730,9 @@ class RocketChatMediaBridge:
             filename=upload.encrypted_name,
             content_type="application/octet-stream",
         )
-        form.add_field("content", json.dumps(file_content["encrypted"], ensure_ascii=False))
+        form.add_field(
+            "content", json.dumps(file_content["encrypted"], ensure_ascii=False)
+        )
 
         upload_resp = await self.post_multipart_json(
             f"{self.adapter.server_url}/api/v1/rooms.media/{room_id}",
@@ -716,7 +745,9 @@ class RocketChatMediaBridge:
         file_id = uploaded_file.get("_id")
         file_url = uploaded_file.get("url")
         if not file_id or not file_url:
-            logger.error(f"[RocketChat][E2EE] rooms.media 响应缺少文件信息: {upload_resp}")
+            logger.error(
+                f"[RocketChat][E2EE] rooms.media 响应缺少文件信息: {upload_resp}"
+            )
             return False
 
         confirm_payload = await self.adapter._e2ee.build_media_confirm_payload(
@@ -744,7 +775,7 @@ class RocketChatMediaBridge:
         file_path: str,
         resolved_name: str,
         description: str = "",
-        tmid: Optional[str] = None,
+        tmid: str | None = None,
     ) -> bool:
         room_info = await self.adapter._get_room_info(room_id)
         if self.adapter._is_unknown_room_info(room_info):
@@ -784,7 +815,7 @@ class RocketChatMediaBridge:
         *,
         media_kind: str,
         text: str = "",
-        tmid: Optional[str] = None,
+        tmid: str | None = None,
     ) -> bool:
         if not await self.is_encrypted_room(room_id):
             return False
@@ -803,7 +834,7 @@ class RocketChatMediaBridge:
         room_id: str,
         image_url: str,
         text: str = "",
-        tmid: Optional[str] = None,
+        tmid: str | None = None,
     ) -> bool:
         # 统一：先下载远程图片到本地，再通过文件上传发送
         # 避免外部 URL 防盗链（Referer 检查）导致图片在 Rocket.Chat 中无法显示
@@ -844,7 +875,7 @@ class RocketChatMediaBridge:
         room_id: str,
         file_path: str,
         description: str = "",
-        tmid: Optional[str] = None,
+        tmid: str | None = None,
     ) -> bool:
         try:
             filename = os.path.basename(file_path) or "image.png"
@@ -865,9 +896,9 @@ class RocketChatMediaBridge:
         self,
         room_id: str,
         file_path: str,
-        filename: Optional[str] = None,
+        filename: str | None = None,
         description: str = "",
-        tmid: Optional[str] = None,
+        tmid: str | None = None,
     ) -> None:
         try:
             resolved_name = filename or os.path.basename(file_path) or "attachment"
@@ -896,15 +927,10 @@ class RocketChatMediaBridge:
         if raw is None:
             return None, None
 
-        tmp = tempfile.NamedTemporaryFile(suffix=suffix, delete=False)
-        try:
+        with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
             tmp.write(raw)
-            tmp.close()
-            return tmp.name, lambda: os.unlink(tmp.name)
-        except Exception:
-            tmp.close()
-            os.unlink(tmp.name)
-            raise
+            name = tmp.name
+        return name, lambda: os.unlink(name)
 
     def decode_base64_media(
         self,
@@ -917,12 +943,7 @@ class RocketChatMediaBridge:
             logger.error(f"[RocketChat] Base64 媒体处理失败: {exc!r}")
             return None, None
 
-        tmp = tempfile.NamedTemporaryFile(suffix=default_suffix, delete=False)
-        try:
+        with tempfile.NamedTemporaryFile(suffix=default_suffix, delete=False) as tmp:
             tmp.write(raw)
-            tmp.close()
-            return tmp.name, lambda: os.unlink(tmp.name)
-        except Exception:
-            tmp.close()
-            os.unlink(tmp.name)
-            raise
+            name = tmp.name
+        return name, lambda: os.unlink(name)

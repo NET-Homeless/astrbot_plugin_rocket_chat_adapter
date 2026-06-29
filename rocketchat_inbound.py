@@ -1,10 +1,9 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import re
 import time
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any
 from urllib.parse import parse_qs, urlparse
 
 from astrbot.api import logger
@@ -16,8 +15,8 @@ from .rocketchat_event import RocketChatMessageEvent
 # 导入常量（从 adapter 模块）
 try:
     from .rocketchat_adapter import (
-        PROCESSED_MESSAGE_TTL_SECONDS,
         PROCESSED_MESSAGE_CACHE_LIMIT,
+        PROCESSED_MESSAGE_TTL_SECONDS,
     )
 except ImportError:
     PROCESSED_MESSAGE_TTL_SECONDS = 10 * 60
@@ -30,10 +29,10 @@ class RocketChatInboundBridge:
         self._processed_message_ttl_seconds = PROCESSED_MESSAGE_TTL_SECONDS
         self._processed_message_cache_limit = PROCESSED_MESSAGE_CACHE_LIMIT
         # 消息去重锁，防止并发处理导致重复消息
-        self._dedup_lock: Optional[asyncio.Lock] = None
+        self._dedup_lock: asyncio.Lock | None = None
         # bot @提及匹配正则缓存，避免每条消息重复编译（bot_username 在登录后才确定）
-        self._mention_pattern: Optional[re.Pattern[str]] = None
-        self._mention_pattern_username: Optional[str] = None
+        self._mention_pattern: re.Pattern[str] | None = None
+        self._mention_pattern_username: str | None = None
 
     def extract_mentions_for_wake(self, raw_msg: dict) -> list[Any]:
         mentions = raw_msg.get("mentions")
@@ -137,7 +136,9 @@ class RocketChatInboundBridge:
                 )
                 if is_bot:
                     bot_mentioned = True
-                elif mention.get("_id") or mention.get("username") or mention.get("name"):
+                elif (
+                    mention.get("_id") or mention.get("username") or mention.get("name")
+                ):
                     has_other_user_mentions = True
 
         return bot_mentioned, has_other_user_mentions
@@ -151,9 +152,11 @@ class RocketChatInboundBridge:
                 rf"(?<![A-Za-z0-9_.-])@{re.escape(bot_username)}(?![A-Za-z0-9_.-])"
             )
             self._mention_pattern_username = bot_username
+        if self._mention_pattern is None:
+            return False
         return bool(self._mention_pattern.search(text))
 
-    def _extract_msg_id_from_parsed_url(self, url_obj: dict) -> Optional[str]:
+    def _extract_msg_id_from_parsed_url(self, url_obj: dict) -> str | None:
         parsed_url = url_obj.get("parsedUrl")
         if isinstance(parsed_url, dict):
             query = parsed_url.get("query")
@@ -205,7 +208,8 @@ class RocketChatInboundBridge:
             # 清理过期条目（每次都清理，防止缓存无限增长）
             # 仅在超过限制时才做强制淘汰
             expired_keys = [
-                cached_id for cached_id, timestamp in seen.items()
+                cached_id
+                for cached_id, timestamp in seen.items()
                 if timestamp < expires_before
             ]
             for cached_id in expired_keys:
@@ -247,8 +251,12 @@ class RocketChatInboundBridge:
 
         msg_text = current_payload.get("msg", "").strip()
 
-        local_images = await self.adapter._media.extract_image_components(current_payload)
-        local_recs = await self.adapter._media.extract_record_components(current_payload)
+        local_images = await self.adapter._media.extract_image_components(
+            current_payload
+        )
+        local_recs = await self.adapter._media.extract_record_components(
+            current_payload
+        )
         local_vids = await self.adapter._media.extract_video_components(current_payload)
         local_files = await self.adapter._media.extract_file_components(current_payload)
 
@@ -266,7 +274,11 @@ class RocketChatInboundBridge:
                 )
 
         att_raw = current_payload.get("attachments", [])
-        direct_atts = [att_raw] if isinstance(att_raw, dict) else [a for a in att_raw if isinstance(a, dict)]
+        direct_atts = (
+            [att_raw]
+            if isinstance(att_raw, dict)
+            else [a for a in att_raw if isinstance(a, dict)]
+        )
         for att in direct_atts:
             link = att.get("message_link") or ""
             if "msg=" in link:
@@ -276,7 +288,9 @@ class RocketChatInboundBridge:
                     q_id = qs["msg"][0]
                     if q_id and q_id not in quote_ids:
                         quote_ids.append(q_id)
-                        logger.debug(f"[RocketChat][IN] 从直接attachment.message_link识别引用: msg_id={q_id}")
+                        logger.debug(
+                            f"[RocketChat][IN] 从直接attachment.message_link识别引用: msg_id={q_id}"
+                        )
 
         link_pattern = re.compile(
             r"\[([^\]]*)\]\(([^)]*msg=[^)]*)\)|"
@@ -306,7 +320,9 @@ class RocketChatInboundBridge:
             try:
                 q_msg = await self.adapter._fetch_message_by_id(q_id)
                 if not q_msg:
-                    logger.debug(f"[RocketChat][IN] 被引用消息不存在或无权限访问: msgId={q_id}")
+                    logger.debug(
+                        f"[RocketChat][IN] 被引用消息不存在或无权限访问: msgId={q_id}"
+                    )
                     continue
 
                 q_components = await self._build_components_recursively(
@@ -319,14 +335,18 @@ class RocketChatInboundBridge:
                     continue
 
                 q_sender_id = q_msg.get("u", {}).get("_id", "")
-                q_sender_name = q_msg.get("u", {}).get("name") or q_msg.get("u", {}).get("username", "")
+                q_sender_name = q_msg.get("u", {}).get("name") or q_msg.get(
+                    "u", {}
+                ).get("username", "")
                 q_ts_raw = q_msg.get("ts")
                 if isinstance(q_ts_raw, dict):
                     q_timestamp = int(q_ts_raw.get("$date", time.time() * 1000) / 1000)
                 else:
                     q_timestamp = int(time.time())
 
-                q_msg_text = "".join([c.text for c in q_components if isinstance(c, Plain)]).strip()
+                q_msg_text = "".join(
+                    [c.text for c in q_components if isinstance(c, Plain)]
+                ).strip()
                 found_reply_comps.append(
                     Reply(
                         id=q_id,
@@ -338,7 +358,9 @@ class RocketChatInboundBridge:
                     )
                 )
             except Exception as exc:
-                logger.warning(f"[RocketChat][IN] 递归处理被引用消息出错: msgId={q_id} error={exc!r}")
+                logger.warning(
+                    f"[RocketChat][IN] 递归处理被引用消息出错: msgId={q_id} error={exc!r}"
+                )
 
         chain.extend(found_reply_comps)
 
@@ -346,7 +368,9 @@ class RocketChatInboundBridge:
         if cleaned_msg_text:
             chain.extend(self._build_text_components(current_payload, cleaned_msg_text))
             if current_depth == 0:
-                logger.debug(f"[RocketChat][IN] 清理后文本: clean_text={cleaned_msg_text!r}")
+                logger.debug(
+                    f"[RocketChat][IN] 清理后文本: clean_text={cleaned_msg_text!r}"
+                )
 
         if local_images or local_recs or local_vids or local_files:
             logger.debug(
@@ -390,7 +414,9 @@ class RocketChatInboundBridge:
                 logger.debug("[RocketChat][IN] skip self message")
                 return
 
-            components = await self._build_components_recursively(raw_msg, seen_quote_ids=set())
+            components = await self._build_components_recursively(
+                raw_msg, seen_quote_ids=set()
+            )
             msg_text = self._build_plain_text(components)
 
             if not msg_text and not [c for c in components if not isinstance(c, Plain)]:
@@ -407,7 +433,7 @@ class RocketChatInboundBridge:
             sender_id: str = raw_msg.get("u", {}).get("_id", "")
             sender_username: str = raw_msg.get("u", {}).get("username", "")
             sender_name: str = raw_msg.get("u", {}).get("name") or sender_username
-            thread_id: Optional[str] = raw_msg.get("tmid")
+            thread_id: str | None = raw_msg.get("tmid")
 
             ts_raw = raw_msg.get("ts")
             if isinstance(ts_raw, dict):
@@ -416,7 +442,11 @@ class RocketChatInboundBridge:
                 timestamp = int(time.time())
 
             room_type = await self.adapter._get_room_type(room_id)
-            msg_type = MessageType.FRIEND_MESSAGE if room_type == "d" else MessageType.GROUP_MESSAGE
+            msg_type = (
+                MessageType.FRIEND_MESSAGE
+                if room_type == "d"
+                else MessageType.GROUP_MESSAGE
+            )
 
             abm = AstrBotMessage()
             abm.type = msg_type
@@ -428,17 +458,25 @@ class RocketChatInboundBridge:
             abm.message_str = msg_text
             abm.raw_message = raw_msg
             abm.timestamp = timestamp
-            abm.group = Group(group_id=room_id) if msg_type == MessageType.GROUP_MESSAGE else None
+            abm.group = (
+                Group(group_id=room_id)
+                if msg_type == MessageType.GROUP_MESSAGE
+                else None
+            )
 
             bot_mentioned, has_other_user_mentions = self._classify_mentions(raw_msg)
             reply_to_self = self._has_reply_to_self(components)
 
             if not bot_mentioned and self.adapter.bot_username:
                 bot_mentioned = self._text_contains_bot_mention(abm.message_str or "")
-                has_other_user_mentions = bool(has_other_user_mentions or "@" in (abm.message_str or ""))
+                has_other_user_mentions = bool(
+                    has_other_user_mentions or "@" in (abm.message_str or "")
+                )
 
             if bot_mentioned:
-                logger.debug(f"[RocketChat][IN] bot mentioned, clean_text={abm.message_str!r}")
+                logger.debug(
+                    f"[RocketChat][IN] bot mentioned, clean_text={abm.message_str!r}"
+                )
 
             has_current_non_text_payload = any(
                 not isinstance(comp, (Plain, At, Reply)) for comp in abm.message
@@ -482,9 +520,8 @@ class RocketChatInboundBridge:
             )
 
             explicit_wake = (
-                (bot_mentioned and not suppress_wake)
-                or msg_type == MessageType.FRIEND_MESSAGE
-            )
+                bot_mentioned and not suppress_wake
+            ) or msg_type == MessageType.FRIEND_MESSAGE
             reply_wake = msg_type == MessageType.GROUP_MESSAGE and reply_to_self
             should_wake_astrbot = explicit_wake or reply_wake
             if explicit_wake:
@@ -494,15 +531,18 @@ class RocketChatInboundBridge:
                 event.start_typing_indicator()
 
             logger.debug(
-                "[RocketChat][IN] → commit type=%s room=%r msg=%r wake=%s"
-                % (
+                "[RocketChat][IN] → commit type={} room={!r} msg={!r} wake={}".format(
                     "DM" if msg_type == MessageType.FRIEND_MESSAGE else "Group",
                     room_id,
-                    (abm.message_str[:60] + "…") if len(abm.message_str) > 60 else abm.message_str,
+                    (abm.message_str[:60] + "…")
+                    if len(abm.message_str) > 60
+                    else abm.message_str,
                     event.is_at_or_wake_command,
                 )
             )
             self.adapter.commit_event(event)
         except Exception as exc:
-            logger.error(f"[RocketChat][IN] unhandled processing error: {exc!r}", exc_info=True)
+            logger.error(
+                f"[RocketChat][IN] unhandled processing error: {exc!r}", exc_info=True
+            )
             raise

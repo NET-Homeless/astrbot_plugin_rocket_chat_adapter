@@ -1,9 +1,8 @@
 from __future__ import annotations
 
-from typing import Any, Callable, Optional
+from typing import TYPE_CHECKING, Any
 
 from astrbot.api import logger
-from astrbot.api.event import MessageChain
 from astrbot.api.message_components import File, Image, Plain, Record, Reply, Video
 
 from .rocketchat_components import append_rendered_component, render_message_chain_text
@@ -11,11 +10,14 @@ from .rocketchat_media import upload_combined_images
 from .rocketchat_segments import (
     ImageGroup,
     MediaItem,
-    SegmentSender,
-    TextSegment,
     dispatch_segments,
     iter_segments,
 )
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
+
+    from astrbot.api.event import MessageChain
 
 
 class RocketChatSenderBridge:
@@ -43,9 +45,9 @@ class RocketChatSenderBridge:
         room_id: str,
         text: str = "",
         *,
-        attachments: Optional[list[dict[str, Any]]] = None,
-        tmid: Optional[str] = None,
-        e2e_mentions: Optional[dict[str, Any]] = None,
+        attachments: list[dict[str, Any]] | None = None,
+        tmid: str | None = None,
+        e2e_mentions: dict[str, Any] | None = None,
     ) -> bool:
         room_info = await self.adapter._get_room_info(room_id)
         if self.adapter._is_unknown_room_info(room_info):
@@ -86,7 +88,7 @@ class RocketChatSenderBridge:
     async def build_explicit_reply_mention(
         self,
         room_id: str,
-        mention_username: Optional[str],
+        mention_username: str | None,
     ) -> tuple[str | None, dict[str, Any] | None]:
         room_info = await self.adapter._get_room_info(room_id)
         if not (
@@ -121,8 +123,8 @@ class RocketChatSenderBridge:
         self,
         room_id: str,
         text: str,
-        tmid: Optional[str] = None,
-        mention_username: Optional[str] = None,
+        tmid: str | None = None,
+        mention_username: str | None = None,
     ) -> None:
         mention_text, e2e_mentions = await self.build_explicit_reply_mention(
             room_id,
@@ -140,9 +142,13 @@ class RocketChatSenderBridge:
         self,
         room_id: str,
         flag: bool,
-        tmid: Optional[str] = None,
+        tmid: str | None = None,
     ) -> None:
-        if not self.adapter._ws or self.adapter._ws.closed or not self.adapter.bot_username:
+        if (
+            not self.adapter._ws
+            or self.adapter._ws.closed
+            or not self.adapter.bot_username
+        ):
             logger.debug(
                 f"[RocketChat] typing 跳过: ws={self.adapter._ws is not None and not getattr(self.adapter._ws, 'closed', True)} "
                 f"bot_username={self.adapter.bot_username!r}"
@@ -161,7 +167,7 @@ class RocketChatSenderBridge:
                 f"[RocketChat] send typing room_id={room_id!r} tmid={tmid!r} "
                 f"user={self.adapter.bot_username!r} flag={flag}"
             )
-            result = await self.adapter._realtime.ddp_call(
+            await self.adapter._realtime.ddp_call(
                 "stream-notify-room",
                 params,
                 timeout=10.0,
@@ -178,8 +184,8 @@ class RocketChatSenderBridge:
         room_id: str,
         text: str,
         original_msg: dict,
-        tmid: Optional[str] = None,
-        mention_username: Optional[str] = None,
+        tmid: str | None = None,
+        mention_username: str | None = None,
     ) -> None:
         msg_id = original_msg.get("_id", "")
         link = self.adapter._build_message_link(room_id, msg_id)
@@ -206,7 +212,7 @@ class RocketChatSenderBridge:
         room_id: str,
         image_url: str,
         text: str = "",
-        tmid: Optional[str] = None,
+        tmid: str | None = None,
     ) -> bool:
         return await self.adapter._media.send_image_url(
             room_id, image_url, text=text, tmid=tmid
@@ -217,7 +223,7 @@ class RocketChatSenderBridge:
         room_id: str,
         file_path: str,
         description: str = "",
-        tmid: Optional[str] = None,
+        tmid: str | None = None,
     ) -> bool:
         return await self.adapter._media.send_image_file(
             room_id,
@@ -232,7 +238,7 @@ class RocketChatSenderBridge:
         file_path: str,
         filename: str | None = None,
         description: str = "",
-        tmid: Optional[str] = None,
+        tmid: str | None = None,
     ) -> None:
         await self.adapter._media.send_file(
             room_id,
@@ -249,7 +255,7 @@ class RocketChatSenderBridge:
         *,
         media_kind: str,
         text: str = "",
-        tmid: Optional[str] = None,
+        tmid: str | None = None,
     ) -> bool:
         return await self.adapter._media.send_remote_media_fallback(
             room_id,
@@ -265,7 +271,9 @@ class RocketChatSenderBridge:
         default_suffix: str,
     ) -> tuple[str | None, Callable[[], None] | None]:
         if file_ref.startswith("http://") or file_ref.startswith("https://"):
-            return await self.adapter._media.download_remote_media(file_ref, default_suffix)
+            return await self.adapter._media.download_remote_media(
+                file_ref, default_suffix
+            )
         if file_ref.startswith("base64://"):
             return self.adapter._media.decode_base64_media(file_ref, default_suffix)
 
@@ -290,9 +298,11 @@ class RocketChatSenderBridge:
         self,
         room_id: str,
         message_chain: MessageChain,
-        tmid: Optional[str] = None,
+        tmid: str | None = None,
     ) -> None:
-        reply_comp = next((c for c in message_chain.chain if isinstance(c, Reply)), None)
+        reply_comp = next(
+            (c for c in message_chain.chain if isinstance(c, Reply)), None
+        )
         full_text = render_message_chain_text(
             message_chain,
             plain_type=Plain,
@@ -337,9 +347,9 @@ class _SenderSegmentSender:
 
     def __init__(
         self,
-        bridge: "RocketChatSenderBridge",
+        bridge: RocketChatSenderBridge,
         room_id: str,
-        tmid: Optional[str],
+        tmid: str | None,
     ) -> None:
         self.bridge = bridge
         self.room_id = room_id
@@ -358,7 +368,9 @@ class _SenderSegmentSender:
             if file_ref.startswith("http://") or file_ref.startswith("https://"):
                 await self.bridge.send_text(
                     self.room_id,
-                    f"{comp.name}: {file_ref}" if getattr(comp, "name", None) else file_ref,
+                    f"{comp.name}: {file_ref}"
+                    if getattr(comp, "name", None)
+                    else file_ref,
                     self.tmid,
                 )
             else:
@@ -373,10 +385,14 @@ class _SenderSegmentSender:
         elif isinstance(comp, (Record, Video)):
             file_ref = comp.file or getattr(comp, "url", None) or ""
             suffix = ".mp4" if isinstance(comp, Video) else ".ogg"
-            media_path, cleanup = await self.bridge.resolve_outbound_media_path(file_ref, suffix)
+            media_path, cleanup = await self.bridge.resolve_outbound_media_path(
+                file_ref, suffix
+            )
             if media_path:
                 try:
-                    await self.bridge.send_file(self.room_id, media_path, tmid=self.tmid)
+                    await self.bridge.send_file(
+                        self.room_id, media_path, tmid=self.tmid
+                    )
                 finally:
                     if cleanup:
                         cleanup()
@@ -401,7 +417,11 @@ class _SenderSegmentSender:
 
         # 有 caption：尝试合并
         sent_text_with_image = await upload_combined_images(
-            self.bridge.adapter, self.room_id, text, images, tmid=self.tmid,
+            self.bridge.adapter,
+            self.room_id,
+            text,
+            images,
+            tmid=self.tmid,
         )
 
         if text and not sent_text_with_image:
@@ -417,5 +437,6 @@ class _SenderSegmentSender:
         else:
             local_path = file_ref.replace("file:///", "").replace("file://", "")
             if local_path:
-                await self.bridge.send_image_file(self.room_id, local_path, tmid=self.tmid)
-
+                await self.bridge.send_image_file(
+                    self.room_id, local_path, tmid=self.tmid
+                )

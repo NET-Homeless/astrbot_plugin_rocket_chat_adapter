@@ -301,6 +301,43 @@ A: 在 AstrBot 平台配置中添加多个 `rocket_chat` 实例，每个实例�
 
 欢迎提交 Issue 和 Pull Request！
 
+### 代码质量 Gate（Pre-commit Hooks）
+
+本项目使用 [lefthook](https://github.com/evilmartians/lefthook) 在 `git commit` 前自动运行格式化和代码质量检查。
+
+未通过检查的提交将被阻止。
+
+**安装步骤：**
+
+1. 安装 lefthook：
+   ```bash
+   # macOS
+   brew install lefthook
+
+   # 或使用官方安装脚本（Linux/macOS）
+   curl -sSfL https://raw.githubusercontent.com/evilmartians/lefthook/master/install.sh | sh
+   ```
+
+2. 在本仓库根目录激活 hooks：
+   ```bash
+   lefthook install
+   ```
+
+3. 安装开发依赖（用于 ruff / pyright）：
+   ```bash
+   pip install -r requirements-dev.txt
+   ```
+
+**每次 commit 时将自动执行：**
+- `ruff check --fix`（仅对暂存文件 lint 检查 + 自动修复）
+- `ruff format`（仅对暂存文件格式化）
+- `pyright .`（对整个项目做类型检查，保证跨文件一致性）
+
+如需临时跳过（不推荐）：
+```bash
+git commit --no-verify
+```
+
 ### 项目结构
 
 ```
@@ -316,6 +353,7 @@ astrbot_plugin_rocket_chat_adapter/
 ├── metadata.yaml                # 插件元数据
 ├── requirements.txt             # 运行时依赖说明（由 AstrBot 本体提供）
 ├── requirements-dev.txt         # 开发/测试依赖（脱离 AstrBot 跑测试时安装）
+├── lefthook.yml                 # Git hooks 配置（commit 前自动 lint/format/type check）
 ├── docs/
 │   └── DEVELOPMENT_KNOWLEDGE_BASE.md
 └── README.md                    # 本文档

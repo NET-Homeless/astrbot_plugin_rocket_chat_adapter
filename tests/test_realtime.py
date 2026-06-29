@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-import unittest
 from typing import Any
+import unittest
 
 from tests._bootstrap import install_astrbot_stubs
 
@@ -32,7 +32,9 @@ class _DummyAdapter:
 
 
 class RocketChatRealtimeTests(unittest.IsolatedAsyncioTestCase):
-    async def test_dynamic_room_subscription_waits_for_ready_and_retries_after_nosub(self) -> None:
+    async def test_dynamic_room_subscription_waits_for_ready_and_retries_after_nosub(
+        self,
+    ) -> None:
         adapter = _DummyAdapter()
         bridge = RocketChatRealtimeBridge(adapter)
         ws = _DummyWs()
@@ -52,7 +54,9 @@ class RocketChatRealtimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(adapter._pending_room_subscriptions, {"room-room-1": "room-1"})
         self.assertNotIn("room-1", adapter._subscribed_rooms)
 
-        bridge._handle_nosub({"msg": "nosub", "id": "room-room-1", "error": {"reason": "denied"}})
+        bridge._handle_nosub(
+            {"msg": "nosub", "id": "room-room-1", "error": {"reason": "denied"}}
+        )
 
         self.assertEqual(adapter._pending_room_subscriptions, {})
         self.assertNotIn("room-1", adapter._subscribed_rooms)

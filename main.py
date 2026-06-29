@@ -46,7 +46,9 @@ class RocketChatAdapterPlugin(Star):
                     "[RocketChat] plugin reloading, restarting adapter id=%s ...",
                     config.get("id", "unknown"),
                 )
-                await pm.reload(config)
+                reload_fn = getattr(pm, "reload", None)
+                if reload_fn:
+                    await reload_fn(config)
             except Exception as exc:
                 logger.error(
                     "[RocketChat] failed to restart adapter id=%s: %r",

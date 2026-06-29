@@ -7,8 +7,20 @@ from tests._bootstrap import install_astrbot_stubs
 install_astrbot_stubs()
 
 from astrbot.api.event import MessageChain  # noqa: E402
-from astrbot.api.message_components import Forward, Image, Node, Nodes, Plain, Reply  # noqa: E402
-from astrbot.api.platform import AstrBotMessage, MessageType, PlatformMetadata  # noqa: E402
+from astrbot.api.message_components import (  # noqa: E402
+    Forward,
+    Image,
+    Node,
+    Nodes,
+    Plain,
+    Reply,
+)
+from astrbot.api.platform import (  # noqa: E402
+    AstrBotMessage,
+    MessageType,
+    PlatformMetadata,
+)
+
 from astrbot_plugin_rocket_chat_adapter.rocketchat_event import (  # noqa: E402
     RocketChatMessageEvent,
 )
@@ -41,7 +53,9 @@ class _DummyEventAdapter:
     async def _get_room_info(self, room_id: str) -> dict:
         return {"_id": room_id, "t": "c", "encrypted": False}
 
-    async def send_typing(self, room_id: str, flag: bool, tmid: str | None = None) -> None:
+    async def send_typing(
+        self, room_id: str, flag: bool, tmid: str | None = None
+    ) -> None:
         self.typing_calls.append((room_id, flag, tmid))
 
     async def _should_explicit_reply_mention(self, room_id: str) -> bool:
@@ -75,7 +89,9 @@ class _DummyEventAdapter:
         description: str = "",
         tmid: str | None = None,
     ) -> bool:
-        self.media_uploads.append((room_id, file_path, resolved_name, description, tmid))
+        self.media_uploads.append(
+            (room_id, file_path, resolved_name, description, tmid)
+        )
         self.events.append(("media", description))
         if self.upload_results:
             return self.upload_results.pop(0)
@@ -155,7 +171,9 @@ class _DummySenderAdapter:
         description: str = "",
         tmid: str | None = None,
     ) -> bool:
-        self.media_uploads.append((room_id, file_path, resolved_name, description, tmid))
+        self.media_uploads.append(
+            (room_id, file_path, resolved_name, description, tmid)
+        )
         self.events.append(("media", description))
         if self.upload_results:
             return self.upload_results.pop(0)
@@ -256,7 +274,9 @@ class _DummyEncryptedEventAdapter(_DummyEncryptedAdapter):
 
         self._sender.post_json_message = post_json_message  # type: ignore[method-assign]
 
-    async def send_typing(self, room_id: str, flag: bool, tmid: str | None = None) -> None:
+    async def send_typing(
+        self, room_id: str, flag: bool, tmid: str | None = None
+    ) -> None:
         pass
 
     async def _should_explicit_reply_mention(self, room_id: str) -> bool:
@@ -294,7 +314,9 @@ class _DummyEncryptedEventAdapter(_DummyEncryptedAdapter):
 
 
 class RocketChatOutboundComponentTests(unittest.IsolatedAsyncioTestCase):
-    async def test_event_send_combines_plain_before_image_with_media_confirm_msg(self) -> None:
+    async def test_event_send_combines_plain_before_image_with_media_confirm_msg(
+        self,
+    ) -> None:
         adapter = _DummyEventAdapter()
         event = RocketChatMessageEvent(
             message_str="",
@@ -310,11 +332,13 @@ class RocketChatOutboundComponentTests(unittest.IsolatedAsyncioTestCase):
             adapter=adapter,
         )
         chain = MessageChain()
-        chain.chain.extend([
-            Plain(text="图文测试"),
-            Image.fromFileSystem("/tmp/a.png"),
-            Plain(text="后续文字"),
-        ])
+        chain.chain.extend(
+            [
+                Plain(text="图文测试"),
+                Image.fromFileSystem("/tmp/a.png"),
+                Plain(text="后续文字"),
+            ]
+        )
 
         await event.send(chain)
 
@@ -341,7 +365,9 @@ class RocketChatOutboundComponentTests(unittest.IsolatedAsyncioTestCase):
             adapter=adapter,
         )
         chain = MessageChain()
-        chain.chain.extend([Image.fromFileSystem("/tmp/a.png"), Plain(text="图片后文字")])
+        chain.chain.extend(
+            [Image.fromFileSystem("/tmp/a.png"), Plain(text="图片后文字")]
+        )
 
         await event.send(chain)
 
@@ -368,7 +394,9 @@ class RocketChatOutboundComponentTests(unittest.IsolatedAsyncioTestCase):
             adapter=adapter,
         )
         chain = MessageChain()
-        chain.chain.extend([Plain(text="远端图文"), Image.fromURL("https://example.com/a.png")])
+        chain.chain.extend(
+            [Plain(text="远端图文"), Image.fromURL("https://example.com/a.png")]
+        )
 
         await event.send(chain)
 
@@ -378,7 +406,9 @@ class RocketChatOutboundComponentTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(adapter.events, [("media", "远端图文")])
 
-    async def test_event_send_combined_remote_image_download_failure_keeps_image_fallback(self) -> None:
+    async def test_event_send_combined_remote_image_download_failure_keeps_image_fallback(
+        self,
+    ) -> None:
         adapter = _DummyEventAdapter()
         adapter.download_results = [(None, None)]
         event = RocketChatMessageEvent(
@@ -395,7 +425,9 @@ class RocketChatOutboundComponentTests(unittest.IsolatedAsyncioTestCase):
             adapter=adapter,
         )
         chain = MessageChain()
-        chain.chain.extend([Plain(text="远端图文"), Image.fromURL("https://example.com/a.png")])
+        chain.chain.extend(
+            [Plain(text="远端图文"), Image.fromURL("https://example.com/a.png")]
+        )
 
         await event.send(chain)
 
@@ -406,7 +438,9 @@ class RocketChatOutboundComponentTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(adapter.sent_texts, [])
 
-    async def test_event_send_keeps_text_when_first_combined_image_upload_fails(self) -> None:
+    async def test_event_send_keeps_text_when_first_combined_image_upload_fails(
+        self,
+    ) -> None:
         adapter = _DummyEventAdapter()
         adapter.upload_results = [False, True]
         event = RocketChatMessageEvent(
@@ -423,11 +457,13 @@ class RocketChatOutboundComponentTests(unittest.IsolatedAsyncioTestCase):
             adapter=adapter,
         )
         chain = MessageChain()
-        chain.chain.extend([
-            Plain(text="图文测试"),
-            Image.fromFileSystem("/tmp/a.png"),
-            Image.fromFileSystem("/tmp/b.png"),
-        ])
+        chain.chain.extend(
+            [
+                Plain(text="图文测试"),
+                Image.fromFileSystem("/tmp/a.png"),
+                Image.fromFileSystem("/tmp/b.png"),
+            ]
+        )
 
         await event.send(chain)
 
@@ -440,7 +476,9 @@ class RocketChatOutboundComponentTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(adapter.sent_texts, [])
 
-    async def test_sender_bridge_combines_plain_before_image_with_media_confirm_msg(self) -> None:
+    async def test_sender_bridge_combines_plain_before_image_with_media_confirm_msg(
+        self,
+    ) -> None:
         adapter = _DummySenderAdapter()
         sender = RocketChatSenderBridge(adapter)
 
@@ -451,11 +489,13 @@ class RocketChatOutboundComponentTests(unittest.IsolatedAsyncioTestCase):
         sender.send_text = send_text  # type: ignore[method-assign]
 
         chain = MessageChain()
-        chain.chain.extend([
-            Plain(text="图文测试"),
-            Image.fromFileSystem("/tmp/a.png"),
-            Plain(text="后续文字"),
-        ])
+        chain.chain.extend(
+            [
+                Plain(text="图文测试"),
+                Image.fromFileSystem("/tmp/a.png"),
+                Plain(text="后续文字"),
+            ]
+        )
 
         await sender.send_message_chain("room-1", chain, tmid="thread-1")
 
@@ -466,7 +506,9 @@ class RocketChatOutboundComponentTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(adapter.sent_texts, [("room-1", "后续文字", "thread-1")])
         self.assertEqual(adapter.events, [("media", "图文测试"), ("text", "后续文字")])
 
-    async def test_sender_bridge_combined_remote_image_download_failure_keeps_image_fallback(self) -> None:
+    async def test_sender_bridge_combined_remote_image_download_failure_keeps_image_fallback(
+        self,
+    ) -> None:
         adapter = _DummySenderAdapter()
         adapter.download_results = [(None, None)]
         sender = RocketChatSenderBridge(adapter)
@@ -478,7 +520,9 @@ class RocketChatOutboundComponentTests(unittest.IsolatedAsyncioTestCase):
         sender.send_text = send_text  # type: ignore[method-assign]
 
         chain = MessageChain()
-        chain.chain.extend([Plain(text="远端图文"), Image.fromURL("https://example.com/a.png")])
+        chain.chain.extend(
+            [Plain(text="远端图文"), Image.fromURL("https://example.com/a.png")]
+        )
 
         await sender.send_message_chain("room-1", chain, tmid="thread-1")
 
@@ -489,7 +533,9 @@ class RocketChatOutboundComponentTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(adapter.sent_texts, [])
 
-    async def test_sender_bridge_unknown_room_info_does_not_send_plaintext(self) -> None:
+    async def test_sender_bridge_unknown_room_info_does_not_send_plaintext(
+        self,
+    ) -> None:
         class _UnknownRoomAdapter(_DummySenderAdapter):
             async def _get_room_info(self, room_id: str) -> dict:
                 return {"_id": room_id, "_unknown": True, "encrypted": None, "t": None}
@@ -506,7 +552,9 @@ class RocketChatOutboundComponentTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertFalse(sent)
 
-    async def test_sender_bridge_splits_image_before_plain_to_preserve_order(self) -> None:
+    async def test_sender_bridge_splits_image_before_plain_to_preserve_order(
+        self,
+    ) -> None:
         adapter = _DummySenderAdapter()
         sender = RocketChatSenderBridge(adapter)
 
@@ -517,7 +565,9 @@ class RocketChatOutboundComponentTests(unittest.IsolatedAsyncioTestCase):
         sender.send_text = send_text  # type: ignore[method-assign]
 
         chain = MessageChain()
-        chain.chain.extend([Image.fromFileSystem("/tmp/a.png"), Plain(text="图片后文字")])
+        chain.chain.extend(
+            [Image.fromFileSystem("/tmp/a.png"), Plain(text="图片后文字")]
+        )
 
         await sender.send_message_chain("room-1", chain, tmid="thread-1")
 
@@ -584,7 +634,9 @@ class RocketChatOutboundComponentTests(unittest.IsolatedAsyncioTestCase):
         sender.send_text = send_text  # type: ignore[method-assign]
 
         chain = MessageChain()
-        chain.chain.extend([Plain(text="这里有转发\n"), Forward(id="forward-message-id")])
+        chain.chain.extend(
+            [Plain(text="这里有转发\n"), Forward(id="forward-message-id")]
+        )
 
         await sender.send_message_chain("room-1", chain)
 
@@ -598,7 +650,11 @@ class RocketChatOutboundComponentTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_sender_bridge_preserves_nodes_in_reply_text(self) -> None:
         adapter = _DummySenderAdapter()
-        adapter.messages_by_id["reply-1"] = {"_id": "reply-1", "rid": "room-1", "msg": "old"}
+        adapter.messages_by_id["reply-1"] = {
+            "_id": "reply-1",
+            "rid": "room-1",
+            "msg": "old",
+        }
         sender = RocketChatSenderBridge(adapter)
 
         async def send_with_quote(
@@ -617,7 +673,11 @@ class RocketChatOutboundComponentTests(unittest.IsolatedAsyncioTestCase):
             [
                 Reply(id="reply-1"),
                 Plain(text="引用里的转发："),
-                Nodes(nodes=[Node(name="Alice", uin="10001", content=[Plain(text="正文")])]),
+                Nodes(
+                    nodes=[
+                        Node(name="Alice", uin="10001", content=[Plain(text="正文")])
+                    ]
+                ),
             ]
         )
 
@@ -644,7 +704,11 @@ class RocketChatOutboundComponentTests(unittest.IsolatedAsyncioTestCase):
         chain.chain.extend(
             [
                 Plain(text="加密房间转发："),
-                Nodes(nodes=[Node(name="Alice", uin="10001", content=[Plain(text="正文")])]),
+                Nodes(
+                    nodes=[
+                        Node(name="Alice", uin="10001", content=[Plain(text="正文")])
+                    ]
+                ),
             ]
         )
 
@@ -685,7 +749,11 @@ class RocketChatOutboundComponentTests(unittest.IsolatedAsyncioTestCase):
         chain.chain.extend(
             [
                 Plain(text="事件回复转发："),
-                Nodes(nodes=[Node(name="Alice", uin="10001", content=[Plain(text="正文")])]),
+                Nodes(
+                    nodes=[
+                        Node(name="Alice", uin="10001", content=[Plain(text="正文")])
+                    ]
+                ),
             ]
         )
 
@@ -697,10 +765,15 @@ class RocketChatOutboundComponentTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("【合并转发消息，共 1 条】", text)
         self.assertIn("Alice(10001): 正文", text)
         self.assertNotIn("type=", text)
-        self.assertEqual(adapter.posted_json[0][0], "https://chat.example.com/api/v1/chat.sendMessage")
+        self.assertEqual(
+            adapter.posted_json[0][0],
+            "https://chat.example.com/api/v1/chat.sendMessage",
+        )
         self.assertEqual(adapter.posted_json[0][1]["message"]["t"], "e2e")
 
-    async def test_sender_bridge_combined_base64_image_is_decoded_and_uploaded(self) -> None:
+    async def test_sender_bridge_combined_base64_image_is_decoded_and_uploaded(
+        self,
+    ) -> None:
         adapter = _DummySenderAdapter()
         sender = RocketChatSenderBridge(adapter)
 
@@ -721,7 +794,9 @@ class RocketChatOutboundComponentTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(adapter.sent_image_urls, [])
         self.assertEqual(adapter.sent_texts, [])
 
-    async def test_event_send_combined_base64_image_is_decoded_and_uploaded(self) -> None:
+    async def test_event_send_combined_base64_image_is_decoded_and_uploaded(
+        self,
+    ) -> None:
         adapter = _DummyEventAdapter()
         event = RocketChatMessageEvent(
             message_str="",
