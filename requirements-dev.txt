@@ -5,4 +5,4 @@
 # 版本约束对齐 AstrBot 本体（master，约 v4.26.x）的核心依赖。
 
 aiohttp>=3.11.18
-cryptography>=44.0.3
+cryptography>=49.0.0
