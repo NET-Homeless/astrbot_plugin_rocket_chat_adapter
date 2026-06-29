@@ -7,6 +7,7 @@ on:
       - master
     paths:
       - 'metadata.yaml'
+  workflow_dispatch: {} # 允许在 Actions 页面手动触发（用于验证测试 gate；发版步骤仍受 tag 存在性保护）
 
 permissions:
   contents: write
