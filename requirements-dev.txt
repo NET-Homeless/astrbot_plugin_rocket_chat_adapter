@@ -1,0 +1,8 @@
+# Rocket.Chat 适配器开发/测试依赖
+#
+# 这些依赖在 AstrBot 运行时由本体提供（见 requirements.txt 说明），
+# 此处声明仅用于脱离 AstrBot 单独运行 tests/ 下的单元测试。
+# 版本约束对齐 AstrBot 本体（master，约 v4.26.x）的核心依赖。
+
+aiohttp>=3.11.18
+cryptography>=44.0.3

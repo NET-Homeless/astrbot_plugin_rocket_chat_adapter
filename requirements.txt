@@ -1,4 +1,8 @@
-# Rocket.Chat 适配器依赖
-# AstrBot 本身已内置 aiohttp，此处声明以确保版本兼容
-aiohttp>=3.9.0,<4.0.0
-cryptography>=42.0.0,<44.0.0
+# Rocket.Chat 适配器运行时依赖
+#
+# 本插件运行于 AstrBot 环境中，以下依赖均由 AstrBot 本体提供，
+# 无需在此重复声明（AstrBot 核心依赖 aiohttp、cryptography）：
+#   - aiohttp      （AstrBot 要求 >=3.11.18）
+#   - cryptography （AstrBot 要求 >=44.0.3）
+#
+# 如需脱离 AstrBot 单独运行测试，请安装 requirements-dev.txt。
