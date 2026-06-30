@@ -216,3 +216,6 @@ __marimo__/
 # Claude persistent memory (project-specific, not for repo)
 MEMORY.md
 memory/
+
+# Local runtime data (plugin data, generated images, temp files)
+data/

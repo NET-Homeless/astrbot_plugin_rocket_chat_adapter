@@ -28,6 +28,21 @@ def _is_http_url(file_ref: str) -> bool:
     return file_ref.startswith("http://") or file_ref.startswith("https://")
 
 
+def _normalize_local_file_path(file_ref: str) -> str | None:
+    """将本地文件引用归一化为绝对路径。
+
+    处理 file:// 前缀，并将相对路径解析为相对当前工作目录的绝对路径。
+    部分插件（如生图插件）只产出裸相对路径（无 file://、非绝对），
+    直接交给 open()/upload 会触发 FileNotFoundError，统一在此收口。
+    """
+    local_path = file_ref.replace("file:///", "").replace("file://", "")
+    if not local_path:
+        return None
+    if not os.path.isabs(local_path):
+        local_path = os.path.abspath(local_path)
+    return local_path
+
+
 async def _resolve_image_upload_path(
     adapter: Any,
     file_ref: str,
@@ -37,8 +52,7 @@ async def _resolve_image_upload_path(
         return await adapter._download_remote_media(file_ref, ".png")
     if file_ref.startswith("base64://"):
         return adapter._decode_base64_media(file_ref, ".png")
-    local_path = file_ref.replace("file:///", "").replace("file://", "")
-    return (local_path or None, None)
+    return (_normalize_local_file_path(file_ref), None)
 
 
 def _guess_upload_filename(
@@ -115,6 +129,14 @@ class RocketChatMediaBridge:
 
     def __init__(self, adapter: Any) -> None:
         self.adapter = adapter
+
+    @staticmethod
+    def normalize_local_file_path(file_ref: str) -> str | None:
+        """桥接公开入口：将本地文件引用归一化为绝对路径。
+
+        供 sender/event 等模块统一调用，避免各自重复 strip file:// 的散点逻辑。
+        """
+        return _normalize_local_file_path(file_ref)
 
     def classify_file_kind(self, file_obj: dict) -> str:
         candidates: list[str] = []

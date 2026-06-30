@@ -277,8 +277,8 @@ class RocketChatSenderBridge:
         if file_ref.startswith("base64://"):
             return self.adapter._media.decode_base64_media(file_ref, default_suffix)
 
-        local_path = file_ref.replace("file:///", "").replace("file://", "")
-        return (local_path or None, None)
+        local_path = self.adapter._media.normalize_local_file_path(file_ref)
+        return (local_path, None)
 
     async def download_remote_media(
         self,
@@ -374,7 +374,9 @@ class _SenderSegmentSender:
                     self.tmid,
                 )
             else:
-                local_path = file_ref.replace("file:///", "").replace("file://", "")
+                local_path = self.bridge.adapter._media.normalize_local_file_path(
+                    file_ref
+                )
                 if local_path:
                     await self.bridge.send_file(
                         self.room_id,
@@ -435,7 +437,7 @@ class _SenderSegmentSender:
         if file_ref.startswith("http"):
             await self.bridge.send_image_url(self.room_id, file_ref, tmid=self.tmid)
         else:
-            local_path = file_ref.replace("file:///", "").replace("file://", "")
+            local_path = self.bridge.adapter._media.normalize_local_file_path(file_ref)
             if local_path:
                 await self.bridge.send_image_file(
                     self.room_id, local_path, tmid=self.tmid

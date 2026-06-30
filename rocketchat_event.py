@@ -303,7 +303,7 @@ class RocketChatMessageEvent(AstrMessageEvent):
             await self.adapter.send_text(self.room_id, text, self.thread_id)
             return
 
-        local_path = file_ref.replace("file:///", "").replace("file://", "")
+        local_path = self.adapter._media.normalize_local_file_path(file_ref)
         if local_path:
             await self.adapter.send_file(
                 self.room_id,
@@ -395,8 +395,8 @@ class RocketChatMessageEvent(AstrMessageEvent):
         if file_ref.startswith("base64://"):
             return self.adapter._decode_base64_media(file_ref, default_suffix)
 
-        local_path = file_ref.replace("file:///", "").replace("file://", "")
-        return (local_path or None, None)
+        local_path = self.adapter._media.normalize_local_file_path(file_ref)
+        return (local_path, None)
 
     def _guess_filename(self, file_ref: str, local_path: str, fallback: str) -> str:
         # Base64 引用不含有意义的文件名，直接使用 fallback
