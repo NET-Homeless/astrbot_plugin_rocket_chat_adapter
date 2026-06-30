@@ -13,4 +13,4 @@ cryptography>=49.0.0
 # 代码质量工具（lint / format / 类型检查）
 # 类似 cargo clippy 的体验
 ruff>=0.15.20
-pyright>=1.1.370
+pyright>=1.1.411
