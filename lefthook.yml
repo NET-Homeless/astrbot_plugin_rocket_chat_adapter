@@ -34,6 +34,14 @@ pre-commit:
       run: pyright rocketchat_*.py main.py
       fail_text: "Pyright 类型检查失败。请修复类型错误后再提交。"
 
+    # 单元测试 gate：命令与 CI（release.yml 的 test job）保持一致，
+    # 避免"本地没跑测试 → 提交后 CI 才暴露失败"。测试为纯 mock、约 0.1s，
+    # 仅在改动涉及 Python 文件时运行（glob 命中才执行）。
+    unittest:
+      glob: "*.py"
+      run: python3 -m unittest discover -s tests -p "test_*.py"
+      fail_text: "单元测试失败。请修复后再提交（命令与 CI 对齐）。"
+
   # 可选：如果需要跳过某些文件或目录，可以在这里配置
   # exclude:
   #   - "tests/**"

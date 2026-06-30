@@ -24,6 +24,9 @@ from astrbot.api.platform import (  # noqa: E402
 from astrbot_plugin_rocket_chat_adapter.rocketchat_event import (  # noqa: E402
     RocketChatMessageEvent,
 )
+from astrbot_plugin_rocket_chat_adapter.rocketchat_media import (  # noqa: E402
+    RocketChatMediaBridge,
+)
 from astrbot_plugin_rocket_chat_adapter.rocketchat_sender import (  # noqa: E402
     RocketChatSenderBridge,
 )
@@ -135,6 +138,10 @@ class _DummyEventAdapter:
     ) -> tuple[str | None, None]:
         return "/tmp/decoded.png", None
 
+    def normalize_local_file_path(self, file_ref: str) -> str | None:
+        # 复用生产实现，避免 mock 与真实归一化逻辑漂移
+        return RocketChatMediaBridge.normalize_local_file_path(file_ref)
+
 
 class _DummySenderAdapter:
     def __init__(self) -> None:
@@ -216,6 +223,10 @@ class _DummySenderAdapter:
         default_suffix: str,
     ) -> tuple[str | None, None]:
         return "/tmp/decoded.png", None
+
+    def normalize_local_file_path(self, file_ref: str) -> str | None:
+        # 复用生产实现，避免 mock 与真实归一化逻辑漂移
+        return RocketChatMediaBridge.normalize_local_file_path(file_ref)
 
 
 class _DummyE2EE:
