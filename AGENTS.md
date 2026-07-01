@@ -129,7 +129,10 @@ On `git commit`, lefthook will automatically run:
 - `ruff check --fix` (lint + auto-fix, re-stages fixed files)
 - `ruff format` (formatting, re-stages)
 - `pyright` (type checking on staged files)
+- `unittest` (full mock test suite)
 
 If any step fails, the commit is blocked.
 
-CI (`.github/workflows/release.yml`) runs the same checks plus full test suite as the final gate.
+Local commit hooks are convenience checks and can be bypassed with Git client flags. The non-bypassable gate is GitHub branch protection requiring the `quality` status check from `.github/workflows/ci.yml` before merging to `main`.
+
+CI (`.github/workflows/ci.yml`) runs lint, format check, pyright, py_compile, and the full test suite on Pull Requests and pushes to `main` / `master`. Release automation (`.github/workflows/release.yml`) is for publishing and should not be treated as the only quality gate.

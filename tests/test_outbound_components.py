@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import unittest
 
 from tests._bootstrap import install_astrbot_stubs
@@ -325,6 +326,35 @@ class _DummyEncryptedEventAdapter(_DummyEncryptedAdapter):
 
 
 class RocketChatOutboundComponentTests(unittest.IsolatedAsyncioTestCase):
+    def test_normalize_local_file_path_preserves_absolute_file_uri(self) -> None:
+        self.assertEqual(
+            RocketChatMediaBridge.normalize_local_file_path(
+                "file:///tmp/rocket%20image.png"
+            ),
+            "/tmp/rocket image.png",
+        )
+
+    def test_normalize_local_file_path_accepts_localhost_file_uri(self) -> None:
+        self.assertEqual(
+            RocketChatMediaBridge.normalize_local_file_path(
+                "file://localhost/tmp/rocket.png"
+            ),
+            "/tmp/rocket.png",
+        )
+
+    def test_normalize_local_file_path_rejects_remote_file_uri(self) -> None:
+        self.assertIsNone(
+            RocketChatMediaBridge.normalize_local_file_path(
+                "file://fileserver/tmp/rocket.png"
+            )
+        )
+
+    def test_normalize_local_file_path_keeps_relative_path_support(self) -> None:
+        self.assertEqual(
+            RocketChatMediaBridge.normalize_local_file_path("data/images/rocket.png"),
+            os.path.abspath("data/images/rocket.png"),
+        )
+
     async def test_event_send_combines_plain_before_image_with_media_confirm_msg(
         self,
     ) -> None:
