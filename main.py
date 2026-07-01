@@ -1,3 +1,5 @@
+from importlib import import_module
+
 from astrbot.api import logger
 from astrbot.api.star import Context, Star
 
@@ -15,7 +17,7 @@ class RocketChatAdapterPlugin(Star):
 
     def __init__(self, context: Context) -> None:
         super().__init__(context)
-        from .rocketchat_adapter import RocketChatAdapter  # noqa: F401
+        import_module(".rocketchat_adapter", __package__)
 
     async def initialize(self) -> None:
         pass

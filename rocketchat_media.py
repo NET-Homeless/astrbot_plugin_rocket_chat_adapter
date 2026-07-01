@@ -7,7 +7,7 @@ import mimetypes
 import os
 import tempfile
 from typing import TYPE_CHECKING, Any
-from urllib.parse import urlparse
+from urllib.parse import unquote, urlparse
 
 import aiohttp
 from astrbot.api import logger
@@ -31,11 +31,22 @@ def _is_http_url(file_ref: str) -> bool:
 def _normalize_local_file_path(file_ref: str) -> str | None:
     """将本地文件引用归一化为绝对路径。
 
-    处理 file:// 前缀，并将相对路径解析为相对当前工作目录的绝对路径。
+    处理 file:// URI，并将相对路径解析为相对当前工作目录的绝对路径。
     部分插件（如生图插件）只产出裸相对路径（无 file://、非绝对），
     直接交给 open()/upload 会触发 FileNotFoundError，统一在此收口。
     """
-    local_path = file_ref.replace("file:///", "").replace("file://", "")
+    parsed = urlparse(file_ref)
+    if parsed.scheme == "file":
+        if parsed.netloc and parsed.netloc not in {"localhost", "127.0.0.1"}:
+            logger.warning(f"[RocketChat] 拒绝解析非本机 file URI: {file_ref!r}")
+            return None
+        local_path = unquote(parsed.path)
+    elif parsed.scheme and "://" in file_ref:
+        logger.warning(f"[RocketChat] 拒绝解析不支持的本地文件 URI: {file_ref!r}")
+        return None
+    else:
+        local_path = file_ref
+
     if not local_path:
         return None
     if not os.path.isabs(local_path):

@@ -301,11 +301,11 @@ A: 在 AstrBot 平台配置中添加多个 `rocket_chat` 实例，每个实例�
 
 欢迎提交 Issue 和 Pull Request！
 
-### 代码质量 Gate（Pre-commit Hooks）
+### 代码质量 Gate（Pre-commit Hooks + CI）
 
 本项目使用 [lefthook](https://github.com/evilmartians/lefthook) 在 `git commit` 前自动运行格式化和代码质量检查。
 
-未通过检查的提交将被阻止。
+本地 hook 用于快速反馈；真正的合并门禁由 GitHub Actions CI + 分支保护承担，避免 `git commit --no-verify` 绕过检查后进入主分支。
 
 **安装步骤：**
 
@@ -331,12 +331,10 @@ A: 在 AstrBot 平台配置中添加多个 `rocket_chat` 实例，每个实例�
 **每次 commit 时将自动执行：**
 - `ruff check --fix`（仅对暂存文件 lint 检查 + 自动修复）
 - `ruff format`（仅对暂存文件格式化）
-- `pyright .`（对整个项目做类型检查，保证跨文件一致性）
+- `pyright rocketchat_*.py main.py`（类型检查）
+- `python3 -m unittest discover -s tests -p "test_*.py"`（单元测试）
 
-如需临时跳过（不推荐）：
-```bash
-git commit --no-verify
-```
+远端 CI（`.github/workflows/ci.yml`）会在 Pull Request 和 `main` / `master` push 上运行 `ruff check .`、`ruff format --check .`、`pyright rocketchat_*.py main.py`、`py_compile` 和全量单元测试。主分支应配置 required status check，只有 CI 通过后才能合并。
 
 ### 项目结构
 

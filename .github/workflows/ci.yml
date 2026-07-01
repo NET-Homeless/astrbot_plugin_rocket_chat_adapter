@@ -1,0 +1,53 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+      - master
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  quality:
+    name: quality
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Install dev dependencies
+        run: pip install -r requirements-dev.txt
+
+      - name: Ruff lint
+        run: ruff check .
+
+      - name: Ruff format check
+        run: ruff format --check .
+
+      - name: Pyright type check
+        run: pyright rocketchat_*.py main.py
+
+      - name: Python syntax check
+        run: >
+          python -m py_compile
+          rocketchat_adapter.py
+          rocketchat_realtime.py
+          rocketchat_inbound.py
+          rocketchat_sender.py
+          rocketchat_e2ee.py
+          rocketchat_event.py
+          rocketchat_media.py
+          main.py
+
+      - name: Run unit tests
+        run: python -m unittest discover -s tests -p "test_*.py" -v
