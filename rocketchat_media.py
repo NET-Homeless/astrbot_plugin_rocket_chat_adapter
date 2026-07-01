@@ -244,7 +244,7 @@ class RocketChatMediaBridge:
         )
 
         try:
-            async with self.adapter._http_session.get(
+            async with self.adapter._get_http_session().get(
                 url,
                 headers=headers,
                 timeout=aiohttp.ClientTimeout(
@@ -600,7 +600,7 @@ class RocketChatMediaBridge:
     ) -> tuple[int | None, dict[str, Any] | None]:
         headers = self.adapter._get_auth_headers()
         try:
-            async with self.adapter._http_session.post(
+            async with self.adapter._get_http_session().post(
                 url, data=form, headers=headers
             ) as resp:
                 try:
@@ -624,7 +624,7 @@ class RocketChatMediaBridge:
         payload: dict[str, Any],
     ) -> tuple[int | None, dict[str, Any] | None]:
         try:
-            async with self.adapter._http_session.post(
+            async with self.adapter._get_http_session().post(
                 url,
                 json=payload,
                 headers=self.adapter._get_auth_headers(),

@@ -563,6 +563,60 @@ class RocketChatOutboundComponentTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertFalse(sent)
 
+    async def test_sender_bridge_posts_through_http_session_helper(self) -> None:
+        class _JsonResponse:
+            status = 200
+
+            async def __aenter__(self) -> _JsonResponse:
+                return self
+
+            async def __aexit__(self, *args: object) -> None:
+                return None
+
+            async def json(self) -> dict:
+                return {"success": True}
+
+        class _HelperSession:
+            def __init__(self) -> None:
+                self.posts: list[tuple[str, dict, dict]] = []
+
+            def post(self, url: str, json: dict, headers: dict) -> _JsonResponse:
+                self.posts.append((url, json, headers))
+                return _JsonResponse()
+
+        class _PostAdapter:
+            def __init__(self) -> None:
+                self.session = _HelperSession()
+                self.helper_used = False
+
+            def _get_http_session(self) -> _HelperSession:
+                self.helper_used = True
+                return self.session
+
+            def _get_auth_headers(self) -> dict:
+                return {"X-Auth-Token": "token", "X-User-Id": "user-id"}
+
+        adapter = _PostAdapter()
+        sender = RocketChatSenderBridge(adapter)
+
+        sent = await sender.post_json_message(
+            "https://chat.example.com/api/v1/chat.postMessage",
+            {"roomId": "room-1", "text": "hello"},
+        )
+
+        self.assertTrue(sent)
+        self.assertTrue(adapter.helper_used)
+        self.assertEqual(
+            adapter.session.posts,
+            [
+                (
+                    "https://chat.example.com/api/v1/chat.postMessage",
+                    {"roomId": "room-1", "text": "hello"},
+                    {"X-Auth-Token": "token", "X-User-Id": "user-id"},
+                )
+            ],
+        )
+
     async def test_sender_bridge_splits_image_before_plain_to_preserve_order(
         self,
     ) -> None:

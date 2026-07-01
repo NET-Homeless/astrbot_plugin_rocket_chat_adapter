@@ -42,7 +42,7 @@ class RocketChatRealtimeBridge:
         self.adapter._room_cache_locks.clear()
         self.adapter._pending_room_subscriptions.clear()
 
-        async with self.adapter._http_session.ws_connect(
+        async with self.adapter._get_http_session().ws_connect(
             ws_url,
             heartbeat=WEBSOCKET_HEARTBEAT_INTERVAL,
             max_msg_size=WEBSOCKET_MAX_MSG_SIZE,
@@ -242,9 +242,6 @@ class RocketChatRealtimeBridge:
             if not room_id:
                 continue
             self.adapter._subscribed_rooms.add(room_id)
-            logger.debug(
-                f"[RocketChat] 房间订阅已确认: room_id={room_id!r} sub_id={sub_id!r}"
-            )
 
     def _handle_nosub(self, data: dict[str, Any]) -> None:
         sub_id = data.get("id")

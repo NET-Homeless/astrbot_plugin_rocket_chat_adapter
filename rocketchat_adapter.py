@@ -303,9 +303,7 @@ class RocketChatAdapter(Platform):
         """适配器主入口，持续运行并自动重连。"""
         self._running = True
         self._stop_event = asyncio.Event()
-        self._http_session = aiohttp.ClientSession(
-            timeout=aiohttp.ClientTimeout(total=HTTP_SESSION_TOTAL_TIMEOUT)
-        )
+        self._http_session = self._create_http_session()
 
         try:
             # 第一步：REST API 登录，获取 authToken / userId
@@ -332,6 +330,7 @@ class RocketChatAdapter(Platform):
                             self._stop_event.wait(), timeout=self.reconnect_delay
                         )
         finally:
+            self._running = False
             await self._cleanup()
 
     async def terminate(self) -> None:
@@ -369,9 +368,11 @@ class RocketChatAdapter(Platform):
         if self._ws and not self._ws.closed:
             with contextlib.suppress(Exception):
                 await self._ws.close()
+        self._ws = None
         if self._http_session and not self._http_session.closed:
             with contextlib.suppress(Exception):
                 await self._http_session.close()
+        self._http_session = None
 
         for future in list(self._pending_ddp_results.values()):
             if not future.done():
@@ -389,10 +390,19 @@ class RocketChatAdapter(Platform):
                 await asyncio.gather(*self._background_tasks, return_exceptions=True)
             self._background_tasks.clear()
 
+    def _create_http_session(self) -> aiohttp.ClientSession:
+        return aiohttp.ClientSession(
+            timeout=aiohttp.ClientTimeout(total=HTTP_SESSION_TOTAL_TIMEOUT)
+        )
+
     def _get_http_session(self) -> aiohttp.ClientSession:
-        """返回可用的 HTTP session，若未初始化或已关闭则报错。"""
-        if self._http_session is None or self._http_session.closed:
+        """返回可用的 HTTP session；运行期间若意外关闭则重建。"""
+        if self._http_session is not None and not self._http_session.closed:
+            return self._http_session
+        if not self._running:
             raise RuntimeError("[RocketChat] HTTP session 未初始化或已关闭")
+        logger.warning("[RocketChat] HTTP session 已关闭，正在重新初始化")
+        self._http_session = self._create_http_session()
         return self._http_session
 
     # ------------------------------------------------------------------ #

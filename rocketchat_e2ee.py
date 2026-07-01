@@ -1010,7 +1010,7 @@ class RocketChatE2EEManager:
         params: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         url = f"{self.adapter.server_url}{path}"
-        async with self.adapter._http_session.get(
+        async with self.adapter._get_http_session().get(
             url,
             params=params,
             headers=self.adapter._get_auth_headers(),
@@ -1022,7 +1022,7 @@ class RocketChatE2EEManager:
 
     async def _rest_post(self, path: str, payload: dict[str, Any]) -> dict[str, Any]:
         url = f"{self.adapter.server_url}{path}"
-        async with self.adapter._http_session.post(
+        async with self.adapter._get_http_session().post(
             url,
             json=payload,
             headers=self.adapter._get_auth_headers(),

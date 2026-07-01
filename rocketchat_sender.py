@@ -26,7 +26,7 @@ class RocketChatSenderBridge:
 
     async def post_json_message(self, url: str, payload: dict) -> bool:
         try:
-            async with self.adapter._http_session.post(
+            async with self.adapter._get_http_session().post(
                 url,
                 json=payload,
                 headers=self.adapter._get_auth_headers(),

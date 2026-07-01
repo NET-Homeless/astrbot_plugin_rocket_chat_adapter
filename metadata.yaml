@@ -1,7 +1,7 @@
 name: astrbot_plugin_rocket_chat_adapter
 display_name: Rocket.Chat 适配器
 desc: AstrBot 的 Rocket.Chat 消息平台适配器，支持实时收发文本与媒体，并兼容私聊/私有群组 E2EE
-version: v0.8.7
+version: v0.8.8
 author: 星光の殲滅者
 repo: https://github.com/NET-Homeless/astrbot_plugin_rocket_chat_adapter
 astrbot_version: ">=4.0"

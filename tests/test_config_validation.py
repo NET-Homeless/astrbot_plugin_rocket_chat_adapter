@@ -60,6 +60,21 @@ class RocketChatConfigValidationTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(ValueError):
             RocketChatAdapter(config, {}, asyncio.Queue())
 
+    async def test_running_adapter_recreates_closed_http_session(self) -> None:
+        adapter = RocketChatAdapter(_base_config(), {}, asyncio.Queue())
+        adapter._running = True
+        session = adapter._get_http_session()
+        await session.close()
+
+        try:
+            new_session = adapter._get_http_session()
+
+            self.assertIsNot(new_session, session)
+            self.assertFalse(new_session.closed)
+        finally:
+            adapter._running = False
+            await adapter._cleanup()
+
 
 if __name__ == "__main__":
     unittest.main()
