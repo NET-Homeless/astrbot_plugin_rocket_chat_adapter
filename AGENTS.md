@@ -136,3 +136,5 @@ If any step fails, the commit is blocked.
 Local commit hooks are convenience checks and can be bypassed with Git client flags. The non-bypassable gate is GitHub branch protection requiring the `quality` status check from `.github/workflows/ci.yml` before merging to `main`.
 
 CI (`.github/workflows/ci.yml`) runs lint, format check, pyright, py_compile, and the full test suite on Pull Requests and pushes to `main` / `master`. Release automation (`.github/workflows/release.yml`) is for publishing and should not be treated as the only quality gate.
+
+Dependabot PRs are auto-merged by `.github/workflows/dependabot-auto-merge.yml` once the `quality` check passes: pip patch/minor updates and all GitHub Actions updates merge automatically; pip major updates stay open for manual review.
